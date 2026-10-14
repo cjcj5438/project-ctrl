@@ -2,5 +2,5 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "windows": ["main"],
-  "permissions": ["dialog:allow-open"]
+  "permissions": ["dialog:allow-open", "updater:default", "process:allow-restart"]
 }

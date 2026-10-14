@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, type ProjectInfo, type ScanCandidate } from './api'
 import DetailView from './Detail'
+import UpdateBanner from './Update'
 import { humanSize } from './format'
 import { pickDirectory, splitTags } from './util'
 
@@ -201,21 +202,25 @@ export default function App() {
   const detailProject = detailId === null ? null : (projects.find((p) => p.id === detailId) ?? null)
   if (detailProject) {
     return (
-      <DetailView
-        project={detailProject}
-        size={sizeOf(detailProject)}
-        onBack={() => setDetailId(null)}
-        onChanged={refresh}
-        onRemoved={() => {
-          setDetailId(null)
-          void refresh()
-        }}
-      />
+      <>
+        <UpdateBanner />
+        <DetailView
+          project={detailProject}
+          size={sizeOf(detailProject)}
+          onBack={() => setDetailId(null)}
+          onChanged={refresh}
+          onRemoved={() => {
+            setDetailId(null)
+            void refresh()
+          }}
+        />
+      </>
     )
   }
 
   return (
     <div className="min-h-screen bg-neutral-100 text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100">
+      <UpdateBanner />
       <div className="mx-auto max-w-6xl px-6 py-6">
         <header className="flex flex-wrap items-center gap-3">
           <h1 className="text-xl font-bold">项目管理</h1>

@@ -10,6 +10,7 @@
   "build": { "beforeBuildCommand": "pnpm build", "beforeDevCommand": "pnpm dev", "devUrl": "http://localhost:1420", "frontendDist": "../dist" },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["app"],
     "icon": [
       "icons/32x32.png",
@@ -25,5 +26,11 @@
     }
   },
   "identifier": "com.chenjing.project-ctrl",
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDBCNEQ4NENCNDdERDVBMEMKUldRTVd0MUh5NFJOQzQ1bG5YZmpIQnF3OXBGdzdxZm02YjFETkJ5VW1QRHZvYU45clpWQlFVR0oK",
+      "endpoints": ["https://github.com/cjcj5438/project-ctrl/releases/latest/download/latest.json"]
+    }
+  },
   "productName": "project-ctrl"
 }

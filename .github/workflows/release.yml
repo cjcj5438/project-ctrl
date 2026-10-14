@@ -1,0 +1,65 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check version matches tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)"
+          echo "tag=$tag  package.json=$pkg  src-tauri/Cargo.toml=$crate"
+          if [ "$tag" != "$pkg" ] || [ "$tag" != "$crate" ]; then
+            echo "::error::版本不一致：tag=$tag, package.json=$pkg, src-tauri/Cargo.toml=$crate（请先同步版本再打 tag）"
+            exit 1
+          fi
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: Build and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'project-ctrl ${{ github.ref_name }}'
+          releaseDraft: false
+          prerelease: false
+          args: --bundles app
