@@ -20,6 +20,7 @@ export default function DetailView({
   const [removeOpen, setRemoveOpen] = useState(false)
   const [tagInput, setTagInput] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const [git, setGit] = useState<{ kind: 'status' | 'log'; loading: boolean; text: string } | null>(null)
 
   const onDirtyChange = useCallback((d: boolean) => setReadmeDirty(d), [])
   const onError = useCallback((m: string | null) => setError(m), [])
@@ -70,6 +71,16 @@ export default function DetailView({
       await api.removeProject(project.id)
       onRemoved()
     })
+  }
+
+  const showGit = async (kind: 'status' | 'log') => {
+    setGit({ kind, loading: true, text: '' })
+    try {
+      const r = await api.runGit(project.id, kind)
+      setGit({ kind, loading: false, text: r.text })
+    } catch (e) {
+      setGit({ kind, loading: false, text: errorText(e) })
+    }
   }
 
   return (
@@ -166,6 +177,22 @@ export default function DetailView({
                   GitHub
                 </button>
               )}
+              {project.has_git && (
+                <>
+                  <button
+                    onClick={() => void showGit('status')}
+                    className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+                  >
+                    git status
+                  </button>
+                  <button
+                    onClick={() => void showGit('log')}
+                    className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+                  >
+                    git log
+                  </button>
+                </>
+              )}
               <button
                 onClick={() => guardUnsaved(() => setRemoveOpen(true))}
                 className="ml-auto rounded border border-red-300 px-2 py-1 text-red-700 dark:border-red-800 dark:text-red-300"
@@ -173,6 +200,24 @@ export default function DetailView({
                 从管理器移除
               </button>
             </div>
+
+            {git && (
+              <div className="mt-4 overflow-hidden rounded-lg border border-neutral-300 dark:border-neutral-700">
+                <div className="flex items-center gap-3 border-b border-neutral-300 bg-neutral-100 px-3 py-2 dark:border-neutral-700 dark:bg-neutral-800">
+                  <span className="font-mono text-xs font-semibold">$ git {git.kind}</span>
+                  {git.loading && <span className="text-xs text-neutral-500">执行中…</span>}
+                  <button
+                    onClick={() => setGit(null)}
+                    className="ml-auto rounded border border-neutral-300 px-2 py-0.5 text-xs dark:border-neutral-600"
+                  >
+                    关闭
+                  </button>
+                </div>
+                <pre className="max-h-[50vh] select-text overflow-auto whitespace-pre p-3 font-mono text-xs leading-relaxed">
+                  {git.loading ? '' : git.text}
+                </pre>
+              </div>
+            )}
 
             <ReadmeSection key={project.path} projectId={project.id} onDirtyChange={onDirtyChange} onError={onError} />
           </>

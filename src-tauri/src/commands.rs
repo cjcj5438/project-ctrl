@@ -1,6 +1,6 @@
 //! Tauri commands：组合 db + logic + 文件系统读取。
 
-use crate::{db, logic, readme};
+use crate::{db, git, logic, readme};
 use crate::readme::ReadmeError;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -16,6 +16,7 @@ pub struct ProjectInfo {
     manual_tags: Vec<String>,
     auto_tags: Vec<String>,
     github_url: Option<String>,
+    has_git: bool,
 }
 
 #[derive(Serialize)]
@@ -72,10 +73,10 @@ pub fn list_projects() -> Result<Vec<ProjectInfo>, String> {
         let p = PathBuf::from(&r.path);
         let missing = !p.exists();
         let manual_tags = db::tags_of(&conn, r.id).map_err(|e| e.to_string())?;
-        let (auto_tags, github_url) = if missing {
-            (vec![], None)
+        let (auto_tags, github_url, has_git) = if missing {
+            (vec![], None, false)
         } else {
-            (auto_tags_of(&p), github_url_of(&p))
+            (auto_tags_of(&p), github_url_of(&p), git_kind_of(&p).is_some())
         };
         out.push(ProjectInfo {
             name: logic::project_name_of(&p),
@@ -84,6 +85,7 @@ pub fn list_projects() -> Result<Vec<ProjectInfo>, String> {
             manual_tags,
             auto_tags,
             github_url,
+            has_git,
             id: r.id,
             path: r.path,
         });
@@ -286,4 +288,15 @@ pub fn open_external(url: String) -> Result<(), String> {
         return Err(format!("不允许打开的链接：{url}"));
     }
     run_command("open", &[&url])
+}
+
+/// 只读执行 `git status` / `git log`（kind 走白名单，绝不接受任意子命令）。
+#[tauri::command]
+pub fn run_git(id: i64, kind: String) -> Result<git::GitResult, String> {
+    let base = project_path(id)?;
+    let kind = git::GitKind::parse(&kind).ok_or_else(|| format!("不支持的 git 命令：{kind}"))?;
+    if git_kind_of(&base).is_none() {
+        return Err("该项目没有 .git".to_string());
+    }
+    Ok(git::run(&base, kind))
 }

@@ -9,6 +9,7 @@ export interface ProjectInfo {
   manual_tags: string[]
   auto_tags: string[]
   github_url: string | null
+  has_git: boolean
 }
 
 export interface ScanCandidate {
@@ -25,6 +26,14 @@ export interface ReadmeInfo {
 
 /** save_readme 的错误：kind==='conflict' 时磁盘 mtime 已变。 */
 export type ReadmeError = { kind: 'conflict'; current_mtime: string } | { kind: 'message'; message: string }
+
+export interface GitResult {
+  text: string
+  ok: boolean
+  code: number | null
+  timed_out: boolean
+  truncated: boolean
+}
 
 export function isConflict(e: unknown): e is { kind: 'conflict'; current_mtime: string } {
   return typeof e === 'object' && e !== null && 'kind' in e && e.kind === 'conflict'
@@ -59,4 +68,5 @@ export const api = {
   readProjectImage: (id: number, relPath: string) =>
     invoke<string>('read_project_image', { id, relPath }),
   openExternal: (url: string) => invoke<void>('open_external', { url }),
+  runGit: (id: number, kind: 'status' | 'log') => invoke<GitResult>('run_git', { id, kind }),
 }

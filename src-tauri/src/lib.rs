@@ -1,5 +1,6 @@
 mod commands;
 mod db;
+mod git;
 mod logic;
 mod readme;
 
@@ -27,6 +28,7 @@ pub fn run() {
             commands::generate_readme,
             commands::read_project_image,
             commands::open_external,
+            commands::run_git,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
