@@ -1,16 +1,19 @@
 import { useCallback, useState } from 'react'
 import { api, errorText, type ProjectInfo } from './api'
+import { humanSize } from './format'
 import ReadmeSection from './Readme'
 import { pickDirectory } from './util'
 
 /** 详情页：项目信息 + tag 编辑 + 打开按钮 + README 区域。 */
 export default function DetailView({
   project,
+  size,
   onBack,
   onChanged,
   onRemoved,
 }: {
   project: ProjectInfo
+  size?: number | null
   onBack: () => void
   onChanged: () => Promise<void> | void
   onRemoved: () => void
@@ -109,6 +112,11 @@ export default function DetailView({
         </div>
         <div className="mt-1 break-all text-xs text-neutral-500">{project.path}</div>
         <div className="mt-1 text-xs text-neutral-500">创建日期：{project.created_date ?? '未知'}</div>
+        {!project.missing && (
+          <div className="mt-1 text-xs text-neutral-500">
+            大小：{size === undefined ? '计算中…' : size === null ? '—' : humanSize(size)}
+          </div>
+        )}
 
         {project.missing ? (
           <div className="mt-6 flex gap-2">

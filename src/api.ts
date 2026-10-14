@@ -69,4 +69,5 @@ export const api = {
     invoke<string>('read_project_image', { id, relPath }),
   openExternal: (url: string) => invoke<void>('open_external', { url }),
   runGit: (id: number, kind: 'status' | 'log') => invoke<GitResult>('run_git', { id, kind }),
+  projectSize: (id: number) => invoke<number>('project_size', { id }),
 }

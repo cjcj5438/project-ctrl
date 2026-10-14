@@ -3,6 +3,7 @@ mod db;
 mod git;
 mod logic;
 mod readme;
+mod size;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -29,6 +30,7 @@ pub fn run() {
             commands::read_project_image,
             commands::open_external,
             commands::run_git,
+            commands::project_size,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

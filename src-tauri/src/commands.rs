@@ -1,6 +1,6 @@
 //! Tauri commands：组合 db + logic + 文件系统读取。
 
-use crate::{db, git, logic, readme};
+use crate::{db, git, logic, readme, size};
 use crate::readme::ReadmeError;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -288,6 +288,17 @@ pub fn open_external(url: String) -> Result<(), String> {
         return Err(format!("不允许打开的链接：{url}"));
     }
     run_command("open", &[&url])
+}
+
+/// 统计项目磁盘占用（字节）。路径由 id 从库取；计算放到阻塞线程池，不占用 IPC/主线程。
+#[tauri::command]
+pub async fn project_size(id: i64) -> Result<u64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base = project_path(id)?;
+        Ok::<u64, String>(size::dir_size(&base))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 只读执行 `git status` / `git log`（kind 走白名单，绝不接受任意子命令）。

@@ -1,9 +1,19 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, type ProjectInfo, type ScanCandidate } from './api'
 import DetailView from './Detail'
+import { humanSize } from './format'
 import { pickDirectory, splitTags } from './util'
 
-type SortMode = 'created' | 'name'
+type SortMode = 'created' | 'name' | 'size'
+
+const NEXT_SORT: Record<SortMode, SortMode> = { created: 'name', name: 'size', size: 'created' }
+const SORT_LABEL: Record<SortMode, string> = { created: '创建时间倒序', name: '名称', size: '大小' }
+
+/** 单个项目大小的并发计算上限。 */
+const SIZE_CONCURRENCY = 3
+
+/** 大小缓存的 key：项目 id + 路径（路径变化即视为需要重算）。 */
+const sizeKey = (p: ProjectInfo): string => `${p.id}\u0000${p.path}`
 
 type Modal =
   | { kind: 'editTags'; project: ProjectInfo }
@@ -22,6 +32,36 @@ export default function App() {
   const [modal, setModal] = useState<Modal | null>(null)
   const [modalInput, setModalInput] = useState('')
   const [detailId, setDetailId] = useState<number | null>(null)
+
+  // 项目大小：仅前端内存缓存（key = id + 路径），会话内不重复计算；null 表示计算失败
+  const [sizes, setSizes] = useState<Record<string, number | null>>({})
+  const sizeQueued = useRef<Set<string>>(new Set())
+  const sizeQueue = useRef<string[]>([])
+  const sizeActive = useRef(0)
+
+  const sizeOf = (p: ProjectInfo): number | null | undefined => sizes[sizeKey(p)]
+
+  const formatSize = (p: ProjectInfo): string => {
+    const s = sizeOf(p)
+    return s === undefined ? '计算中…' : s === null ? '—' : humanSize(s)
+  }
+
+  // 简单队列：并发上限 SIZE_CONCURRENCY
+  const pump = () => {
+    while (sizeActive.current < SIZE_CONCURRENCY && sizeQueue.current.length > 0) {
+      const key = sizeQueue.current.shift() as string
+      const id = Number(key.split('\u0000')[0])
+      sizeActive.current += 1
+      api
+        .projectSize(id)
+        .then((n) => setSizes((s) => ({ ...s, [key]: n })))
+        .catch(() => setSizes((s) => ({ ...s, [key]: null })))
+        .finally(() => {
+          sizeActive.current -= 1
+          pump()
+        })
+    }
+  }
 
   // 扫描弹层
   const [scanRoot, setScanRoot] = useState<string | null>(null)
@@ -57,12 +97,29 @@ export default function App() {
       const tags = new Set([...p.manual_tags, ...p.auto_tags])
       return selected.every((t) => tags.has(t))
     })
-    return [...list].sort((a, b) =>
-      sort === 'name'
-        ? a.name.localeCompare(b.name, 'zh-CN')
-        : (b.created_date ?? '').localeCompare(a.created_date ?? ''),
-    )
-  }, [projects, query, selected, sort])
+    return [...list].sort((a, b) => {
+      if (sort === 'name') return a.name.localeCompare(b.name, 'zh-CN')
+      if (sort === 'size') {
+        const sa = typeof sizes[sizeKey(a)] === 'number' ? (sizes[sizeKey(a)] as number) : -1
+        const sb = typeof sizes[sizeKey(b)] === 'number' ? (sizes[sizeKey(b)] as number) : -1
+        return sb - sa // 未算完的（-1）排在最后
+      }
+      return (b.created_date ?? '').localeCompare(a.created_date ?? '')
+    })
+  }, [projects, query, selected, sort, sizes])
+
+  // 未算过的、非丢失的项目排队后台计算（并发上限 3，结果只进内存缓存）
+  useEffect(() => {
+    for (const p of projects) {
+      if (p.missing) continue
+      const key = sizeKey(p)
+      if (sizeQueued.current.has(key)) continue
+      sizeQueued.current.add(key)
+      sizeQueue.current.push(key)
+    }
+    pump()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projects])
 
   const run = async (fn: () => Promise<void>) => {
     try {
@@ -146,6 +203,7 @@ export default function App() {
     return (
       <DetailView
         project={detailProject}
+        size={sizeOf(detailProject)}
         onBack={() => setDetailId(null)}
         onChanged={refresh}
         onRemoved={() => {
@@ -169,11 +227,11 @@ export default function App() {
           />
           <div className="ml-auto flex items-center gap-2">
             <button
-              onClick={() => setSort(sort === 'created' ? 'name' : 'created')}
+              onClick={() => setSort(NEXT_SORT[sort])}
               className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
               title="切换排序"
             >
-              排序：{sort === 'created' ? '创建时间倒序' : '名称'}
+              排序：{SORT_LABEL[sort]}
             </button>
             <button
               onClick={doScan}
@@ -273,6 +331,9 @@ export default function App() {
                 {p.path}
               </div>
               <div className="mt-1 text-xs text-neutral-500">创建日期：{p.created_date ?? '未知'}</div>
+              {!p.missing && (
+                <div className="mt-1 text-xs text-neutral-500">大小：{formatSize(p)}</div>
+              )}
               <div className="mt-2 flex flex-wrap gap-1.5">
                 {p.manual_tags.map((t) => (
                   <span
