@@ -1,0 +1,25 @@
+[package]
+edition = "2021"
+name = "project-ctrl"
+version = "0.1.0"
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+name = "project_ctrl_lib"
+
+[[bin]]
+name = "project-ctrl"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+
+[dev-dependencies]
+tempfile = "3"
