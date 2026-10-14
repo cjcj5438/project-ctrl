@@ -17,6 +17,10 @@ pub fn run() {
             commands::delete_tag,
             commands::relink_project,
             commands::remove_project,
+            commands::open_in_finder,
+            commands::open_in_vscode,
+            commands::open_in_iterm,
+            commands::open_github,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -289,18 +289,8 @@ export default function App() {
                   <span className="text-xs text-neutral-400">无 tag</span>
                 )}
               </div>
-              <div className="mt-3 flex gap-2 text-xs">
-                {!p.missing ? (
-                  <button
-                    onClick={() => {
-                      setModalInput(p.manual_tags.join('，'))
-                      setModal({ kind: 'editTags', project: p })
-                    }}
-                    className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
-                  >
-                    编辑 tag
-                  </button>
-                ) : (
+              <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                {p.missing ? (
                   <>
                     <button
                       onClick={() => relink(p)}
@@ -314,6 +304,44 @@ export default function App() {
                     >
                       移除
                     </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      onClick={() => {
+                        setModalInput(p.manual_tags.join('，'))
+                        setModal({ kind: 'editTags', project: p })
+                      }}
+                      className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+                    >
+                      编辑 tag
+                    </button>
+                    <button
+                      onClick={() => run(() => api.openInFinder(p.id))}
+                      className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+                    >
+                      Finder
+                    </button>
+                    <button
+                      onClick={() => run(() => api.openInIterm(p.id))}
+                      className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+                    >
+                      iTerm
+                    </button>
+                    <button
+                      onClick={() => run(() => api.openInVscode(p.id))}
+                      className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+                    >
+                      VS Code
+                    </button>
+                    {p.github_url && (
+                      <button
+                        onClick={() => run(() => api.openGithub(p.id))}
+                        className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+                      >
+                        GitHub
+                      </button>
+                    )}
                   </>
                 )}
               </div>

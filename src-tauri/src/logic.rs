@@ -136,6 +136,24 @@ pub fn pick_github_url(remotes: &HashMap<String, String>) -> Option<String> {
     None
 }
 
+/// iTerm2 脚本：在 iTerm 当前窗口新开 tab 并 `cd` 到项目目录；没有窗口则新建窗口。
+/// 路径经 `osascript ... -- <path>` 作为 argv 传入，由 `quoted form of` 在 AppleScript 侧
+/// 做 shell 转义，故空格、中文、单/双引号、`$`、反引号等特殊字符都安全，Rust 侧不拼接 shell 字符串。
+pub const ITERM_SCRIPT: &str = r#"on run argv
+	set targetPath to item 1 of argv
+	tell application "iTerm"
+		activate
+		if (count of windows) = 0 then
+			create window with default profile
+		else
+			tell current window to create tab with default profile
+		end if
+		tell current session of current window
+			write text "cd " & quoted form of targetPath
+		end tell
+	end tell
+end run"#;
+
 /// 自动 tag。
 /// - `git_kind`: None=无 .git；Some(true)=`.git` 是目录；Some(false)=`.git` 是文件（worktree/submodule）
 /// - 有 .git 一定有 `git`；只有 `.git` 为目录时才读 config 找 `github`。
@@ -292,5 +310,53 @@ mod tests {
     fn project_name_is_folder_name() {
         assert_eq!(project_name_of(Path::new("/a/b/my-proj")), "my-proj");
         assert_eq!(project_name_of(Path::new("/a/未命名文件夹")), "未命名文件夹");
+    }
+
+    #[test]
+    fn github_url_suffix_and_trailing_slash_variants() {
+        // 带 / 不带 .git 后缀、带尾部斜杠，均归一化到同一仓库页
+        for u in [
+            "https://github.com/octocat/Hello-World",
+            "https://github.com/octocat/Hello-World.git",
+            "https://github.com/octocat/Hello-World.git/",
+            "https://github.com/octocat/Hello-World/",
+            "git@github.com:octocat/Hello-World.git",
+            "git@github.com:octocat/Hello-World.git/",
+            "ssh://git@github.com/octocat/Hello-World.git",
+        ] {
+            assert_eq!(
+                github_repo_url(u).as_deref(),
+                Some("https://github.com/octocat/Hello-World"),
+                "url = {u}"
+            );
+        }
+    }
+
+    #[test]
+    fn pick_returns_none_when_no_github_remote() {
+        let mut m = HashMap::new();
+        m.insert("origin".into(), "git@gitee.com:o/x.git".into());
+        m.insert("mirror".into(), "https://gitlab.com/o/x.git".into());
+        assert_eq!(pick_github_url(&m), None);
+    }
+
+    #[test]
+    fn pick_skips_non_github_to_reach_github_among_many() {
+        let mut m = HashMap::new();
+        m.insert("a".into(), "https://gitlab.com/x/y.git".into());
+        m.insert("b".into(), "git@gitee.com:x/y.git".into());
+        m.insert("c".into(), "https://github.com/x/y.git".into());
+        m.insert("d".into(), "git@github.com:z/w.git".into());
+        // b 之后按名称序首个 github 是 c
+        assert_eq!(pick_github_url(&m).as_deref(), Some("https://github.com/x/y"));
+    }
+
+    #[test]
+    fn iterm_script_uses_argv_and_quoted_form() {
+        // 契约：路径只能作为 argv 传入并由 quoted form of 转义，绝不把路径拼进脚本字符串。
+        assert!(ITERM_SCRIPT.contains("on run argv"));
+        assert!(ITERM_SCRIPT.contains("item 1 of argv"));
+        assert!(ITERM_SCRIPT.contains("quoted form of targetPath"));
+        assert!(ITERM_SCRIPT.contains("cd "));
     }
 }

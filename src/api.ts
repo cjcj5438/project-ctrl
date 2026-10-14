@@ -8,6 +8,7 @@ export interface ProjectInfo {
   missing: boolean
   manual_tags: string[]
   auto_tags: string[]
+  github_url: string | null
 }
 
 export interface ScanCandidate {
@@ -27,4 +28,8 @@ export const api = {
   deleteTag: (name: string) => invoke<void>('delete_tag', { name }),
   relinkProject: (id: number, newPath: string) => invoke<void>('relink_project', { id, newPath }),
   removeProject: (id: number) => invoke<void>('remove_project', { id }),
+  openInFinder: (id: number) => invoke<void>('open_in_finder', { id }),
+  openInIterm: (id: number) => invoke<void>('open_in_iterm', { id }),
+  openInVscode: (id: number) => invoke<void>('open_in_vscode', { id }),
+  openGithub: (id: number) => invoke<void>('open_github', { id }),
 }

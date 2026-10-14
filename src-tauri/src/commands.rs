@@ -14,6 +14,7 @@ pub struct ProjectInfo {
     missing: bool,
     manual_tags: Vec<String>,
     auto_tags: Vec<String>,
+    github_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -41,14 +42,24 @@ pub fn git_kind_of(project: &Path) -> Option<bool> {
     }
 }
 
-pub fn auto_tags_of(project: &Path) -> Vec<String> {
-    let kind = git_kind_of(project);
-    let config = if kind == Some(true) {
+/// 读 `.git/config` 文本；仅当 `.git` 是目录时才有 config（`.git` 为文件时返回 None）。
+pub fn git_config_text_of(project: &Path) -> Option<String> {
+    if git_kind_of(project) == Some(true) {
         std::fs::read_to_string(project.join(".git").join("config")).ok()
     } else {
         None
-    };
-    logic::auto_tags(kind, config.as_deref())
+    }
+}
+
+/// 由项目路径现算 GitHub 仓库页 URL（无 .git / .git 为文件 / 非 github remote 时为 None）。
+/// 与自动 tag `github` 共用 `logic::pick_github_url`，保证两者判断一致。
+pub fn github_url_of(project: &Path) -> Option<String> {
+    let config = git_config_text_of(project)?;
+    logic::pick_github_url(&logic::extract_remote_urls(&config))
+}
+
+pub fn auto_tags_of(project: &Path) -> Vec<String> {
+    logic::auto_tags(git_kind_of(project), git_config_text_of(project).as_deref())
 }
 
 #[tauri::command]
@@ -60,13 +71,18 @@ pub fn list_projects() -> Result<Vec<ProjectInfo>, String> {
         let p = PathBuf::from(&r.path);
         let missing = !p.exists();
         let manual_tags = db::tags_of(&conn, r.id).map_err(|e| e.to_string())?;
-        let auto_tags = if missing { vec![] } else { auto_tags_of(&p) };
+        let (auto_tags, github_url) = if missing {
+            (vec![], None)
+        } else {
+            (auto_tags_of(&p), github_url_of(&p))
+        };
         out.push(ProjectInfo {
             name: logic::project_name_of(&p),
             created_date: if missing { None } else { created_date_of(&p) },
             missing,
             manual_tags,
             auto_tags,
+            github_url,
             id: r.id,
             path: r.path,
         });
@@ -170,4 +186,56 @@ pub fn relink_project(id: i64, new_path: String) -> Result<(), String> {
 pub fn remove_project(id: i64) -> Result<(), String> {
     let conn = db::open_db().map_err(|e| e.to_string())?;
     db::remove_project(&conn, id).map_err(|e| e.to_string())
+}
+
+/// 按 id 从库里取项目路径（命令不接受前端传入的路径，杜绝任意路径）。
+fn project_path(id: i64) -> Result<PathBuf, String> {
+    let conn = db::open_db().map_err(|e| e.to_string())?;
+    match db::project_path(&conn, id).map_err(|e| e.to_string())? {
+        Some(p) => Ok(PathBuf::from(p)),
+        None => Err("项目不存在".to_string()),
+    }
+}
+
+/// 以参数数组调用外部程序（绝不拼 shell 字符串）。失败时返回 stderr。
+fn run_command(program: &str, args: &[&str]) -> Result<(), String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| format!("无法启动 {program}：{e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let msg = stderr.trim();
+    Err(if msg.is_empty() {
+        format!("{program} 执行失败（退出码 {:?}）", output.status.code())
+    } else {
+        msg.to_string()
+    })
+}
+
+#[tauri::command]
+pub fn open_in_finder(id: i64) -> Result<(), String> {
+    let path = project_path(id)?;
+    run_command("open", &[&path.to_string_lossy()])
+}
+
+#[tauri::command]
+pub fn open_in_vscode(id: i64) -> Result<(), String> {
+    let path = project_path(id)?;
+    run_command("open", &["-a", "Visual Studio Code", &path.to_string_lossy()])
+}
+
+#[tauri::command]
+pub fn open_in_iterm(id: i64) -> Result<(), String> {
+    let path = project_path(id)?;
+    run_command("osascript", &["-e", logic::ITERM_SCRIPT, "--", &path.to_string_lossy()])
+}
+
+#[tauri::command]
+pub fn open_github(id: i64) -> Result<(), String> {
+    let path = project_path(id)?;
+    let url = github_url_of(&path).ok_or_else(|| "该项目未识别到 GitHub remote".to_string())?;
+    run_command("open", &[&url])
 }

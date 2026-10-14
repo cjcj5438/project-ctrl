@@ -1,6 +1,6 @@
 //! SQLite 持久化：projects / tags / project_tags。
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::PathBuf;
 
 pub fn data_dir() -> PathBuf {
@@ -42,12 +42,8 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn normalize(p: &str) -> String {
-    p.trim_end_matches('/').to_string()
-}
-
 pub fn add_project(conn: &Connection, path: &str) -> rusqlite::Result<i64> {
-    let path = normalize(path);
+    let path = crate::logic::normalize_path(path);
     conn.execute("INSERT OR IGNORE INTO projects (path, added_at) VALUES (?1, ?2)", params![path, now_secs()])?;
     let id: i64 = conn.query_row("SELECT id FROM projects WHERE path = ?1", params![path], |r| r.get(0))?;
     Ok(id)
@@ -57,6 +53,11 @@ pub fn all_project_paths(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut st = conn.prepare("SELECT path FROM projects")?;
     let rows = st.query_map([], |r| r.get(0))?;
     rows.collect()
+}
+
+pub fn project_path(conn: &Connection, id: i64) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT path FROM projects WHERE id = ?1", params![id], |r| r.get(0))
+        .optional()
 }
 
 pub struct ProjectRow {
@@ -77,7 +78,7 @@ pub fn remove_project(conn: &Connection, id: i64) -> rusqlite::Result<()> {
 }
 
 pub fn update_project_path(conn: &Connection, id: i64, new_path: &str) -> rusqlite::Result<()> {
-    let new_path = normalize(new_path);
+    let new_path = crate::logic::normalize_path(new_path);
     conn.execute("UPDATE projects SET path = ?1 WHERE id = ?2", params![new_path, id])?;
     Ok(())
 }

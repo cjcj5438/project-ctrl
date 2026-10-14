@@ -5,6 +5,13 @@
 里程碑 1：脚手架 + SQLite + 添加项目（扫描并勾选 / 添加单个）+ 列表页 +
 tag（手动 tag 打/摘/改名/删除、自动 tag、筛选、搜索、排序）+ 路径丢失标记及重新关联/移除。
 
+里程碑 2：卡片打开按钮——Finder / iTerm（新标签页并 cd 到项目）/ VS Code /
+GitHub（仅识别出 GitHub remote 时显示，用系统默认浏览器打开仓库页）。
+命令只接收项目 id，路径与 GitHub URL 均由后端从数据库与 `.git/config` 现算，
+外部程序一律以参数数组调用（不拼 shell 字符串）；iTerm 的 AppleScript 用
+`on run argv` + `quoted form of`，路径含空格/中文/引号/`$`/反引号也安全。
+`src-tauri/Info.plist` 提供 `NSAppleEventsUsageDescription`（iTerm 自动化授权说明）。
+
 ## 环境
 
 - pnpm 11、node 22、rust 1.99、Xcode CLT
