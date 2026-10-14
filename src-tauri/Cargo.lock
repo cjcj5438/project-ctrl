@@ -2420,6 +2420,7 @@ dependencies = [
 name = "project-ctrl"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "rusqlite",
  "serde",

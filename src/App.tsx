@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
-import { open } from '@tauri-apps/plugin-dialog'
 import { api, type ProjectInfo, type ScanCandidate } from './api'
+import DetailView from './Detail'
+import { pickDirectory, splitTags } from './util'
 
 type SortMode = 'created' | 'name'
 
@@ -11,19 +12,6 @@ type Modal =
   | { kind: 'singleTags'; path: string }
   | { kind: 'removeProject'; project: ProjectInfo }
 
-async function pickDirectory(): Promise<string | null> {
-  // dev 自动化验证旁路：debug 构建读 dev-pick-dir 控制文件；release 恒走原生弹窗。
-  const bypass = await api.devPickDir()
-  if (bypass) return bypass
-  const sel = await open({ directory: true, multiple: false })
-  if (!sel) return null
-  return Array.isArray(sel) ? (sel[0] ?? null) : sel
-}
-
-function splitTags(s: string): string[] {
-  return [...new Set(s.split(/[,，、\s]+/).map((t) => t.trim()).filter(Boolean))]
-}
-
 export default function App() {
   const [projects, setProjects] = useState<ProjectInfo[]>([])
   const [allTags, setAllTags] = useState<string[]>([])
@@ -33,6 +21,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   const [modal, setModal] = useState<Modal | null>(null)
   const [modalInput, setModalInput] = useState('')
+  const [detailId, setDetailId] = useState<number | null>(null)
 
   // 扫描弹层
   const [scanRoot, setScanRoot] = useState<string | null>(null)
@@ -152,6 +141,21 @@ export default function App() {
 
   const allChecked = candidates.length > 0 && checked.size === candidates.length
 
+  const detailProject = detailId === null ? null : (projects.find((p) => p.id === detailId) ?? null)
+  if (detailProject) {
+    return (
+      <DetailView
+        project={detailProject}
+        onBack={() => setDetailId(null)}
+        onChanged={refresh}
+        onRemoved={() => {
+          setDetailId(null)
+          void refresh()
+        }}
+      />
+    )
+  }
+
   return (
     <div className="min-h-screen bg-neutral-100 text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100">
       <div className="mx-auto max-w-6xl px-6 py-6">
@@ -254,7 +258,8 @@ export default function App() {
           {visible.map((p) => (
             <div
               key={p.id}
-              className="rounded-xl border border-neutral-200 bg-white p-4 shadow-sm dark:border-neutral-800 dark:bg-neutral-900"
+              onClick={() => setDetailId(p.id)}
+              className="cursor-pointer rounded-xl border border-neutral-200 bg-white p-4 shadow-sm transition hover:border-blue-400 dark:border-neutral-800 dark:bg-neutral-900 dark:hover:border-blue-700"
             >
               <div className="flex items-center gap-2">
                 <h2 className="truncate font-semibold">{p.name}</h2>
@@ -289,7 +294,7 @@ export default function App() {
                   <span className="text-xs text-neutral-400">无 tag</span>
                 )}
               </div>
-              <div className="mt-3 flex flex-wrap gap-2 text-xs">
+              <div className="mt-3 flex flex-wrap gap-2 text-xs" onClick={(e) => e.stopPropagation()}>
                 {p.missing ? (
                   <>
                     <button

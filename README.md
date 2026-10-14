@@ -12,6 +12,15 @@ GitHub（仅识别出 GitHub remote 时显示，用系统默认浏览器打开�
 `on run argv` + `quoted form of`，路径含空格/中文/引号/`$`/反引号也安全。
 `src-tauri/Info.plist` 提供 `NSAppleEventsUsageDescription`（iTerm 自动化授权说明）。
 
+里程碑 3：详情页 + README。点卡片进详情（返回后保留搜索/筛选/排序）；详情含 tag 增删、
+四个打开按钮、「从管理器移除」。README 支持渲染 / 编辑 / 生成：Markdown 经 marked 转
+HTML 后用 DOMPurify 清洗再插入（拦截 script/iframe/on* 事件/javascript: 链接），
+相对路径图片经 `read_project_image` 校验（限项目目录内、扩展名与 10MB 白名单）后转 data URL；
+CodeMirror 6 左编辑右实时预览，Cmd+S 保存并按纳秒 mtime 检测外部冲突（冲突弹框，
+不静默覆盖）；无 README 时用 `create_new` 生成模板（绝不覆盖）。安全：`app.security.csp`
+禁止内联/外部脚本，写入 README 前 canonicalize 校验位于项目目录内（拒绝符号链接写穿）。
+后端只收项目 id，路径由数据库取；对用户目录只写 README 本身。
+
 ## 环境
 
 - pnpm 11、node 22、rust 1.99、Xcode CLT

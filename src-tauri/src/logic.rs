@@ -47,6 +47,15 @@ pub fn format_date_ymd(secs: i64) -> String {
         .unwrap_or_default()
 }
 
+/// 今天的本地日期 `YYYY-MM-DD`。
+pub fn today_ymd() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    format_date_ymd(secs)
+}
+
 /// 解析 `.git/config` 中各 remote 的 URL：`{ remote名: url }`
 pub fn extract_remote_urls(config_text: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();

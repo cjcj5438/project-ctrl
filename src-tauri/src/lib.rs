@@ -1,6 +1,7 @@
 mod commands;
 mod db;
 mod logic;
+mod readme;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -21,6 +22,11 @@ pub fn run() {
             commands::open_in_vscode,
             commands::open_in_iterm,
             commands::open_github,
+            commands::read_readme,
+            commands::save_readme,
+            commands::generate_readme,
+            commands::read_project_image,
+            commands::open_external,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

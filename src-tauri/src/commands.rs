@@ -1,6 +1,7 @@
 //! Tauri commands：组合 db + logic + 文件系统读取。
 
-use crate::{db, logic};
+use crate::{db, logic, readme};
+use crate::readme::ReadmeError;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -237,5 +238,52 @@ pub fn open_in_iterm(id: i64) -> Result<(), String> {
 pub fn open_github(id: i64) -> Result<(), String> {
     let path = project_path(id)?;
     let url = github_url_of(&path).ok_or_else(|| "该项目未识别到 GitHub remote".to_string())?;
+    run_command("open", &[&url])
+}
+
+fn project_path_err(id: i64) -> Result<PathBuf, ReadmeError> {
+    project_path(id).map_err(|m| ReadmeError::Message { message: m })
+}
+
+#[tauri::command]
+pub fn read_readme(id: i64) -> Result<readme::ReadmeInfo, String> {
+    let base = project_path(id)?;
+    let name = readme::find_readme(&base).map_err(|e| e.to_string())?;
+    readme::read_info(&base, name).map_err(ReadmeError::into_message)
+}
+
+#[tauri::command]
+pub fn save_readme(
+    id: i64,
+    content: String,
+    expected_mtime: Option<String>,
+    force: bool,
+) -> Result<String, ReadmeError> {
+    let base = project_path_err(id)?;
+    let name = readme::find_readme(&base)
+        .map_err(|e| ReadmeError::Message { message: e.to_string() })?
+        .ok_or_else(|| ReadmeError::Message { message: "该项目没有 README 文件".to_string() })?;
+    readme::save(&base, &name, &content, expected_mtime.as_deref(), force)
+}
+
+#[tauri::command]
+pub fn generate_readme(id: i64) -> Result<readme::ReadmeInfo, ReadmeError> {
+    let base = project_path_err(id)?;
+    let title = logic::project_name_of(&base);
+    let date = created_date_of(&base).unwrap_or_else(logic::today_ymd);
+    readme::generate(&base, &title, &date)
+}
+
+#[tauri::command]
+pub fn read_project_image(id: i64, rel_path: String) -> Result<String, String> {
+    let base = project_path(id)?;
+    readme::read_image_data_url(&base, &rel_path).map_err(ReadmeError::into_message)
+}
+
+#[tauri::command]
+pub fn open_external(url: String) -> Result<(), String> {
+    if !readme::is_allowed_external(&url) {
+        return Err(format!("不允许打开的链接：{url}"));
+    }
     run_command("open", &[&url])
 }
