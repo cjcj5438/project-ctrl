@@ -61,8 +61,8 @@ pub struct GitResult {
 
 /// 子进程一次执行的结果（保留 pid 便于测试确认超时被真正回收）。
 pub struct RunOutcome {
-    /// 子进程 pid（产品逻辑不用；测试用于确认超时后已被回收）。
-    #[allow(dead_code)]
+    /// 子进程 pid（仅测试使用：确认超时后进程已被真正回收）。
+    #[cfg(test)]
     pub pid: u32,
     pub success: bool,
     pub code: Option<i32>,
@@ -99,6 +99,8 @@ pub fn run_capture(
         .stderr(Stdio::piped())
         .spawn()?;
     let pid = child.id();
+    #[cfg(not(test))]
+    let _ = pid;
     let mut so = child.stdout.take().expect("stdout piped");
     let mut se = child.stderr.take().expect("stderr piped");
     let th_out = std::thread::spawn(move || {
@@ -135,6 +137,7 @@ pub fn run_capture(
     let stdout = th_out.join().unwrap_or_default();
     let stderr = th_err.join().unwrap_or_default();
     Ok(RunOutcome {
+        #[cfg(test)]
         pid,
         success: status.map(|s| s.success()).unwrap_or(false),
         code: status.and_then(|s| s.code()),

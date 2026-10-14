@@ -8,6 +8,22 @@
     }
   },
   "build": { "beforeBuildCommand": "pnpm build", "beforeDevCommand": "pnpm dev", "devUrl": "http://localhost:1420", "frontendDist": "../dist" },
-  "identifier": "com.project-ctrl.app",
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "public.app-category.developer-tools",
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "signingIdentity": "-"
+    }
+  },
+  "identifier": "com.chenjing.project-ctrl",
   "productName": "project-ctrl"
 }
