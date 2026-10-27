@@ -4,7 +4,7 @@ import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, TextareaHTML
  * 原子组件层：全站唯一的按钮/输入框/徽章/卡片外观来源。
  *
  * 之前每个文件内联复制同一串 Tailwind class，改一处颜色要改 20 个文件；现在只有这里定义，
- * 且颜色全部走 `index.css` 的语义 token（`surface` / `fg` / `border` / `accent` …），
+ * 且颜色全部走 `index.css` 的语义 token（`surface` / `fg` / `border` / `primary` …），
  * 亮暗两套由 `.dark` 类切换，不再散落 `dark:` 变体。
  */
 
@@ -13,11 +13,11 @@ type Size = 'sm' | 'md'
 
 const VARIANT: Record<Variant, string> = {
   primary:
-    'bg-primary text-primary-fg hover:brightness-110 disabled:opacity-40 border border-transparent',
+    'bg-primary text-primary-fg hover:brightness-95 disabled:opacity-40 border border-transparent',
   outline:
     'border border-border bg-surface text-fg hover:bg-surface-raised disabled:opacity-40',
   ghost: 'border border-transparent text-muted hover:bg-surface-raised disabled:opacity-40',
-  danger: 'border border-error/50 text-error hover:brightness-110/10 disabled:opacity-40',
+  danger: 'border border-error/50 text-error hover:brightness-95 disabled:opacity-40',
 }
 
 const SIZE: Record<Size, string> = {
@@ -29,11 +29,13 @@ const SIZE: Record<Size, string> = {
 export function Button({
   variant = 'outline',
   size = 'md',
+  type = 'button',
   className = '',
   ...rest
 }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: Variant; size?: Size }) {
   return (
     <button
+      type={type}
       {...rest}
       className={`inline-flex items-center gap-1.5 whitespace-nowrap transition-colors disabled:cursor-not-allowed ${VARIANT[variant]} ${SIZE[size]} ${className}`}
     />
@@ -42,12 +44,14 @@ export function Button({
 
 export function IconButton({
   label,
+  type = 'button',
   className = '',
   children,
   ...rest
 }: ButtonHTMLAttributes<HTMLButtonElement> & { label: string }) {
   return (
     <button
+      type={type}
       {...rest}
       aria-label={label}
       title={label}
@@ -59,7 +63,7 @@ export function IconButton({
 }
 
 const FIELD =
-  'w-full rounded-md border border-border bg-surface px-2 py-1 text-sm text-fg placeholder:text-muted/70 focus:border-accent'
+  'w-full rounded-md border border-border bg-surface px-2 py-1 text-sm text-fg placeholder:text-muted/70 focus:border-primary'
 
 export function Input({ className = '', ...rest }: InputHTMLAttributes<HTMLInputElement>) {
   return <input {...rest} className={`${FIELD} ${className}`} />
@@ -84,12 +88,11 @@ export function Badge({
   title,
 }: {
   children: ReactNode
-  tone?: 'neutral' | 'accent' | 'success' | 'warning' | 'error'
+  tone?: 'neutral' | 'success' | 'warning' | 'error'
   title?: string
 }) {
   const tones: Record<string, string> = {
     neutral: 'border-border text-muted',
-    accent: 'border-accent/50 text-accent',
     success: 'border-success/50 text-success',
     warning: 'border-warning/50 text-warning',
     error: 'border-error/50 text-error',
@@ -112,7 +115,7 @@ export function Card({
   return (
     <div
       {...rest}
-      className={`rounded-[var(--radius-card)] border border-border bg-surface ${className}`}
+      className={`rounded-card border border-border bg-surface ${className}`}
     >
       {children}
     </div>
@@ -121,7 +124,7 @@ export function Card({
 
 export function Panel({ title, children }: { title: ReactNode; children: ReactNode }) {
   return (
-    <details className="mt-4 rounded-[var(--radius-card)] border border-border">
+    <details className="mt-4 rounded-card border border-border">
       <summary className="cursor-pointer px-3 py-2 text-sm font-semibold">{title}</summary>
       <div className="border-t border-border p-3">{children}</div>
     </details>
@@ -133,7 +136,7 @@ export function ErrorBanner({ text, onClose }: { text: string; onClose?: () => v
     <div className="mt-3 flex items-start gap-2 rounded-lg border border-error/40 bg-error/10 px-3 py-2 text-sm text-error">
       <span className="min-w-0 flex-1 whitespace-pre-wrap break-words">{text}</span>
       {onClose && (
-        <button onClick={onClose} className="shrink-0 text-xs underline" aria-label="关闭提示">
+        <button type="button" onClick={onClose} className="shrink-0 text-xs underline" aria-label="关闭提示">
           关闭
         </button>
       )}
@@ -156,7 +159,7 @@ export function Modal({
 }) {
   return (
     <div
-      className="fixed inset-0 z-30 flex items-center justify-center bg-black/50 p-6"
+      className="fixed inset-0 z-30 flex items-center justify-center bg-scrim p-6"
       role="dialog"
       aria-modal="true"
       aria-label={typeof title === 'string' ? title : '对话框'}
@@ -169,6 +172,7 @@ export function Modal({
         <div className="flex items-center gap-3 border-b border-border px-4 py-2.5">
           <h2 className="text-sm font-semibold">{title}</h2>
           <button
+            type="button"
             onClick={onClose}
             className="ml-auto rounded-md px-2 py-0.5 text-xs text-muted hover:bg-surface-raised hover:text-fg"
             aria-label="关闭"
@@ -184,15 +188,23 @@ export function Modal({
 }
 
 /** 运行状态圆点：颜色不是唯一信息源（旁边总带文字标签）。 */
-export function StatusDot({ tone, label }: { tone: 'idle' | 'busy' | 'ok' | 'bad'; label?: string }) {
+export function StatusDot({
+  tone,
+  label,
+  title,
+}: {
+  tone: 'idle' | 'busy' | 'ok' | 'bad'
+  label?: string
+  title?: string
+}) {
   const map = {
     idle: 'bg-muted/50',
     busy: 'bg-warning',
     ok: 'bg-success',
-    bad: 'bg-error',
+    bad: 'bg-error-solid',
   } as const
   return (
-    <span className="inline-flex items-center gap-1.5">
+    <span className="inline-flex items-center gap-1.5" title={title} role={title && !label ? 'img' : undefined} aria-label={title && !label ? title : undefined}>
       <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${map[tone]}`} aria-hidden />
       {label && <span className="text-xs">{label}</span>}
     </span>

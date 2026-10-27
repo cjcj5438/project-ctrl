@@ -13,21 +13,23 @@
   --color-muted: var(--muted);
   --color-border: var(--border);
   --color-accent: var(--accent);
-  --color-accent-fg: var(--accent-fg);
   /* 主操作：亮暗两套都用蓝，与「运行绿 / 成功绿」彻底分开 */
   --color-primary: var(--primary);
   --color-primary-fg: var(--primary-fg);
   --color-success: var(--success);
-  --color-on-success: var(--on-success);
   --color-warning: var(--warning);
   --color-error: var(--error);
   --color-error-solid: var(--error-solid);
+  --color-on-solid: var(--on-solid);
   --color-info: var(--info);
+  --color-on-info: var(--on-info);
+  --color-scrim: var(--scrim);
   --radius-card: 10px;
   --font-sans: "IBM Plex Sans", -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
+/* 每个 text-…-on-… 对都要求正文级对比度（WCAG AA 4.5:1，见最终报告的实测表） */
 :root {
   /* 亮色：低对比背景 + 明确边框（不用阴影堆层次） */
   --surface: #ffffff;
@@ -35,16 +37,19 @@
   --fg: #16181d;
   --muted: #5c6470;
   --border: #d7dbe2;
+  /* accent 只做装饰性描边/高亮，不再承载文字信息；running 绿由 success 承担 */
   --accent: #2563eb;
-  --accent-fg: #ffffff;
   --primary: #2563eb;
   --primary-fg: #ffffff;
   --success: #15803d;
-  --on-success: #ffffff;
-  --warning: #a16207;
+  --warning: #8a6100;
   --error: #b91c1c;
   --error-solid: #b91c1c;
+  /* 实底按钮上的字：两套主题都是白字，但 solid 本身深浅不同，token 分开声明 */
+  --on-solid: #ffffff;
   --info: #1d4ed8;
+  --on-info: #ffffff;
+  --scrim: rgb(0 0 0 / 0.45);
   --ring: #2563eb;
   color-scheme: light;
 }
@@ -56,18 +61,20 @@ html.dark {
   --fg: #f8fafc;
   --muted: #94a3b8;
   --border: #334155;
-  /* accent 在暗色下是「运行/选中」绿；主操作仍是蓝，避免与状态同色 */
+  /* accent 在暗色下是「运行/选中」绿（与 success 同值是故意的：同一语义同一色） */
   --accent: #22c55e;
-  --accent-fg: #0f172a;
   --primary: #2563eb;
   --primary-fg: #ffffff;
   --success: #22c55e;
-  --on-success: #0f172a;
   --warning: #f59e0b;
   /* 拆两个：error 用于文字/边框（亮底上要够亮），error-solid 用于实底按钮（配白字要够深） */
   --error: #f87171;
   --error-solid: #dc2626;
+  --on-solid: #ffffff;
+  /* 暗 --info 是浅蓝 #60a5fa：白字只有 2.54:1，必须配深色字 */
   --info: #60a5fa;
+  --on-info: #0f172a;
+  --scrim: rgb(0 0 0 / 0.55);
   --ring: #f8fafc;
   color-scheme: dark;
 }
@@ -111,7 +118,7 @@ html.dark ::-webkit-scrollbar {
   height: 10px;
 }
 html.dark ::-webkit-scrollbar-thumb {
-  background: #334155;
+  background: var(--border);
   border-radius: 6px;
 }
 html.dark ::-webkit-scrollbar-track {
@@ -156,18 +163,18 @@ html.dark ::-webkit-scrollbar-track {
   margin: 0.5em 0;
 }
 .md-body a {
-  color: var(--accent);
+  color: var(--info);
   text-decoration: underline;
 }
 .md-body code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  background: rgba(127, 127, 127, 0.18);
+  background: color-mix(in srgb, var(--fg) 12%, transparent);
   padding: 0.1em 0.3em;
   border-radius: 4px;
   font-size: 0.85em;
 }
 .md-body pre {
-  background: rgba(127, 127, 127, 0.14);
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
   padding: 0.8em;
   border-radius: 8px;
   overflow: auto;
@@ -182,11 +189,11 @@ html.dark ::-webkit-scrollbar-track {
 }
 .md-body th,
 .md-body td {
-  border: 1px solid rgba(127, 127, 127, 0.35);
+  border: 1px solid var(--border);
   padding: 0.3em 0.6em;
 }
 .md-body blockquote {
-  border-left: 3px solid rgba(127, 127, 127, 0.4);
+  border-left: 3px solid var(--border);
   padding-left: 0.8em;
   color: var(--muted);
   margin: 0.6em 0;
@@ -196,7 +203,7 @@ html.dark ::-webkit-scrollbar-track {
 }
 .md-body hr {
   border: none;
-  border-top: 1px solid rgba(127, 127, 127, 0.3);
+  border-top: 1px solid var(--border);
   margin: 1em 0;
 }
 
@@ -212,7 +219,7 @@ html.dark .cm-editor {
   }
   html.dark .cm-activeLine,
   html.dark .cm-activeLineGutter {
-    background: rgba(255, 255, 255, 0.06);
+    background: color-mix(in srgb, var(--fg) 6%, transparent);
   }
   html.dark .cm-cursor {
     border-left-color: var(--fg);
