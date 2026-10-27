@@ -30,6 +30,10 @@
 - **从 GitHub 克隆**：粘贴 https / ssh 地址 + 选父目录 → `git clone` → 自动加入管理器。
 - **导入 PM2 配置**：读 `~/my/PM2/ecosystem.config.js`，把其中的应用转成项目 + 配方（已存在的不覆盖，cwd 不存在的跳过）。
 
+## 使用文档
+
+带截图的完整使用说明见 [`docs/USAGE.md`](docs/USAGE.md)。
+
 ## 环境
 
 - macOS（Apple Silicon）、pnpm 11、node 22、Rust stable、Xcode Command Line Tools
