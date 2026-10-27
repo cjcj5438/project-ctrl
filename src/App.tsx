@@ -946,6 +946,7 @@ function OpsBar({
           >
             <StatusDot tone={tone} title={PHASE_TEXT[st.phase]} />
             <span>{st.name}</span>
+            {st.port != null && <span className="font-mono text-muted">:{st.port}</span>}
           </button>
         )
       })}

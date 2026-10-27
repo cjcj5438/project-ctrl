@@ -251,8 +251,8 @@ export const api = {
   projectServices: (id: number) => invoke<ProjectServices>('project_services', { id }),
   saveService: (id: number, spec: ServiceSpec) => invoke<void>('save_service', { id, spec }),
   deleteService: (id: number, name: string) => invoke<void>('delete_service', { id, name }),
-  solidifyDescriptor: (id: number, names: string[], overwrite: boolean) =>
-    invoke<string>('solidify_descriptor', { id, names, overwrite }),
+  solidifyDescriptor: (id: number, names: string[], overwrite: boolean, confirmEnv: boolean) =>
+    invoke<string>('solidify_descriptor', { id, names, overwrite, confirm_env: confirmEnv }),
   readDescriptor: (id: number) => invoke<string | null>('read_descriptor', { id }),
   serviceStatus: () => invoke<ServiceStatus[]>('service_status'),
   serviceLogs: (id: number, name: string) => invoke<string[]>('service_logs', { id, name }),

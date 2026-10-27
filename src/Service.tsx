@@ -662,6 +662,7 @@ function DetectPanel({
   act: (tag: string, fn: () => Promise<void>) => Promise<void>
 }) {
   const [input, setInput] = useState('')
+  const [envConfirm, setEnvConfirm] = useState<string | null>(null)
   const compose = detected.compose_stacks
 
   /** 探测结果 → 一条可保存的声明（不写仓库文件）。 */
@@ -688,6 +689,28 @@ function DetectPanel({
         ports: { requires: stack.ports },
       })
       onDone()
+    })
+
+  /**
+   * 固化为仓库声明。env 非空时后端先拒绝（Err 含 ENV_CONFIRM_REQUIRED，只列 key 名）：
+   * 此时弹确认框展示后端原文，用户确认后再用 confirmEnv=true 重调。
+   * 其余错误直接走 onError，不弹框。
+   */
+  const solidify = (confirmEnv: boolean) =>
+    act('solidify', async () => {
+      try {
+        const text = await api.solidifyDescriptor(project.id, [], false, confirmEnv)
+        onError(null)
+        void text
+        onDone()
+      } catch (e) {
+        const msg = errorText(e)
+        if (!confirmEnv && msg.includes('ENV_CONFIRM_REQUIRED')) {
+          setEnvConfirm(msg)
+          return
+        }
+        onError(msg)
+      }
     })
 
   return (
@@ -780,17 +803,46 @@ function DetectPanel({
         </button>
         <button
           type="button"
-          onClick={() => void act('solidify', async () => {
-            const text = await api.solidifyDescriptor(project.id, [], false)
-            onError(null)
-            void text
-          })}
+          onClick={() => void solidify(false)}
+          disabled={busy !== null}
           title="把已有服务写进仓库内的 .project-ctrl.json"
-          className="ml-auto rounded border border-border px-2 py-1 text-xs "
+          className="ml-auto rounded border border-border px-2 py-1 text-xs disabled:opacity-40 "
         >
           固化为仓库声明…
         </button>
       </div>
+      {envConfirm !== null && (
+        <div className="fixed inset-0 z-30 flex items-center justify-center bg-scrim p-6">
+          <div className="w-full max-w-md rounded-xl bg-surface p-5 ">
+            <h3 className="font-semibold">确认写入环境变量？</h3>
+            <p className="mt-2 text-sm">
+              以下服务的 env 将写入可提交的 <span className="font-mono">.project-ctrl.json</span>。
+              为防 secret 泄露，这里只列变量名，请确认无密钥后再继续。
+            </p>
+            <p className="mt-2 break-all text-xs text-warning">{envConfirm}</p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setEnvConfirm(null)}
+                className="rounded-lg border border-border px-3 py-1.5 text-sm "
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setEnvConfirm(null)
+                  void solidify(true)
+                }}
+                disabled={busy !== null}
+                className="rounded-lg bg-primary px-3 py-1.5 text-sm text-primary-fg disabled:opacity-40"
+              >
+                确认写入
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
