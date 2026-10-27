@@ -54,6 +54,12 @@ impl Drop for ScopedDataDir {
 /// （固定顺序，避免两锁反转死锁）。
 static HOME_LOCK: Mutex<()> = Mutex::new(());
 
+/// 只读 HOME 派生路径（`execenv::base_path/path_for/env_for`）的测试也要持有它：
+/// 持 `ScopedHome` 的测试会切换进程级 HOME，无锁读会在两次调用之间读到不同的 HOME。
+pub fn exclusive_home() -> MutexGuard<'static, ()> {
+    HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// 把 HOME 指到 `dir`，并在离开作用域时恢复原值。
 ///
 /// 与 `ScopedDataDir` 互斥方式不同：两者各持自己的锁，若一个测试同时需要两者，

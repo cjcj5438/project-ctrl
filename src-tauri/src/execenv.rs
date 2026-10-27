@@ -185,7 +185,8 @@ mod tests {
 
     #[test]
     fn declared_path_is_appended_not_replacing_pin_prefix() {
-        // 声明 PATH 拼在后面：pin 前缀（path_for）保留在前，与 preflight 解析一致。
+        // 两次 path_for 之间若有测试切换进程级 HOME，前缀断言会偶发挂掉：持同锁串行。
+        let _home = crate::test_support::exclusive_home();
         let mut env = BTreeMap::new();
         env.insert("PATH".to_string(), "/declared/bin".to_string());
         let out = env_for(Some("99.99.99"), &env, &[]);

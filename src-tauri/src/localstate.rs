@@ -152,6 +152,17 @@ impl Override {
 
 /// `set_service_override` 的 patch 形状（#22 三态语义）。
 ///
+/// 三态字段的反序列化：serde 默认把 JSON `null` 反成外层 `None`（= 不变），
+/// 与三态语义（`null` = 删键）相悖。这里显式包一层 `Some`，使字段缺席 → `None`、
+/// `null` → `Some(None)`、值 → `Some(Some(v))`（等价于 `serde_with::double_option`，免引依赖）。
+fn deserialize_double_option<'de, T, D>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(d)?))
+}
+
 /// 每个字段三态：absent（字段缺席）= 不变；`null` = 删除该键；值 = 设置。
 /// `env` 逐键三态：缺席的键不变，`null` 值的键删除，有值的键设置/覆盖。
 /// `env_files` 整体三态：absent 不变，`null` 清空，数组整体替换。
@@ -162,11 +173,15 @@ impl Override {
 #[derive(Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct OverridePatch {
+    #[serde(deserialize_with = "deserialize_double_option")]
     pub port_offset: Option<Option<u16>>,
+    #[serde(deserialize_with = "deserialize_double_option")]
     pub keep_alive: Option<Option<bool>>,
+    #[serde(deserialize_with = "deserialize_double_option")]
     pub restart: Option<Option<Restart>>,
     #[serde(default)]
     pub env: Option<BTreeMap<String, Option<String>>>,
+    #[serde(deserialize_with = "deserialize_double_option")]
     pub env_files: Option<Option<Vec<String>>>,
 }
 
@@ -341,14 +356,53 @@ pub fn write_adopt(rec: &crate::supervisor::AdoptRecord) -> Result<(), String> {
 
 pub fn read_adopts() -> Vec<crate::supervisor::AdoptRecord> {
     let Ok(rd) = std::fs::read_dir(run_dir()) else { return Vec::new() };
-    rd.filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
-        .filter_map(|e| {
-            restrict_permissions(&e.path());
-            std::fs::read_to_string(e.path()).ok()
-        })
-        .filter_map(|t| serde_json::from_str::<crate::supervisor::AdoptRecord>(&t).ok())
-        .collect()
+    // #15 命名迁移：同一 key 可能同时有新旧两个文件（旧 `_` 命名 + 新 `%XX` 命名）。
+    // 同 key 只保留一条，并删掉非新命名路径的文件，避免调用方 verify 旧记录失败后
+    // clear_adopt(key) 误删同名新凭据。
+    let mut by_key: BTreeMap<String, (std::path::PathBuf, crate::supervisor::AdoptRecord)> = BTreeMap::new();
+    for e in rd.filter_map(|e| e.ok()) {
+        let path = e.path();
+        if path.extension().map(|x| x != "json").unwrap_or(true) {
+            continue;
+        }
+        restrict_permissions(&path);
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let Ok(rec) = serde_json::from_str::<crate::supervisor::AdoptRecord>(&text) else { continue };
+        let canonical = adopt_path(&rec.key);
+        match by_key.get(&rec.key) {
+            None => {
+                by_key.insert(rec.key.clone(), (path, rec));
+            }
+            Some((prev_path, prev)) => {
+                // 新命名路径优先；都不/都新则 started_at 大者胜。
+                let cur_canon = path == canonical;
+                let prev_canon = *prev_path == canonical;
+                let cur_wins = match (cur_canon, prev_canon) {
+                    (true, false) => true,
+                    (false, true) => false,
+                    _ => rec.started_at >= prev.started_at,
+                };
+                if cur_wins {
+                    let (loser_path, _) = by_key.insert(rec.key.clone(), (path.clone(), rec)).unwrap();
+                    let _ = std::fs::remove_file(loser_path);
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+    // 单文件但路径非新命名（如仅剩旧 1_keep.json）：搬到新命名，避免下次写出双份。
+    let mut out = Vec::with_capacity(by_key.len());
+    for (key, (path, rec)) in by_key {
+        let canonical = adopt_path(&key);
+        if path != canonical
+            && atomic_write(&canonical, serde_json::to_string_pretty(&rec).unwrap_or_default().as_bytes()).is_ok()
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+        out.push(rec);
+    }
+    out
 }
 
 pub fn clear_adopt(key: &str) {
@@ -607,6 +661,31 @@ mod tests {
             let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "存量 {} 应被修复为 0600", p.display());
         }
+    }
+
+    #[test]
+    fn stale_old_naming_adopt_files_are_deduped_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let _data = crate::test_support::ScopedDataDir::new(dir.path());
+        std::fs::create_dir_all(run_dir()).unwrap();
+        // 新旧两个文件同 key：新命名 1%2Fkeep.json + 旧命名 1_keep.json
+        let new_rec = crate::supervisor::AdoptRecord {
+            key: "1/keep".into(), project_id: 1, name: "keep".into(), pid: 37881, pgid: 37881,
+            argv: vec!["sleep".into(), "30".into()], cwd: "/tmp".into(), started_at: 1793129285,
+            port: None, keep_alive: true,
+        };
+        let mut old_rec = new_rec.clone();
+        old_rec.pid = 27881;
+        old_rec.started_at = 1793128207;
+        std::fs::write(adopt_path("1/keep"), serde_json::to_string_pretty(&new_rec).unwrap()).unwrap();
+        std::fs::write(run_dir().join("1_keep.json"), serde_json::to_string_pretty(&old_rec).unwrap()).unwrap();
+        // 读出只保留一条（started_at 较大者），旧命名文件被顺手删掉
+        let recs = read_adopts();
+        let keep: Vec<_> = recs.iter().filter(|r| r.key == "1/keep").collect();
+        assert_eq!(keep.len(), 1, "{recs:?}");
+        assert_eq!(keep[0].started_at, 1793129285);
+        assert!(!run_dir().join("1_keep.json").exists(), "旧命名文件应被清理");
+        assert!(adopt_path("1/keep").exists(), "新命名文件必须保留");
     }
 
     #[test]

@@ -1244,3 +1244,39 @@ fn ipc_docker_logs_small_output_reaches_ui_promptly() {
     }
     assert!(dead, "stop 后跟随进程 {pid} 必须退出");
 }
+
+/// #22 三态经 IPC 必须成立：`{"port_offset": null}` 删键，不是不变。
+///
+/// 退化史：serde 默认把 JSON `null` 反成外层 `None`（= 不变），`Some(None)`
+/// （= 删键）需要自定义 `deserialize_with`。单测只覆盖了 merge 层，IPC 层的
+/// 反序列化断裂直到真机联调才暴露（偏移清零无效）。
+#[test]
+fn ipc_override_null_deletes_key() {
+    let h = Harness::new("tmpnull");
+    let dir = std::env::temp_dir().join(format!("pc-ipc-ovenull-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    sample_service(&dir);
+    let path = dir.to_string_lossy().into_owned();
+    let id = add_project(&h, &path);
+    h.invoke(
+        "save_service",
+        json!({ "id": id, "spec": { "name": "api", "run": ["node", "server.js"] } }),
+    )
+    .expect("save");
+    // exact frontend shape: set then clear via explicit null
+    h.invoke("set_service_override", json!({ "id": id, "name": "api", "patch": { "port_offset": 5 } }))
+        .expect("set");
+    let back = h.invoke("service_override", json!({ "id": id, "name": "api" })).unwrap();
+    assert_eq!(back["port_offset"], 5);
+    h.invoke(
+        "set_service_override",
+        json!({ "id": id, "name": "api", "patch": { "port_offset": null } }),
+    )
+    .expect("clear");
+    let back2 = h.invoke("service_override", json!({ "id": id, "name": "api" })).unwrap();
+    assert!(
+        back2.get("port_offset").is_none() || back2["port_offset"].is_null(),
+        "null must delete key: {back2}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
