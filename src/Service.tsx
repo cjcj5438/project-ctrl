@@ -356,12 +356,17 @@ function ServiceCard({
     return () => {
       alive = false
       setLogErr(null)
-      void started.then(() =>
+      void started.then(() => {
+        // 被更新的一轮顶替（StrictMode remount / dockerKey 变化）时跳过 stop：
+        // 新轮的 dockerLogs 会在后端顶掉旧流，此时再 stop 会误杀刚开的新流
+        // （面板变空白且无 follower——旧代码注释里记过的失败模式）。
+        // 只有"没有后继者"（真正收起）时才停本轮的流。
+        if (seq !== dockerSeq.current) return
         api.dockerLogsStop(project.id, name).catch((e) => {
           // 停止失败必须可见：流可能还在后端常驻（compose logs -f 孤儿）
           setLogErr((prev) => prev ?? `日志跟随停止失败：${errorText(e)}`)
-        }),
-      )
+        })
+      })
     }
   }, [open, dockerKey, project.id, name])
 
