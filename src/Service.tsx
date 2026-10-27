@@ -604,10 +604,14 @@ function MeOverride({
 
   const save = () =>
     act(`me-${name}`, async () => {
-      const next: ServiceOverride | null =
-        Number(offset || 0) === 0 && !keep
-          ? null
-          : { port_offset: Number(offset || 0) || null, keep_alive: keep || null }
+      // 三态 patch：只发脏字段（缺席=不变），清零/取消发 null 删键——
+      // 旧语义"缺字段=删"会误伤 restart/env 等本面板不显示的键。
+      const next: ServiceOverride = {}
+      if (offsetDirty) {
+        const n = Number(offset || 0) || 0
+        next.port_offset = n === 0 ? null : n
+      }
+      if (keep !== view.keep_alive) next.keep_alive = keep ? true : null
       await api.setServiceOverride(project.id, name, next)
       await onSaved()
     })

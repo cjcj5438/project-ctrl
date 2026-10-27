@@ -118,13 +118,17 @@ export interface ProjectServices {
   detected: DetectResult
 }
 
-/** 本机层的覆盖（只由用户写）。 */
+/**
+ * set_service_override 的 patch 形状（三态语义，与后端 OverridePatch 对齐）：
+ * 外层 null = 删整条服务覆盖；字段缺席 = 不变；字段 null = 删该键；
+ * env 逐键三态（缺席不变/null删键/有值设置），env_files 整体三态（缺席不变/null清空/数组替换）。
+ */
 export interface ServiceOverride {
   port_offset?: number | null
   keep_alive?: boolean | null
   restart?: Restart | null
-  env?: Record<string, string>
-  env_files?: string[]
+  env?: Record<string, string | null>
+  env_files?: string[] | null
 }
 
 export interface ComposeCandidate {
