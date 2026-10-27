@@ -588,19 +588,22 @@ function MeOverride({
 }) {
   const [offset, setOffset] = useState(String(view.port_offset || ''))
   const [keep, setKeep] = useState(view.keep_alive)
-  // 输入中（offset 为脏或聚焦）时跳过外部回写：svc:state 触发的 load 会重建 view，
-  // 直接 setOffset 会把正在打的字覆盖掉。
+  // 脏字段不覆盖：svc:state 触发的 load 会重建 view，直接回写会把用户未保存的
+  // 输入弹回（offset 正在打的字 / keep 刚勾的复选框）。
   const offsetFocused = useRef(false)
   const offsetDirty = (Number(offset || 0) || 0) !== view.port_offset
+  const keepDirty = keep !== view.keep_alive
 
   useEffect(() => {
     if (!offsetFocused.current && !offsetDirty) {
       setOffset(view.port_offset ? String(view.port_offset) : '')
     }
-    setKeep(view.keep_alive)
-  }, [view.port_offset, view.keep_alive, offsetDirty])
+    if (!keepDirty) {
+      setKeep(view.keep_alive)
+    }
+  }, [view.port_offset, view.keep_alive, offsetDirty, keepDirty])
 
-  const dirty = offsetDirty || keep !== view.keep_alive
+  const dirty = offsetDirty || keepDirty
 
   const save = () =>
     act(`me-${name}`, async () => {
