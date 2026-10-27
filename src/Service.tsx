@@ -51,6 +51,40 @@ function statusLine(st: ServiceStatus | null) {
   return { label: PHASE_LABEL[st.phase], dot: DOT[st.phase], detail: bits.join(' · ') }
 }
 
+/**
+ * docker-only 的状态快照：后端不进 supervisor、无事件通道，前端在 up/down 后
+ * 主动读一次 dockerPs 推导 Running/Stopped。失败时抛给 act→onError，不写回旧态。
+ */
+async function dockerSnapshot(
+  projectId: number,
+  name: string,
+  prev: ServiceStatus | null,
+): Promise<ServiceStatus> {
+  const views = await api.dockerPs(projectId, name)
+  const running = views.filter((v) => v.state === 'running')
+  const port =
+    running
+      .flatMap((v) => v.ports.split(','))
+      .map((p) => Number(p.trim()))
+      .find((n) => Number.isInteger(n) && n > 0 && n <= 65535) ?? null
+  return {
+    key: statusKey(projectId, name),
+    project_id: projectId,
+    name,
+    phase: running.length > 0 ? 'Running' : 'Stopped',
+    step: null,
+    port,
+    pid: null,
+    exit_code: null,
+    note:
+      running.length > 0
+        ? `docker 运行中：${running.map((v) => v.service).join('、')}`
+        : null,
+    restarts: prev?.restarts ?? 0,
+    started_at: prev?.started_at ?? 0,
+  }
+}
+
 /** 服务面板：多服务的状态、启停、步骤、日志、docker 子容器。折叠时只显示汇总。 */
 export default function ServiceSection({
   project,
@@ -164,6 +198,9 @@ export default function ServiceSection({
             onToggle={() => setActive(active === v.spec.name ? null : v.spec.name)}
             onEdit={() => setEditing(v.spec.name)}
             onRefresh={load}
+            onStatus={(st) =>
+              setStatuses((prev) => ({ ...prev, [statusKey(project.id, v.spec.name)]: st }))
+            }
             act={act}
           />
         ))}
@@ -241,6 +278,7 @@ function ServiceCard({
   onToggle,
   onEdit,
   onRefresh,
+  onStatus,
   act,
 }: {
   project: ProjectInfo
@@ -251,6 +289,7 @@ function ServiceCard({
   onToggle: () => void
   onEdit: () => void
   onRefresh: () => Promise<void>
+  onStatus: (st: ServiceStatus) => void
   act: (tag: string, fn: () => Promise<void>) => Promise<void>
 }) {
   const spec = view.spec
@@ -417,14 +456,40 @@ function ServiceCard({
             <Button
               variant="primary"
               size="sm"
-              onClick={() => void act(`start-${name}`, async () => void (await api.serviceStart(project.id, name)))}
+              onClick={() => void act(`start-${name}`, async () => {
+                const st = await api.serviceStart(project.id, name)
+                // docker-only 不进 supervisor：没有 svc:state 事件，必须把返回值写回，
+                // 否则成功也显示「未运行」。本地进程的事件随后会覆盖同一条，无害。
+                onStatus(st)
+                if (spec.docker) await loadContainers()
+              })}
               disabled={busy !== null || isRunning || isStep || problems === null || (problems?.length ?? 0) > 0 || !!preflightErr || (!spec.run && !spec.docker)}
               title={problems === null ? '预检中…' : (problems?.[0] ?? preflightErr ?? (!spec.run && !spec.docker ? '该服务没有 run 命令' : ''))}
             >
               {problems === null ? '预检中…' : '启动'}
             </Button>
             <Button size="sm"
-              onClick={() => void act(`stop-${name}`, async () => void (await api.serviceStop(project.id, name)))}
+              onClick={() => void act(`stop-${name}`, async () => {
+                await api.serviceStop(project.id, name)
+                // 与启动对称：docker-only 停后把快照置回 Stopped 并刷新容器表
+                // （本地进程的 Stopped 事件随后会覆盖同一条，无害）。
+                if (spec.docker && !spec.run) {
+                  onStatus({
+                    key: statusKey(project.id, name),
+                    project_id: project.id,
+                    name,
+                    phase: 'Stopped',
+                    step: null,
+                    port: status?.port ?? null,
+                    pid: null,
+                    exit_code: null,
+                    note: null,
+                    restarts: 0,
+                    started_at: 0,
+                  })
+                  await loadContainers()
+                }
+              })}
               disabled={busy !== null || (!isRunning && !isStep)}
             >
               停止
@@ -433,7 +498,9 @@ function ServiceCard({
               onClick={() =>
                 void act(`restart-${name}`, async () => {
                   await api.serviceStop(project.id, name)
-                  await api.serviceStart(project.id, name)
+                  const st = await api.serviceStart(project.id, name)
+                  onStatus(st)
+                  if (spec.docker) await loadContainers()
                 })
               }
               disabled={busy !== null || isStep || (!spec.run && !spec.docker)}
@@ -465,6 +532,9 @@ function ServiceCard({
                     void act(`up-${name}`, async () => {
                       await api.dockerUp(project.id, name)
                       await loadContainers()
+                      // compose up 成功后同步一次状态快照：docker-only 无事件通道，
+                      // 不写回则 badge/按钮停在旧态。读容器表推导 Running/Stopped。
+                      if (!spec.run) onStatus(await dockerSnapshot(project.id, name, status))
                     })
                   }
                   disabled={busy !== null}
@@ -477,6 +547,7 @@ function ServiceCard({
                     void act(`down-${name}`, async () => {
                       await api.dockerDown(project.id, name)
                       await loadContainers()
+                      if (!spec.run) onStatus(await dockerSnapshot(project.id, name, status))
                     })
                   }
                   disabled={busy !== null}
