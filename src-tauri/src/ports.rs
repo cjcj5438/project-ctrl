@@ -31,6 +31,10 @@ const LSOF: &str = "/usr/sbin/lsof";
 /// 单次查询用这个函数；需要反复判断时用 `pick` / `listening_in` / `missing_requires`
 /// （它们只扫一次 `lsof`，而不是每个端口扫一次）。
 pub fn is_free(port: u16) -> bool {
+    // 0 不是可分配的固定端口：bind(0) 语义是“随机分配”，判空闲只会让调用方恒超时。
+    if port == 0 {
+        return false;
+    }
     bind_free(port) && !listen_set().contains(&port)
 }
 
@@ -226,6 +230,9 @@ pub fn wait_listening(
 }
 
 /// 停止后等待端口释放（供 supervisor 用）。
+///
+/// 仅覆盖 TCP（`is_free` 只 bind/观测 TCP 监听）：UDP 独占的端口这里看不见，
+/// 若服务是纯 UDP，返回 true 不代表端口真释放——调用方不要据此做强假设。
 pub fn wait_released(port: u16, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -243,6 +250,12 @@ mod tests {
 
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn is_free_zero_is_always_false() {
+        // PORT=0 会恒超时：0 不是可分配的固定端口，判空闲只会误导调用方去 bind(0)。
+        assert!(!is_free(0));
     }
 
     #[test]

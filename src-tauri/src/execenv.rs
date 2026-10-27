@@ -30,9 +30,15 @@ pub fn base_path() -> String {
 }
 
 /// `~/.nvm/versions/node/v<pin>/bin`，目录存在才返回。
+///
+/// 白名单（#49）：只允许 `[A-Za-z0-9._-]+` 且不含 `/` 与 `..`，非法直接拒绝——
+/// 否则 pin 会被拼进路径，目录恰好存在时误命中、带出注入风险。
 pub fn node_bin_dir(pin: &str) -> Option<PathBuf> {
     let pin = pin.trim().trim_start_matches('v');
-    if pin.is_empty() {
+    if pin.is_empty()
+        || pin == ".."
+        || !pin.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
         return None;
     }
     let dir = home()?.join(".nvm/versions/node").join(format!("v{pin}")).join("bin");
@@ -79,6 +85,8 @@ pub fn resolve(program: &str, path: &str) -> Option<PathBuf> {
 
 /// 子进程的完整环境变量集合。调用方必须先 `env_clear()`。
 /// 优先级（低→高）：模块常量 < 声明的 `env` < `extra`（端口注入等）。
+/// 例外：`PATH` 是追加语义——pin 前缀（`path_for`）保留在前，声明的 PATH 拼在
+/// 后面（#49）。整体替换会丢掉 pin 前缀，与 preflight 的解析语义不一致。
 pub fn env_for(
     pin: Option<&str>,
     env: &BTreeMap<String, String>,
@@ -94,6 +102,12 @@ pub fn env_for(
     if let Some(h) = home() {
         out.push(("HOME".into(), h.display().to_string()));
     }
+    // 非密钥透传（#49）：值照抄当前进程，缺席就不设。
+    for k in ["TMPDIR", "USER"] {
+        if let Some(v) = std::env::var_os(k) {
+            out.push((k.into(), v.to_string_lossy().into_owned()));
+        }
+    }
     let upsert = |out: &mut Vec<(String, String)>, k: &str, v: &str| match
         out.iter_mut().find(|(ek, _)| ek == k)
     {
@@ -101,6 +115,14 @@ pub fn env_for(
         None => out.push((k.to_string(), v.to_string())),
     };
     for (k, v) in env {
+        // PATH 追加：pin 前缀保留，声明值拼后面；声明/extra 都只追加一次，
+        // 同 key 重复出现时后者覆盖前者的追加结果（与 upsert 语义一致）。
+        if k == "PATH" && !v.is_empty() {
+            if let Some(slot) = out.iter_mut().find(|(ek, _)| ek == "PATH") {
+                slot.1 = format!("{}:{v}", path_for(pin));
+            }
+            continue;
+        }
         upsert(&mut out, k, v);
     }
     for (k, v) in extra {
@@ -159,6 +181,51 @@ mod tests {
         assert_eq!(get("PORT"), Some("2222"));
         assert_eq!(get("MODE"), Some("dev"));
         assert_eq!(get("NO_COLOR"), Some("1"));
+    }
+
+    #[test]
+    fn declared_path_is_appended_not_replacing_pin_prefix() {
+        // 声明 PATH 拼在后面：pin 前缀（path_for）保留在前，与 preflight 解析一致。
+        let mut env = BTreeMap::new();
+        env.insert("PATH".to_string(), "/declared/bin".to_string());
+        let out = env_for(Some("99.99.99"), &env, &[]);
+        let path = out.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone()).unwrap();
+        assert!(path.starts_with(&path_for(Some("99.99.99"))), "{path}");
+        assert!(path.ends_with("/declared/bin"), "{path}");
+    }
+
+    #[test]
+    fn illegal_pin_is_rejected() {
+        // 非法 pin 直接拒绝（不做路径拼接/存在性判断）：含 / 或 .. 或空。
+        assert!(node_bin_dir("../x").is_none());
+        assert!(node_bin_dir("20/x").is_none());
+        assert!(node_bin_dir("..").is_none());
+        assert!(node_bin_dir("").is_none());
+        assert!(node_bin_dir("   ").is_none());
+        // 非法字符集（空格）也不接受——当前实现会拼出路径，目录恰好存在时
+        // 就会误命中，所以这里用“目录存在也拒绝”断言。
+        let home = std::env::var("HOME").unwrap();
+        let evil = std::path::PathBuf::from(&home).join(".nvm/versions/node/v20 0/bin");
+        std::fs::create_dir_all(&evil).unwrap();
+        assert!(node_bin_dir("20 0").is_none(), "含空格的 pin 必须拒绝");
+        let _ =
+            std::fs::remove_dir_all(std::path::PathBuf::from(&home).join(".nvm/versions/node/v20 0"));
+    }
+
+    #[test]
+    fn passthrough_tmpdir_and_user_exist() {
+        // 非密钥透传：当前进程有则子进程也有（值照抄，不做解析）。
+        let out = env_for(None, &BTreeMap::new(), &[]);
+        for k in ["TMPDIR", "USER"] {
+            match std::env::var(k) {
+                Ok(v) => assert_eq!(
+                    out.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.as_str()),
+                    Some(v.as_str()),
+                    "{k} 应透传"
+                ),
+                Err(_) => assert!(out.iter().all(|(ek, _)| ek != k), "{k} 缺席时不应凭空出现"),
+            }
+        }
     }
 
     #[test]

@@ -144,16 +144,30 @@ impl ServiceSpec {
         if !self.is_longrun() && self.steps.is_empty() && self.docker.is_none() {
             out.push(format!("{}：既没有 run、也没有 steps 或 docker", self.name));
         }
-        for (field, value) in [("cwd", &self.cwd)] {
-            if let Some(v) = value {
-                if v.starts_with('/') || v.split('/').any(|seg| seg == "..") {
-                    out.push(format!("{}：{field} 必须是项目内的相对路径（{v}）", self.name));
-                }
+        // clippy 单元素循环改写：直接判 cwd（行为零差异）。
+        if let Some(v) = &self.cwd {
+            if !is_project_relative(v) {
+                out.push(format!("{}：cwd 必须是项目内的相对路径（{v}）", self.name));
             }
         }
         for f in &self.env_files {
-            if f.starts_with('/') || f.split('/').any(|seg| seg == "..") {
+            if !is_project_relative(f) {
                 out.push(format!("{}：env_files 必须是项目内的相对路径（{f}）", self.name));
+            }
+        }
+        if self.ports.listen == Some(0) {
+            out.push(format!("{}：ports.listen 不能为 0（0 不是可监听的固定端口）", self.name));
+        }
+        if let Some(h) = &self.health {
+            if let Some(p) = &h.path {
+                if !p.starts_with('/') || p.chars().any(|c| c.is_whitespace()) {
+                    out.push(format!("{}：health.path 必须形如 /… 且不含空白（{p:?}）", self.name));
+                }
+            }
+            if let Some(t) = h.timeout_ms {
+                if !(100..=120_000).contains(&t) {
+                    out.push(format!("{}：health.timeout_ms 必须在 100–120000 之间（{t}）", self.name));
+                }
             }
         }
         if let Some(d) = &self.docker {
@@ -161,7 +175,7 @@ impl ServiceSpec {
                 out.push(format!("{}：docker.files 不能为空", self.name));
             }
             for f in &d.files {
-                if f.starts_with('/') || f.split('/').any(|seg| seg == "..") {
+                if !is_project_relative(f) {
                     out.push(format!("{}：docker 文件必须是项目内的相对路径（{f}）", self.name));
                 }
             }
@@ -215,6 +229,14 @@ pub fn parse_descriptor(text: &str) -> Result<Descriptor, String> {
         format!("描述文件解析失败：{e}（未知字段会直接报错，请检查拼写）")
     })?;
     let mut problems = Vec::new();
+    {
+        let mut seen = std::collections::HashSet::new();
+        for s in &d.services {
+            if !seen.insert(s.name.clone()) {
+                problems.push(format!("描述文件里服务名重复：{}", s.name));
+            }
+        }
+    }
     for s in &d.services {
         problems.extend(s.validate());
     }
@@ -222,6 +244,12 @@ pub fn parse_descriptor(text: &str) -> Result<Descriptor, String> {
         return Err(problems.join("；"));
     }
     Ok(d)
+}
+
+/// 项目内相对路径：非空、不以 `/` 开头、不含 `..` 路径段。
+/// 描述文件（cwd/env_files/docker.files）与本机覆盖层（env_files）共用同一规则。
+pub fn is_project_relative(p: &str) -> bool {
+    !p.is_empty() && !p.starts_with('/') && !p.split('/').any(|seg| seg == "..")
 }
 
 pub fn to_descriptor_json(d: &Descriptor) -> Result<String, String> {
@@ -426,6 +454,55 @@ mod tests {
         assert_eq!(serde_json::to_string(&Restart::OnFailure).unwrap(), "\"on-failure\"");
         assert_eq!(serde_json::to_string(&Restart::Never).unwrap(), "\"never\"");
     }
+
+    #[test]
+    fn duplicate_service_names_are_rejected_with_the_name() {
+        let err = parse_descriptor(
+            r#"{"schema_version":1,"services":[{"name":"api","run":["a"]},{"name":"api","run":["b"]}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("api"), "重名错误应点名：{err}");
+    }
+    #[test]
+    fn listen_zero_is_rejected() {
+        let s = ServiceSpec { ports: Ports { listen: Some(0), requires: vec![] }, ..minimal() };
+        assert!(s.validate().iter().any(|m| m.contains('0')), "{:?}", s.validate());
+    }
+
+    #[test]
+    fn health_path_must_be_absolute_without_whitespace() {
+        for p in ["relative", "/has space", "/has\ttab", "/crlf\r\n"] {
+            let s = ServiceSpec {
+                health: Some(Health { kind: HealthKind::Http, path: Some(p.into()), timeout_ms: None }),
+                ..minimal()
+            };
+            assert!(!s.validate().is_empty(), "应拒绝 {p:?}");
+        }
+        let ok = ServiceSpec {
+            health: Some(Health { kind: HealthKind::Http, path: Some("/healthz".into()), timeout_ms: None }),
+            ..minimal()
+        };
+        assert!(ok.validate().is_empty(), "{:?}", ok.validate());
+    }
+
+    #[test]
+    fn health_timeout_is_bounded_but_optional() {
+        for t in [99u64, 120_001] {
+            let s = ServiceSpec {
+                health: Some(Health { kind: HealthKind::Port, path: None, timeout_ms: Some(t) }),
+                ..minimal()
+            };
+            assert!(!s.validate().is_empty(), "应拒绝 timeout {t}");
+        }
+        for t in [None, Some(100u64), Some(30_000), Some(120_000)] {
+            let s = ServiceSpec {
+                health: Some(Health { kind: HealthKind::Port, path: None, timeout_ms: t }),
+                ..minimal()
+            };
+            assert!(s.validate().is_empty(), "应接受 timeout {t:?}：{:?}", s.validate());
+        }
+    }
+
 
     #[test]
     fn absolute_paths_are_rejected() {

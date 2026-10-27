@@ -129,47 +129,58 @@ pub fn resolve_all(
     Ok((items, overrides))
 }
 
-/// 拓扑排序：`depends_on` 先于自身。有环或指向未知服务时报错。
-pub fn order_by_deps(items: &[Resolved]) -> Result<Vec<usize>, String> {
+
+/// 目标服务的依赖闭包（target 自身除外），按拓扑顺序排列（被依赖的在前）。
+///
+/// 只验闭包内部：无关服务的环/错指不影响本次启动（#24）。闭包内有环或指向
+/// 不存在的服务时报错，调用方应中止启动。
+pub fn dependency_chain<'a>(items: &'a [Resolved], target: &str) -> Result<Vec<&'a Resolved>, String> {
     let index: HashMap<&str, usize> =
         items.iter().enumerate().map(|(i, r)| (r.spec.name.as_str(), i)).collect();
-    for r in items {
-        for d in &r.spec.depends_on {
-            if !index.contains_key(d.as_str()) {
-                return Err(format!("{}：depends_on 指向不存在的服务 {d}", r.spec.name));
+    let &start = index.get(target).ok_or_else(|| format!("该项目没有名为 {target} 的服务"))?;
+    // 闭包：target 的 depends 传递闭包（含 target，用于验环与排序）。
+    let mut wanted: HashSet<usize> = HashSet::from([start]);
+    let mut stack = vec![start];
+    while let Some(node) = stack.pop() {
+        for d in &items[node].spec.depends_on {
+            let Some(&dep) = index.get(d.as_str()) else {
+                return Err(format!("{}：depends_on 指向不存在的服务 {d}", items[node].spec.name));
+            };
+            if wanted.insert(dep) {
+                stack.push(dep);
             }
         }
     }
-    let mut state: Vec<u8> = vec![0; items.len()]; // 0=未访问 1=访问中 2=完成
-    let mut out = Vec::with_capacity(items.len());
-    // 显式栈避免深依赖链爆栈
-    for start in 0..items.len() {
-        if state[start] == 2 {
+    // 闭包内拓扑排序（复用与 order_by_deps 相同的 DFS 规则；只走闭包节点）。
+    let mut state: HashMap<usize, u8> = HashMap::new();
+    let mut out: Vec<&'a Resolved> = Vec::with_capacity(wanted.len());
+    let mut dfs_stack: Vec<(usize, usize)> = vec![(start, 0)];
+    state.insert(start, 1);
+    while let Some((node, dep_i)) = dfs_stack.pop() {
+        if state.get(&node) == Some(&2) {
             continue;
         }
-        let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
-        while let Some((node, dep_i)) = stack.pop() {
-            if state[node] == 2 {
-                continue;
-            }
-            state[node] = 1;
-            let deps = &items[node].spec.depends_on;
-            if dep_i < deps.len() {
-                stack.push((node, dep_i + 1));
-                let dep = index[deps[dep_i].as_str()];
-                match state[dep] {
-                    0 => stack.push((dep, 0)),
-                    1 => {
-                        return Err(format!(
-                            "{}：depends_on 存在循环依赖（{}）",
-                            items[node].spec.name, deps[dep_i]
-                        ));
-                    }
-                    _ => {}
+        let deps = &items[node].spec.depends_on;
+        if dep_i < deps.len() {
+            dfs_stack.push((node, dep_i + 1));
+            let dep = index[deps[dep_i].as_str()];
+            match state.get(&dep).copied().unwrap_or(0) {
+                0 => {
+                    state.insert(dep, 1);
+                    dfs_stack.push((dep, 0));
                 }
-            } else {
-                state[node] = 2;
-                out.push(node);
+                1 => {
+                    return Err(format!(
+                        "{}：depends_on 存在循环依赖（{}）",
+                        items[node].spec.name, deps[dep_i]
+                    ));
+                }
+                _ => {}
+            }
+        } else {
+            state.insert(node, 2);
+            if node != start {
+                out.push(&items[node]);
             }
         }
     }
@@ -177,19 +188,32 @@ pub fn order_by_deps(items: &[Resolved]) -> Result<Vec<usize>, String> {
 }
 
 /// 期望端口：本机覆盖的偏移优先，其次声明里的 listen。
-pub fn wanted_port(r: &Resolved) -> Option<u16> {
-    r.spec.ports.listen.map(|p| p.saturating_add(r.port_offset))
+/// 加法语义（#53）：`listen + port_offset`，溢出返回 Err（不再 saturating 钳位，
+/// 钳位会让多个服务静默撞到同一端口）。
+pub fn wanted_port(r: &Resolved) -> Result<Option<u16>, String> {
+    r.spec
+        .ports
+        .listen
+        .map(|p| crate::localstate::checked_apply_offset(p, r.port_offset))
+        .transpose()
 }
 
-/// 给某个服务挑端口：先试上次用过的那个（URL 稳定），再按期望端口顺延。
+/// 给某个服务挑端口：wanted（listen+offset）空闲时优先 wanted（#20），
+/// 被占时先试 remembered（URL 稳定），再按期望端口顺延。
 pub fn plan_port(project_path: &str, r: &Resolved, extra_taken: &HashSet<u16>) -> Result<Option<(u16, Option<String>)>, String> {
-    let Some(wanted) = wanted_port(r) else { return Ok(None) };
+    let Some(wanted) = wanted_port(r)? else { return Ok(None) };
     let remembered = localstate::observed_port(project_path, &r.spec.name);
     let mut notes: Vec<String> = Vec::new();
 
+    // wanted 空闲 → 直接用（offset 修改立即生效，不被 remembered 压住）。
+    if !extra_taken.contains(&wanted) && crate::ports::is_free(wanted) {
+        return Ok(Some((wanted, None)));
+    }
     let mut candidates: Vec<u16> = Vec::new();
     if let Some(p) = remembered {
-        candidates.push(p);
+        if p != wanted {
+            candidates.push(p);
+        }
     }
     for off in 0..crate::ports::PICK_ATTEMPTS {
         candidates.push(wanted.saturating_add(off));
@@ -234,7 +258,7 @@ pub fn build_plan(
     r: &Resolved,
     extra_taken: &HashSet<u16>,
 ) -> Result<StartPlan, String> {
-    if !r.spec.is_longrun() {
+    if !r.spec.is_longrun() && r.spec.docker.is_none() {
         return Err(format!("{}：没有 run 命令（只有步骤），不能作为长驻服务启动", r.spec.name));
     }
     let cwd = r.cwd()?;
@@ -259,7 +283,7 @@ pub fn build_plan(
     let mut final_argv = argv.clone();
     // 端口计划必须**始终**执行：`node server.js` 这类命令没有任何框架自动读端口，
     // 只有 `PORT=N` 注入才能让它听在被分配的端口上（顺延与否都一样）。
-    if let (Some(wanted), Some(actual)) = (wanted_port(r), port) {
+    if let (Some(wanted), Some(actual)) = (wanted_port(r)?, port) {
         let (planned, injected) = crate::ports::plan_argv(wanted, actual, &argv, &cwd);
         final_argv = planned;
         extra = injected;
@@ -413,30 +437,87 @@ mod tests {
     #[test]
     fn topo_order_puts_dependencies_first() {
         let items = vec![res("web", &["api"]), res("api", &["db"]), res("db", &[])];
-        let order = order_by_deps(&items).unwrap();
-        let names: Vec<&str> = order.iter().map(|i| items[*i].spec.name.as_str()).collect();
-        assert_eq!(names, vec!["db", "api", "web"]);
+        let chain = dependency_chain(&items, "web").unwrap();
+        let names: Vec<&str> = chain.iter().map(|r| r.spec.name.as_str()).collect();
+        assert_eq!(names, vec!["db", "api"]);
     }
 
     #[test]
     fn cycle_is_reported() {
         let items = vec![res("a", &["b"]), res("b", &["a"])];
-        assert!(order_by_deps(&items).unwrap_err().contains("循环依赖"));
+        assert!(dependency_chain(&items, "a").unwrap_err().contains("循环依赖"));
     }
 
     #[test]
     fn unknown_dependency_is_reported() {
         let items = vec![res("a", &["ghost"])];
-        assert!(order_by_deps(&items).unwrap_err().contains("ghost"));
+        assert!(dependency_chain(&items, "a").unwrap_err().contains("ghost"));
+    }
+
+    #[test]
+    fn closure_ignores_unrelated_cycle() {
+        // web→api→db 正常；x↔y 自成环但与 web 无关 → web 闭包不受影响。
+        let items = vec![
+            res("web", &["api"]),
+            res("api", &["db"]),
+            res("db", &[]),
+            res("x", &["y"]),
+            res("y", &["x"]),
+        ];
+        let chain = dependency_chain(&items, "web").unwrap();
+        let names: Vec<&str> = chain.iter().map(|r| r.spec.name.as_str()).collect();
+        assert_eq!(names, vec!["db", "api"]);
+    }
+
+    #[test]
+    fn closure_reports_cycle_and_unknown_inside() {
+        let items = vec![res("a", &["b"]), res("b", &["a"])];
+        assert!(dependency_chain(&items, "a").unwrap_err().contains("循环依赖"));
+        let items = vec![res("a", &["ghost"])];
+        assert!(dependency_chain(&items, "a").unwrap_err().contains("ghost"));
+    }
+
+    #[test]
+    fn closure_chain_order_is_topological() {
+        let items = vec![res("web", &["api"]), res("api", &["db"]), res("db", &[])];
+        let chain = dependency_chain(&items, "web").unwrap();
+        let names: Vec<&str> = chain.iter().map(|r| r.spec.name.as_str()).collect();
+        assert_eq!(names, vec!["db", "api"]);
+        assert!(dependency_chain(&items, "db").unwrap().is_empty());
+    }
+
+    #[test]
+    fn closure_includes_docker_dependency_in_order() {
+        // docker-only 服务也在依赖闭包里（#6）：web→db(docker)，chain 应含 db。
+        let mut db = res("db", &[]);
+        db.spec.run = None;
+        db.spec.docker = Some(crate::services::DockerSpec {
+            files: vec!["docker-compose.yml".into()],
+            project_name: None,
+            services: vec!["postgres".into()],
+        });
+        let items = vec![res("web", &["db"]), db];
+        let chain = dependency_chain(&items, "web").unwrap();
+        let names: Vec<&str> = chain.iter().map(|r| r.spec.name.as_str()).collect();
+        assert_eq!(names, vec!["db"]);
+        assert!(chain[0].spec.docker.is_some() && !chain[0].spec.is_longrun());
     }
 
     #[test]
     fn wanted_port_applies_override_offset() {
         let mut r = res("a", &[]);
         r.spec.ports.listen = Some(5000);
-        assert_eq!(wanted_port(&r), Some(5000));
+        assert_eq!(wanted_port(&r).unwrap(), Some(5000));
         r.port_offset = 10;
-        assert_eq!(wanted_port(&r), Some(5010));
+        assert_eq!(wanted_port(&r).unwrap(), Some(5010));
+    }
+
+    #[test]
+    fn wanted_port_overflow_is_an_error_not_a_clamp() {
+        let mut r = res("a", &[]);
+        r.spec.ports.listen = Some(65530);
+        r.port_offset = 10;
+        assert!(wanted_port(&r).unwrap_err().contains("溢出"));
     }
 
     #[test]
@@ -451,6 +532,48 @@ mod tests {
         let (p, note) = plan_port("/nonexistent-project", &r, &HashSet::new()).unwrap().unwrap();
         assert_eq!(p, free);
         assert!(note.is_none(), "端口未被占用时不该有任何 note：{note:?}");
+    }
+
+    #[test]
+    fn plan_port_prefers_wanted_over_remembered_when_free() {
+        // wanted 空闲时优先 wanted（offset 修改立即生效），remembered 只作空闲回退。
+        let dir = tempfile::tempdir().unwrap();
+        let _data = crate::test_support::ScopedDataDir::new(dir.path());
+        let held_w = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let wanted = held_w.local_addr().unwrap().port();
+        drop(held_w);
+        let held_r = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let remembered = held_r.local_addr().unwrap().port();
+        drop(held_r);
+        assert_ne!(wanted, remembered);
+        let proj = "/x/wanted-wins";
+        crate::localstate::remember_port(proj, "a", remembered);
+        let mut r = res("a", &[]);
+        r.spec.ports.listen = Some(wanted);
+        let (p, note) = plan_port(proj, &r, &HashSet::new()).unwrap().unwrap();
+        assert_eq!(p, wanted, "wanted 空闲时必须选 wanted 而非 remembered {remembered}");
+        assert!(note.is_none(), "{note:?}");
+    }
+
+    #[test]
+    fn plan_port_falls_back_to_remembered_when_wanted_busy() {
+        // wanted 被占时 remembered（若空闲）仍是合法回退，note 说明原因。
+        let dir = tempfile::tempdir().unwrap();
+        let _data = crate::test_support::ScopedDataDir::new(dir.path());
+        let squat = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let wanted = squat.local_addr().unwrap().port();
+        let held_r = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let remembered = held_r.local_addr().unwrap().port();
+        drop(held_r);
+        assert_ne!(wanted, remembered);
+        let proj = "/x/wanted-busy";
+        crate::localstate::remember_port(proj, "a", remembered);
+        let mut r = res("a", &[]);
+        r.spec.ports.listen = Some(wanted);
+        let (p, note) = plan_port(proj, &r, &HashSet::new()).unwrap().unwrap();
+        assert_eq!(p, remembered);
+        assert!(note.unwrap_or_default().contains(&remembered.to_string()));
+        drop(squat);
     }
 
     #[test]
