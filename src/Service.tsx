@@ -100,7 +100,7 @@ export default function ServiceSection({
   const [active, setActive] = useState<string | null>(null)
   const [editing, setEditing] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
-
+  const [envConfirm, setEnvConfirm] = useState<string | null>(null)
   const load = useCallback(async () => {
     try {
       const ps = await api.projectServices(project.id)
@@ -167,7 +167,27 @@ export default function ServiceSection({
       setBusy(null)
     }
   }
-
+  /**
+   * 固化为仓库声明。env 非空时后端先拒绝（Err 含 ENV_CONFIRM_REQUIRED，只列 key 名）：
+   * 此时弹确认框展示后端原文，用户确认后再用 confirm=true 重调。
+   * 其余错误直接走 onError，不弹框。
+   */
+  const solidify = (confirm: boolean) =>
+    act('solidify', async () => {
+      try {
+        const text = await api.solidifyDescriptor(project.id, [], false, confirm)
+        onError(null)
+        void text
+        await load()
+      } catch (e) {
+        const msg = errorText(e)
+        if (!confirm && msg.includes('ENV_CONFIRM_REQUIRED')) {
+          setEnvConfirm(msg)
+          return
+        }
+        onError(msg)
+      }
+    })
   const services = data?.services ?? []
   const running = services.filter((v) => {
     const st = statuses[statusKey(project.id, v.spec.name)]
@@ -266,11 +286,54 @@ export default function ServiceSection({
             >
               刷新
             </button>
+            {/* 固化入口必须在有服务时可达：DetectPanel 只在零服务时渲染，
+                放那里 DB 必空、无东西可写 */}
+            <button
+              type="button"
+              onClick={() => void solidify(false)}
+              disabled={busy !== null}
+              title="把本机服务的声明写进仓库内的 .project-ctrl.json"
+              className="rounded border border-border px-2 py-1 disabled:opacity-40 "
+            >
+              固化为仓库声明…
+            </button>
             <span className="ml-auto text-[11px] text-muted">
               来源：{data.descriptor_exists ? '.project-ctrl.json' : '本机数据库'}
             </span>
           </div>
         )}
+      {envConfirm !== null && (
+        <div className="fixed inset-0 z-30 flex items-center justify-center bg-scrim p-6">
+          <div className="w-full max-w-md rounded-xl bg-surface p-5 ">
+            <h3 className="font-semibold">确认写入环境变量？</h3>
+            <p className="mt-2 text-sm">
+              以下服务的 env 将写入可提交的 <span className="font-mono">.project-ctrl.json</span>。
+              为防 secret 泄露，这里只列变量名，请确认无密钥后再继续。
+            </p>
+            <p className="mt-2 break-all text-xs text-warning">{envConfirm}</p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setEnvConfirm(null)}
+                className="rounded-lg border border-border px-3 py-1.5 text-sm "
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setEnvConfirm(null)
+                  void solidify(true)
+                }}
+                disabled={busy !== null}
+                className="rounded-lg bg-primary px-3 py-1.5 text-sm text-primary-fg disabled:opacity-40"
+              >
+                确认写入
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
         {(editing || creating) && (
           <EditForm
@@ -735,7 +798,7 @@ function MeOverride({
   )
 }
 
-/** 未配置时：探测结果 + 三条路径（保存到本机 / 固化为声明 / 手工填写）。 */
+/** 未配置时：探测结果 + 两条路径（保存到本机 / 手工填写）。固化入口在服务列表底部（有服务时才可达）。 */
 function DetectPanel({
   project,
   detected,
@@ -752,7 +815,6 @@ function DetectPanel({
   act: (tag: string, fn: () => Promise<void>) => Promise<void>
 }) {
   const [input, setInput] = useState('')
-  const [envConfirm, setEnvConfirm] = useState<string | null>(null)
   const compose = detected.compose_stacks
 
   /** 探测结果 → 一条可保存的声明（不写仓库文件）。 */
@@ -779,28 +841,6 @@ function DetectPanel({
         ports: { requires: stack.ports },
       })
       onDone()
-    })
-
-  /**
-   * 固化为仓库声明。env 非空时后端先拒绝（Err 含 ENV_CONFIRM_REQUIRED，只列 key 名）：
-   * 此时弹确认框展示后端原文，用户确认后再用 confirmEnv=true 重调。
-   * 其余错误直接走 onError，不弹框。
-   */
-  const solidify = (confirmEnv: boolean) =>
-    act('solidify', async () => {
-      try {
-        const text = await api.solidifyDescriptor(project.id, [], false, confirmEnv)
-        onError(null)
-        void text
-        onDone()
-      } catch (e) {
-        const msg = errorText(e)
-        if (!confirmEnv && msg.includes('ENV_CONFIRM_REQUIRED')) {
-          setEnvConfirm(msg)
-          return
-        }
-        onError(msg)
-      }
     })
 
   return (
@@ -891,48 +931,7 @@ function DetectPanel({
         >
           保存
         </button>
-        <button
-          type="button"
-          onClick={() => void solidify(false)}
-          disabled={busy !== null}
-          title="把已有服务写进仓库内的 .project-ctrl.json"
-          className="ml-auto rounded border border-border px-2 py-1 text-xs disabled:opacity-40 "
-        >
-          固化为仓库声明…
-        </button>
       </div>
-      {envConfirm !== null && (
-        <div className="fixed inset-0 z-30 flex items-center justify-center bg-scrim p-6">
-          <div className="w-full max-w-md rounded-xl bg-surface p-5 ">
-            <h3 className="font-semibold">确认写入环境变量？</h3>
-            <p className="mt-2 text-sm">
-              以下服务的 env 将写入可提交的 <span className="font-mono">.project-ctrl.json</span>。
-              为防 secret 泄露，这里只列变量名，请确认无密钥后再继续。
-            </p>
-            <p className="mt-2 break-all text-xs text-warning">{envConfirm}</p>
-            <div className="mt-4 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setEnvConfirm(null)}
-                className="rounded-lg border border-border px-3 py-1.5 text-sm "
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setEnvConfirm(null)
-                  void solidify(true)
-                }}
-                disabled={busy !== null}
-                className="rounded-lg bg-primary px-3 py-1.5 text-sm text-primary-fg disabled:opacity-40"
-              >
-                确认写入
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }
