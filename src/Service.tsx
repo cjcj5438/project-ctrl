@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import type { UnlistenFn } from '@tauri-apps/api/event'
 import {
   api,
   errorText,
@@ -15,7 +15,7 @@ import {
   type ServiceView,
 } from './api'
 import { Button } from './components'
-
+import { subscribe } from './util'
 const PHASE_LABEL: Record<Phase, string> = {
   Idle: '未运行',
   Step: '执行中',
@@ -90,19 +90,10 @@ export default function ServiceSection({
   // 只在展开时订阅，避免列表页常驻监听
   useEffect(() => {
     if (!opened) return
-    let alive = true
-    const un: UnlistenFn[] = []
-    void (async () => {
-      const u1 = await listen<ServiceStatus>('svc:state', (e) => {
-        if (!alive || e.payload.project_id !== project.id) return
-        setStatuses((prev) => ({ ...prev, [e.payload.key]: e.payload }))
-      })
-      un.push(u1)
-    })()
-    return () => {
-      alive = false
-      un.forEach((f) => f())
-    }
+    return subscribe<ServiceStatus>('svc:state', (e) => {
+      if (e.payload.project_id !== project.id) return
+      setStatuses((prev) => ({ ...prev, [e.payload.key]: e.payload }))
+    })
   }, [opened, project.id])
 
   const act = async (tag: string, fn: () => Promise<void>) => {
@@ -191,12 +182,14 @@ export default function ServiceSection({
         {data && services.length > 0 && (
           <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
             <button
+              type="button"
               onClick={() => setCreating(true)}
               className="rounded border border-border px-2 py-1 "
             >
               添加服务…
             </button>
             <button
+              type="button"
               onClick={() => void act('stop-all', async () => void (await api.serviceStopAll(project.id)))}
               disabled={busy !== null || running === 0}
               className="rounded border border-border px-2 py-1 disabled:opacity-40 "
@@ -204,6 +197,7 @@ export default function ServiceSection({
               全部停止
             </button>
             <button
+              type="button"
               onClick={() => void act('refresh', load)}
               className="rounded border border-border px-2 py-1 "
             >
@@ -265,34 +259,45 @@ function ServiceCard({
   const isRunning = status?.phase === 'Running'
   const isStep = status?.phase === 'Step'
   const [lines, setLines] = useState<string[]>([])
-  const [problems, setProblems] = useState<string[]>([])
+  const [problems, setProblems] = useState<string[] | null>(null)
+  const [preflightErr, setPreflightErr] = useState<string | null>(null)
   const [containers, setContainers] = useState<ContainerView[] | null>(null)
+  const [containersErr, setContainersErr] = useState<string | null>(null)
   const [logErr, setLogErr] = useState<string | null>(null)
   const logRef = useRef<HTMLPreElement | null>(null)
+  // 日志快照的请求序号：展开 effect 与 docker effect 各拉一次 serviceLogs，
+  // 后发先至的旧快照必须丢弃，否则它会覆盖已追加的增量行。
+  const logReq = useRef(0)
 
   // 展开时才拉日志 + 预检，避免无谓 IO
   useEffect(() => {
     if (!open) return
+    const req = ++logReq.current
     let alive = true
+    setProblems(null)
+    setPreflightErr(null)
     void (async () => {
       try {
         const l = await api.serviceLogs(project.id, name)
-        if (alive) setLines(l)
+        if (alive && req === logReq.current) setLines(l)
+      } catch (e) {
+        if (alive && req === logReq.current) setLogErr(errorText(e))
+      }
+      try {
         const pf = await api.servicePreflight(project.id, name)
-        if (alive) setProblems(pf)
-      } catch {
-        /* 预检/日志失败不打断 UI */
+        if (alive) {
+          setProblems(pf)
+          setPreflightErr(null)
+        }
+      } catch (e) {
+        // 预检失败必须可见：初值 null 本就禁用启动，文案说明是「查不出」而非「没问题」
+        if (alive) setPreflightErr(errorText(e))
       }
     })()
-    const un: UnlistenFn[] = []
-    void listen<{ key: string; lines: string[] }>('svc:log', (e) => {
-      if (!alive || e.payload.key !== statusKey(project.id, name)) return
+    return subscribe<{ key: string; lines: string[] }>('svc:log', (e) => {
+      if (e.payload.key !== statusKey(project.id, name)) return
       setLines((prev) => [...prev, ...e.payload.lines].slice(-2000))
-    }).then((f) => un.push(f))
-    return () => {
-      alive = false
-      un.forEach((f) => f())
-    }
+    })
   }, [open, project.id, name])
 
   useEffect(() => {
@@ -303,45 +308,61 @@ function ServiceCard({
   const loadContainers = async () => {
     try {
       setContainers(await api.dockerPs(project.id, name))
-    } catch {
-      setContainers([])
+      setContainersErr(null)
+    } catch (e) {
+      // daemon 没起 / 命令失败必须可见：不能折成「没有运行中的容器」误导用户
+      setContainers(null)
+      setContainersErr(errorText(e))
     }
   }
 
   useEffect(() => {
-    if (open && spec.docker) void loadContainers()
+    if (open && spec.docker) {
+      setContainers(null)
+      setContainersErr(null)
+      void loadContainers()
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, name])
 
   // compose 日志：展开且有 docker 时跟随，收起时停止（容器本身不受影响）。
   // 输出走与服务相同的 svc:log 通道。
   // 注意 deps 用 dockerKey（字符串）而不用 spec.docker 对象：父组件每次 load 都会
-  // 重建 view/spec 对象，对象引用每次都变会导致 effect 反复重跑；而 cleanup 里的
-  // dockerLogsStop 是 fire-and-forget 的异步请求，可能落在下一次 dockerLogs 之后
-  // 到达后端、把刚开的新流杀掉（面板变空白且无 follower）。
+  // 重建 view/spec 对象，对象引用每次都变会导致 effect 反复重跑。
+  // 排序保证：cleanup 等待 in-flight 的 dockerLogs 先落定（token 比对：只有最新
+  // 一轮的启动才有效；旧轮的启动被顶掉后不再开流），再发 dockerLogsStop——
+  //  stop 一定排在「本轮最后一次 start 落定」之后到达后端，
+  // 不会再出现 stop 先到、start 后完成导致的 `logs -f` 常驻。
   const dockerKey = spec.docker
     ? `${spec.docker.files.join('+')}\n${spec.docker.project_name ?? ''}\n${spec.docker.services.join('+')}`
     : ''
+  const dockerSeq = useRef(0)
   useEffect(() => {
     if (!open || !spec.docker) return
+    const seq = ++dockerSeq.current
     let alive = true
+    const req = ++logReq.current
     setLogErr(null)
-    void (async () => {
+    const started = (async () => {
       try {
         const l = await api.serviceLogs(project.id, name)
-        if (alive) setLines(l)
+        if (alive && req === logReq.current && seq === dockerSeq.current) setLines(l)
         await api.dockerLogs(project.id, name)
       } catch (e) {
         // 跟随失败必须可见：静默吞掉会让面板卡在"暂无输出"，无从排查
-        if (alive) setLogErr(errorText(e))
+        if (alive && seq === dockerSeq.current) setLogErr(errorText(e))
       }
     })()
     return () => {
       alive = false
       setLogErr(null)
-      void api.dockerLogsStop(project.id, name).catch(() => {})
+      void started.then(() =>
+        api.dockerLogsStop(project.id, name).catch((e) => {
+          // 停止失败必须可见：流可能还在后端常驻（compose logs -f 孤儿）
+          setLogErr((prev) => prev ?? `日志跟随停止失败：${errorText(e)}`)
+        }),
+      )
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, dockerKey, project.id, name])
 
   const stepLabel = (s: { name: string }) => s.name
@@ -349,6 +370,7 @@ function ServiceCard({
   return (
     <div className="mb-2 rounded border border-border last:mb-0 ">
       <button
+        type="button"
         onClick={onToggle}
         aria-expanded={open}
         className="flex w-full items-center gap-2 px-2 py-1.5 text-left text-xs hover:bg-surface-raised "
@@ -357,7 +379,7 @@ function ServiceCard({
         <span className="font-semibold">{name}</span>
         <span className="text-muted">{line.label}</span>
         {line.detail && <span className="font-mono text-[11px] text-muted">{line.detail}</span>}
-        {spec.docker && <span className="rounded border border-accent/40 bg-accent/10 px-1 text-[10px] text-fg">docker</span>}
+        {spec.docker && <span className="rounded border border-success/40 bg-success/10 px-1 text-[10px] text-fg">docker</span>}
         <span className="ml-auto font-mono text-[10px] text-muted">{view.layer === 'descriptor' ? '.json' : 'db'}</span>
       </button>
 
@@ -373,12 +395,17 @@ function ServiceCard({
               ))}
             </ul>
           )}
-          {problems.length > 0 && (
+          {(problems?.length ?? 0) > 0 && (
             <ul className="mb-1 list-inside list-disc text-[11px] text-error ">
-              {problems.map((p) => (
+              {(problems ?? []).map((p) => (
                 <li key={p}>{p}</li>
               ))}
             </ul>
+          )}
+          {preflightErr && (
+            <div className="mb-1 text-[11px] break-all text-error ">
+              预检失败：{preflightErr}
+            </div>
           )}
 
           <div className="flex flex-wrap gap-1.5 text-[11px]">
@@ -386,10 +413,10 @@ function ServiceCard({
               variant="primary"
               size="sm"
               onClick={() => void act(`start-${name}`, async () => void (await api.serviceStart(project.id, name)))}
-              disabled={busy !== null || isRunning || isStep || problems.length > 0 || !spec.run}
-              title={problems[0] ?? (!spec.run ? '该服务没有 run 命令' : '')}
+              disabled={busy !== null || isRunning || isStep || problems === null || (problems?.length ?? 0) > 0 || !!preflightErr || !spec.run}
+              title={problems === null ? '预检中…' : (problems?.[0] ?? preflightErr ?? (!spec.run ? '该服务没有 run 命令' : ''))}
             >
-              启动
+              {problems === null ? '预检中…' : '启动'}
             </Button>
             <Button size="sm"
               onClick={() => void act(`stop-${name}`, async () => void (await api.serviceStop(project.id, name)))}
@@ -428,6 +455,7 @@ function ServiceCard({
             {spec.docker && (
               <>
                 <button
+                  type="button"
                   onClick={() =>
                     void act(`up-${name}`, async () => {
                       await api.dockerUp(project.id, name)
@@ -435,7 +463,7 @@ function ServiceCard({
                     })
                   }
                   disabled={busy !== null}
-                  className="rounded bg-primary px-2 py-0.5 text-white disabled:opacity-40"
+                  className="rounded bg-primary px-2 py-0.5 text-primary-fg disabled:opacity-40"
                 >
                   compose up
                 </button>
@@ -453,12 +481,14 @@ function ServiceCard({
               </>
             )}
             <button
+              type="button"
               onClick={onEdit}
               className="ml-auto rounded border border-border px-2 py-0.5 "
             >
               编辑
             </button>
             <button
+              type="button"
               onClick={() => void act(`refresh-${name}`, onRefresh)}
               className="rounded border border-border px-2 py-0.5 "
             >
@@ -466,17 +496,33 @@ function ServiceCard({
             </button>
           </div>
 
-          {spec.docker && containers && (
+          {spec.docker && (containers !== null || containersErr !== null) && (
             <div className="mt-2 overflow-hidden rounded border border-border ">
-              <div className="border-b border-border bg-surface-raised px-2 py-1 text-[11px] font-semibold ">
-                容器 · {spec.docker.files.join(' + ')}
+              <div className="flex items-center gap-2 border-b border-border bg-surface-raised px-2 py-1 text-[11px] font-semibold ">
+                <span className="min-w-0 flex-1 truncate" title={spec.docker.files.join(' + ')}>
+                  容器 · {spec.docker.files.join(' + ')}
+                </span>
+                {containersErr && (
+                  <span className="shrink-0 font-normal text-error">读取失败</span>
+                )}
               </div>
-              {containers.length === 0 ? (
+              {containersErr ? (
+                <div className="flex flex-wrap items-center gap-2 p-2 text-[11px]">
+                  <span className="min-w-0 flex-1 break-all text-error">容器状态读取失败：{containersErr}</span>
+                  <button
+                    type="button"
+                    onClick={() => void loadContainers()}
+                    className="shrink-0 rounded border border-border px-2 py-0.5 text-[11px] "
+                  >
+                    重试
+                  </button>
+                </div>
+              ) : (containers?.length ?? 0) === 0 ? (
                 <div className="p-2 text-[11px] text-muted">（没有运行中的容器）</div>
               ) : (
                 <table className="w-full text-left text-[11px]">
                   <tbody>
-                    {containers.map((c) => (
+                    {(containers ?? []).map((c) => (
                       <tr key={c.name} className="border-b border-border last:border-0 ">
                         <td className="px-2 py-1 font-mono">{c.service}</td>
                         <td className="px-2 py-1">{c.state}</td>
@@ -496,6 +542,7 @@ function ServiceCard({
             <div className="flex items-center gap-2 border-b border-border bg-surface-raised px-2 py-1 ">
               <span className="font-mono text-[11px] font-semibold">日志 · {lines.length} 行</span>
               <button
+                type="button"
                 onClick={() => setLines([])}
                 className="ml-auto rounded border border-border px-2 py-0.5 text-[11px] "
               >
@@ -536,14 +583,19 @@ function MeOverride({
 }) {
   const [offset, setOffset] = useState(String(view.port_offset || ''))
   const [keep, setKeep] = useState(view.keep_alive)
+  // 输入中（offset 为脏或聚焦）时跳过外部回写：svc:state 触发的 load 会重建 view，
+  // 直接 setOffset 会把正在打的字覆盖掉。
+  const offsetFocused = useRef(false)
+  const offsetDirty = (Number(offset || 0) || 0) !== view.port_offset
 
   useEffect(() => {
-    setOffset(view.port_offset ? String(view.port_offset) : '')
+    if (!offsetFocused.current && !offsetDirty) {
+      setOffset(view.port_offset ? String(view.port_offset) : '')
+    }
     setKeep(view.keep_alive)
-  }, [view.port_offset, view.keep_alive])
+  }, [view.port_offset, view.keep_alive, offsetDirty])
 
-  const dirty =
-    (Number(offset || 0) || 0) !== view.port_offset || keep !== view.keep_alive
+  const dirty = offsetDirty || keep !== view.keep_alive
 
   const save = () =>
     act(`me-${name}`, async () => {
@@ -563,7 +615,14 @@ function MeOverride({
         <input
           value={offset}
           onChange={(e) => setOffset(e.target.value.replace(/[^\d]/g, ''))}
+          onFocus={() => {
+            offsetFocused.current = true
+          }}
+          onBlur={() => {
+            offsetFocused.current = false
+          }}
           placeholder="0"
+          aria-label="端口偏移"
           className="w-14 rounded border border-border px-1 py-0.5 font-mono "
         />
       </label>
@@ -649,6 +708,7 @@ function DetectPanel({
                 {c.join(' ')}
               </code>
               <button
+                type="button"
                 onClick={() => void saveCandidate(c)}
                 disabled={busy !== null}
                 className="rounded border border-border px-2 py-0.5 text-xs disabled:opacity-40 "
@@ -670,6 +730,7 @@ function DetectPanel({
               </code>
               <span className="text-[11px] text-muted">{s.services.join(', ')}</span>
               <button
+                type="button"
                 onClick={() => void saveCompose(s)}
                 disabled={busy !== null}
                 className="rounded border border-border px-2 py-0.5 text-xs disabled:opacity-40 "
@@ -700,6 +761,7 @@ function DetectPanel({
           className="w-64 rounded border border-border px-2 py-1 font-mono text-xs "
         />
         <button
+          type="button"
           onClick={() =>
             void act('adopt-manual', async () => {
               await api.saveService(project.id, fromCandidate(splitArgv(input), detected.dev_port, detected.requires_ports))
@@ -707,11 +769,12 @@ function DetectPanel({
             })
           }
           disabled={busy !== null || splitArgv(input).length === 0}
-          className="rounded bg-primary px-2 py-1 text-xs text-white disabled:opacity-40"
+          className="rounded bg-primary px-2 py-1 text-xs text-primary-fg disabled:opacity-40"
         >
           保存
         </button>
         <button
+          type="button"
           onClick={() => void act('solidify', async () => {
             const text = await api.solidifyDescriptor(project.id, [], false)
             onError(null)
@@ -914,13 +977,14 @@ function EditForm({
       </div>
 
       <div className="mt-3 flex justify-end gap-2 text-xs">
-        <button onClick={onCancel} className="rounded border border-border px-2 py-1 ">
+        <button type="button" onClick={onCancel} className="rounded border border-border px-2 py-1 ">
           取消
         </button>
         <button
+          type="button"
           onClick={save}
           disabled={!canSave}
-          className="rounded bg-primary px-2 py-1 text-white disabled:opacity-40"
+          className="rounded bg-primary px-2 py-1 text-primary-fg disabled:opacity-40"
         >
           保存
         </button>

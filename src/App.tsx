@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   api,
+  errorText,
   type ImportReport,
   type ProjectInfo,
   type ScanCandidate,
@@ -15,7 +15,7 @@ import { opsBadCount, opsRows } from './ops'
 import { IconMonitor, IconMoon, IconPencil, IconSearch, IconSun, IconX } from './icons'
 import { applyTheme, loadTheme, saveTheme, watchSystemTheme, type ThemeMode } from './theme'
 import { humanSize } from './format'
-import { pickDirectory, splitTags } from './util'
+import { pickDirectory, splitTags, subscribe } from './util'
 
 type SortMode = 'created' | 'name' | 'size'
 
@@ -63,12 +63,12 @@ export default function App() {
 
   // 项目大小：仅前端内存缓存（key = id + 路径），会话内不重复计算；null 表示计算失败
   const [sizes, setSizes] = useState<Record<string, number | null>>({})
+  const [sizeErrs, setSizeErrs] = useState<Record<string, string>>({})
   const sizeQueued = useRef<Set<string>>(new Set())
   const sizeQueue = useRef<string[]>([])
   const sizeActive = useRef(0)
 
   const sizeOf = (p: ProjectInfo): number | null | undefined => sizes[sizeKey(p)]
-
   const formatSize = (p: ProjectInfo): string => {
     const s = sizeOf(p)
     return s === undefined ? '计算中…' : s === null ? '—' : humanSize(s)
@@ -83,7 +83,11 @@ export default function App() {
       api
         .projectSize(id)
         .then((n) => setSizes((s) => ({ ...s, [key]: n })))
-        .catch(() => setSizes((s) => ({ ...s, [key]: null })))
+        .catch((e) => {
+          // 失败原因进 title：界面仍只显示 —，不打断列表
+          setSizes((s) => ({ ...s, [key]: null }))
+          setSizeErrs((s) => ({ ...s, [key]: errorText(e) }))
+        })
         .finally(() => {
           sizeActive.current -= 1
           pump()
@@ -115,11 +119,8 @@ export default function App() {
   // 运行状态：初始化一次 + 订阅 svc:state（不轮询）。
   // 以 key 为粒度维护，项目徽章由「该项目有任一活跃服务」推出。
   useEffect(() => {
-    let alive = true
-    let un: UnlistenFn | null = null
     const ACTIVE: ServiceStatus['phase'][] = ['Running', 'Step']
     const apply = (list: ServiceStatus[]) => {
-      if (!alive) return
       const byKey: Record<string, ServiceStatus> = {}
       list.forEach((st) => {
         byKey[st.key] = st
@@ -128,30 +129,31 @@ export default function App() {
       setStatuses(byKey)
       setRunning(new Set(list.filter((st) => ACTIVE.includes(st.phase)).map((st) => st.project_id)))
     }
+    const stop = subscribe<ServiceStatus>('svc:state', (e) => {
+      const st = e.payload
+      const merged = { ...statusesRef.current, [st.key]: st }
+      statusesRef.current = merged
+      setStatuses(merged)
+      setRunning(
+        new Set(
+          Object.values(merged)
+            .filter((s) => ACTIVE.includes(s.phase))
+            .map((s) => s.project_id),
+        ),
+      )
+    })
+    let alive = true
     void (async () => {
       try {
-        apply(await api.serviceStatus())
-      } catch {
-        /* 后端不可用时保持空集合 */
+        const list = await api.serviceStatus()
+        if (alive) apply(list)
+      } catch (e) {
+        if (alive) setError(`服务状态读取失败：${errorText(e)}`)
       }
-      un = await listen<ServiceStatus>('svc:state', (e) => {
-        if (!alive) return
-        const st = e.payload
-        const merged = { ...statusesRef.current, [st.key]: st }
-        statusesRef.current = merged
-        setStatuses(merged)
-        setRunning(
-          new Set(
-            Object.values(merged)
-              .filter((s) => ACTIVE.includes(s.phase))
-              .map((s) => s.project_id),
-          ),
-        )
-      })
     })()
     return () => {
       alive = false
-      if (un) un()
+      stop()
     }
   }, [])
 
@@ -309,11 +311,12 @@ export default function App() {
               onChange={(e) => setQuery(e.target.value)}
               placeholder="按名称搜索…"
               aria-label="按名称搜索"
-              className="w-56 rounded-lg border border-border bg-surface py-1.5 pl-7 pr-3 text-sm focus:border-accent"
+              className="w-56 rounded-lg border border-border bg-surface py-1.5 pl-7 pr-3 text-sm focus:border-primary"
             />
           </div>
           <div className="ml-auto flex items-center gap-2">
             <button
+              type="button"
               onClick={() => setSort(NEXT_SORT[sort])}
               className="rounded-lg border border-border px-3 py-1.5 text-sm "
               title="切换排序"
@@ -321,24 +324,28 @@ export default function App() {
               排序：{SORT_LABEL[sort]}
             </button>
             <button
+              type="button"
               onClick={doScan}
-              className="rounded-lg border border-transparent bg-info px-3 py-1.5 text-sm text-white hover:brightness-110"
+              className="rounded-lg border border-transparent bg-info px-3 py-1.5 text-sm text-on-info hover:brightness-95"
             >
               扫描文件夹…
             </button>
             <button
+              type="button"
               onClick={doAddSingle}
               className="rounded-lg border border-border px-3 py-1.5 text-sm "
             >
               添加单个项目…
             </button>
             <button
+              type="button"
               onClick={() => setCloneOpen(true)}
               className="rounded-lg border border-border px-3 py-1.5 text-sm "
             >
               从 GitHub 克隆…
             </button>
             <button
+              type="button"
               onClick={() => setProbeOpen(true)}
               className="rounded-lg border border-border px-3 py-1.5 text-sm "
               title="只读扫描所有项目的可启动方式，勾选后只写本机"
@@ -346,6 +353,7 @@ export default function App() {
               批量探测…
             </button>
             <button
+              type="button"
               onClick={() => setExternalOpen(true)}
               className="rounded-lg border border-border px-3 py-1.5 text-sm "
               title="launchd 与 PM2 的只读视图"
@@ -362,6 +370,7 @@ export default function App() {
         <div className="mt-4 flex items-center gap-1 text-sm" role="group" aria-label="视图切换">
           {(['projects', 'services'] as const).map((v) => (
             <button
+              type="button"
               key={v}
               aria-pressed={view === v}
               onClick={() => setView(v)}
@@ -398,6 +407,7 @@ export default function App() {
                 }`}
               >
                 <button
+                  type="button"
                   onClick={() =>
                     setSelected((s) => (s.includes(t) ? s.filter((x) => x !== t) : [...s, t]))
                   }
@@ -408,6 +418,7 @@ export default function App() {
                 {manual && (
                   <>
                     <button
+                      type="button"
                       onClick={() => {
                         setModalInput(t)
                         setModal({ kind: 'renameTag', tag: t })
@@ -419,6 +430,7 @@ export default function App() {
                       <IconPencil size={12} />
                     </button>
                     <button
+                      type="button"
                       onClick={() => setModal({ kind: 'deleteTag', tag: t })}
                       className="opacity-60 transition-opacity hover:opacity-100"
                       aria-label={`删除 ${t}`}
@@ -432,7 +444,7 @@ export default function App() {
             )
           })}
           {selected.length > 0 && (
-            <button onClick={() => setSelected([])} className="text-xs text-info hover:underline">
+            <button type="button" onClick={() => setSelected([])} className="text-xs text-info hover:underline">
               清除筛选
             </button>
           )}
@@ -447,7 +459,7 @@ export default function App() {
               key={p.id}
               role="button"
               tabIndex={0}
-              aria-label={`打开项目 ${p.name}`}
+              aria-label={`打开项目 ${p.name}${running.has(p.id) ? '（服务运行中）' : ''}`}
               onClick={() => setDetailId(p.id)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
@@ -455,7 +467,7 @@ export default function App() {
                   setDetailId(p.id)
                 }
               }}
-              className="cursor-pointer rounded-xl border border-border bg-surface p-4 transition-colors hover:border-accent focus-visible:border-accent"
+              className="cursor-pointer rounded-xl border border-border bg-surface p-4 transition-colors hover:border-success focus-visible:border-success"
             >
               <div className="flex items-center gap-2">
                 <h2 className="truncate font-semibold">{p.name}</h2>
@@ -477,13 +489,13 @@ export default function App() {
               </div>
               <div className="mt-1 text-xs text-muted">创建日期：{p.created_date ?? '未知'}</div>
               {!p.missing && (
-                <div className="mt-1 text-xs text-muted">大小：{formatSize(p)}</div>
+                <div className="mt-1 text-xs text-muted" title={sizeErrs[sizeKey(p)] ? `大小计算失败：${sizeErrs[sizeKey(p)]}` : undefined}>大小：{formatSize(p)}</div>
               )}
               <div className="mt-2 flex flex-wrap gap-1.5">
                 {p.manual_tags.map((t) => (
                   <span
                     key={t}
-                    className="inline-flex items-center gap-1 rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-xs text-fg"
+                    className="inline-flex items-center gap-1 rounded-full border border-success/40 bg-success/10 px-2 py-0.5 text-xs text-fg"
                   >
                     {t}
                   </span>
@@ -506,12 +518,14 @@ export default function App() {
                 {p.missing ? (
                   <>
                     <button
+                      type="button"
                       onClick={() => relink(p)}
                       className="rounded bg-primary px-2 py-1 text-primary-fg"
                     >
                       重新关联
                     </button>
                     <button
+                      type="button"
                       onClick={() => setModal({ kind: 'removeProject', project: p })}
                       className="rounded border border-border px-2 py-1 "
                     >
@@ -521,6 +535,7 @@ export default function App() {
                 ) : (
                   <>
                     <button
+                      type="button"
                       onClick={() => {
                         setModalInput(p.manual_tags.join('，'))
                         setModal({ kind: 'editTags', project: p })
@@ -530,18 +545,21 @@ export default function App() {
                       编辑 tag
                     </button>
                     <button
+                      type="button"
                       onClick={() => run(() => api.openInFinder(p.id))}
                       className="rounded border border-border px-2 py-1 "
                     >
                       Finder
                     </button>
                     <button
+                      type="button"
                       onClick={() => run(() => api.openInIterm(p.id))}
                       className="rounded border border-border px-2 py-1 "
                     >
                       iTerm
                     </button>
                     <button
+                      type="button"
                       onClick={() => run(() => api.openInVscode(p.id))}
                       className="rounded border border-border px-2 py-1 "
                     >
@@ -549,6 +567,7 @@ export default function App() {
                     </button>
                     {p.github_url && (
                       <button
+                        type="button"
                         onClick={() => run(() => api.openGithub(p.id))}
                         className="rounded border border-border px-2 py-1 "
                       >
@@ -566,9 +585,9 @@ export default function App() {
         {view === 'services' && <ServicesView rows={ops} projectName={projectName} onOpen={setDetailId} />}
 
         {scanRoot && (
-          <div className="fixed inset-0 flex items-center justify-center bg-black/40 p-6">
+          <div className="fixed inset-0 flex items-center justify-center bg-scrim p-6">
             <div className="max-h-[80vh] w-full max-w-lg overflow-auto rounded-xl bg-surface p-5 ">
-              <h3 className="font-semibold">扫描结果：{scanRoot}</h3>
+              <h3 className="font-semibold break-all">扫描结果：{scanRoot}</h3>
               <p className="mt-1 text-xs text-muted">
                 已加入管理的不显示；没勾选的不记忆，下次还会出现。
               </p>
@@ -597,8 +616,8 @@ export default function App() {
                         })
                       }
                     />
-                    <span className="font-medium">{c.name}</span>
-                    <span className="truncate text-xs text-muted">{c.path}</span>
+                    <span className="shrink-0 font-medium">{c.name}</span>
+                    <span className="min-w-0 flex-1 truncate text-xs text-muted" title={c.path}>{c.path}</span>
                   </label>
                 ))}
                 {candidates.length === 0 && (
@@ -613,12 +632,14 @@ export default function App() {
               />
               <div className="mt-4 flex justify-end gap-2">
                 <button
+                  type="button"
                   onClick={() => setScanRoot(null)}
                   className="rounded-lg border border-border px-3 py-1.5 text-sm "
                 >
                   取消
                 </button>
                 <button
+                  type="button"
                   onClick={doJoin}
                   disabled={checked.size === 0}
                   className="rounded-lg bg-primary px-3 py-1.5 text-sm text-primary-fg disabled:opacity-40"
@@ -631,7 +652,7 @@ export default function App() {
         )}
 
         {modal && (
-          <div className="fixed inset-0 flex items-center justify-center bg-black/40 p-6">
+          <div className="fixed inset-0 flex items-center justify-center bg-scrim p-6">
             <div className="w-full max-w-sm rounded-xl bg-surface p-5 ">
               {modal.kind === 'deleteTag' ? (
                 <>
@@ -668,16 +689,18 @@ export default function App() {
               )}
               <div className="mt-4 flex justify-end gap-2">
                 <button
+                  type="button"
                   onClick={() => setModal(null)}
                   className="rounded-lg border border-border px-3 py-1.5 text-sm "
                 >
                   取消
                 </button>
                 <button
+                  type="button"
                   onClick={confirmModal}
                   className={`rounded-lg px-3 py-1.5 text-sm text-primary-fg ${ modal.kind === 'deleteTag' || modal.kind === 'removeProject'
-                      ? 'bg-error-solid text-white hover:brightness-110'
-                      : 'bg-primary hover:brightness-110'
+                      ? 'bg-error-solid text-on-solid hover:brightness-95'
+                      : 'bg-primary hover:brightness-95'
                   }`}
                 >
                   {modal.kind === 'deleteTag' || modal.kind === 'removeProject' ? '确认' : '确定'}
@@ -687,7 +710,7 @@ export default function App() {
           </div>
         )}
         {cloneOpen && (
-          <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/40 p-6">
+          <div className="fixed inset-0 z-30 flex items-center justify-center bg-scrim p-6">
             <div className="w-full max-w-md rounded-xl bg-surface p-5 ">
               <h3 className="font-semibold">从 GitHub 克隆</h3>
               <p className="mt-1 text-xs text-muted">
@@ -702,23 +725,26 @@ export default function App() {
               />
               <div className="mt-2 flex items-center gap-2">
                 <button
+                  type="button"
                   onClick={() => void run(async () => setCloneDir(await pickDirectory()))}
                   className="rounded-lg border border-border px-3 py-1.5 text-sm "
                 >
                   选择父目录…
                 </button>
-                <span className="truncate text-xs text-muted" title={cloneDir ?? ''}>
+                <span className="min-w-0 flex-1 truncate text-xs text-muted" title={cloneDir ?? ''}>
                   {cloneDir ?? '未选择'}
                 </span>
               </div>
               <div className="mt-4 flex justify-end gap-2">
                 <button
+                  type="button"
                   onClick={() => setCloneOpen(false)}
                   className="rounded-lg border border-border px-3 py-1.5 text-sm "
                 >
                   取消
                 </button>
                 <button
+                  type="button"
                   onClick={() =>
                     void run(async () => {
                       if (!cloneDir) throw new Error('请先选择父目录')
@@ -745,7 +771,7 @@ export default function App() {
         )}
 
         {pm2Report && (
-          <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/40 p-6">
+          <div className="fixed inset-0 z-30 flex items-center justify-center bg-scrim p-6">
             <div className="w-full max-w-md rounded-xl bg-surface p-5 ">
               <h3 className="font-semibold">导入 PM2 配置</h3>
               <p className="mt-2 text-sm">新增 {pm2Report.imported.length} 个项目的配方。</p>
@@ -753,6 +779,7 @@ export default function App() {
               <ReportList title="问题" items={pm2Report.errors} />
               <div className="mt-4 flex justify-end">
                 <button
+                  type="button"
                   onClick={() => {
                     setPm2Report(null)
                     void refresh()
@@ -810,6 +837,7 @@ function ThemeButton() {
 
   return (
     <button
+      type="button"
       onClick={() => setMode(next[mode])}
       title={`主题：${label[mode]}（点击切换）`}
       aria-label={`主题：${label[mode]}，点击切换`}
@@ -833,13 +861,13 @@ function ServicesView({
 }) {
   if (rows.length === 0) {
     return (
-      <div className="mt-6 rounded-[var(--radius-card)] border border-dashed border-border p-8 text-center text-sm text-muted">
+      <div className="mt-6 rounded-card border border-dashed border-border p-8 text-center text-sm text-muted">
         没有正在运行或异常的服务。到项目详情页的「服务」面板里启动，或用工具栏的「批量探测…」。
       </div>
     )
   }
   return (
-    <div className="mt-4 overflow-hidden rounded-[var(--radius-card)] border border-border">
+    <div className="mt-4 overflow-hidden rounded-card border border-border">
       <table className="w-full text-left text-xs">
         <thead className="bg-surface-raised text-muted">
           <tr>
@@ -909,14 +937,15 @@ function OpsBar({
         const tone = st.phase === 'Running' ? 'ok' : st.phase === 'Step' ? 'busy' : 'bad'
         return (
           <button
+            type="button"
             key={st.key}
             onClick={() => onOpen(st.project_id)}
-            className="inline-flex items-center gap-1.5 rounded-full border border-border bg-surface px-2 py-0.5 hover:border-accent"
-            title={`${projectName(st.project_id)} / ${st.name}`}
+            className="inline-flex items-center gap-1.5 rounded-full border border-border bg-surface px-2 py-0.5 hover:border-success"
+            title={`${projectName(st.project_id)} / ${st.name}（${PHASE_TEXT[st.phase]}${st.port != null ? ` · 端口 ${st.port}` : ''}）`}
+            aria-label={`${projectName(st.project_id)} / ${st.name}：${PHASE_TEXT[st.phase]}${st.port != null ? `，端口 ${st.port}` : ''}`}
           >
-            <StatusDot tone={tone} />
+            <StatusDot tone={tone} title={PHASE_TEXT[st.phase]} />
             <span>{st.name}</span>
-            {st.port != null && <span className="font-mono text-muted">:{st.port}</span>}
           </button>
         )
       })}

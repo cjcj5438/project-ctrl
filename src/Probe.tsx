@@ -4,13 +4,17 @@ import { api, errorText, type ExternalItem, type ProbeItem } from './api'
 /** Esc 关闭 + 打开时把焦点移到对话框内，关闭时还给触发元素。 */
 function useDialog(onClose: () => void) {
   const ref = useRef<HTMLDivElement | null>(null)
+  // onClose 是内联闭包（每次渲染引用都变）：直接进 deps 会让 effect 重跑、
+  // 开着对话框时焦点被反复抢走。用 ref 存最新回调，effect 只跑一次。
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
   useEffect(() => {
     const prev = document.activeElement as HTMLElement | null
     ref.current?.focus()
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.stopPropagation()
-        onClose()
+        onCloseRef.current()
       }
     }
     window.addEventListener('keydown', onKey)
@@ -18,7 +22,7 @@ function useDialog(onClose: () => void) {
       window.removeEventListener('keydown', onKey)
       prev?.focus?.()
     }
-  }, [onClose])
+  }, [])
   return ref
 }
 
@@ -81,7 +85,7 @@ export default function ProbePanel({ onClose, onDone }: { onClose: () => void; o
   const selectable = (items ?? []).filter((i) => !i.has_descriptor)
 
   return (
-    <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/50 p-6">
+    <div className="fixed inset-0 z-30 flex items-center justify-center bg-scrim p-6">
       <div
         ref={dialogRef}
         tabIndex={-1}
@@ -95,7 +99,7 @@ export default function ProbePanel({ onClose, onDone }: { onClose: () => void; o
           <span className="text-xs text-muted">
             只读扫描：{selectable.length} 个项目可采集；勾选后写入<strong>本机</strong>，不动任何仓库
           </span>
-          <button onClick={onClose} className="ml-auto rounded border border-border px-2 py-1 text-xs ">
+          <button type="button" onClick={onClose} className="ml-auto rounded border border-border px-2 py-1 text-xs ">
             关闭
           </button>
         </div>
@@ -122,10 +126,10 @@ export default function ProbePanel({ onClose, onDone }: { onClose: () => void; o
             {(items ?? []).map((it) => (
               <li key={it.project_id} className="rounded border border-border p-2 ">
                 <div className="flex flex-wrap items-center gap-2 text-xs">
-                  <span className="font-semibold">{it.project_name}</span>
-                  <span className="font-mono text-[10px] text-muted">{it.path}</span>
+                  <span className="shrink-0 font-semibold">{it.project_name}</span>
+                  <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-muted" title={it.path}>{it.path}</span>
                   {it.has_descriptor && (
-                    <span className="rounded border border-accent/40 bg-accent/10 px-1 text-[10px] text-fg">
+                    <span className="rounded border border-success/40 bg-success/10 px-1 text-[10px] text-fg">
                       已有 .json
                     </span>
                   )}
@@ -173,6 +177,7 @@ export default function ProbePanel({ onClose, onDone }: { onClose: () => void; o
         <div className="mt-3 flex items-center gap-2">
           <span className="text-xs text-muted">已选 {picked.size} 项</span>
           <button
+            type="button"
             onClick={() => void adopt()}
             disabled={busy || picked.size === 0}
             className="ml-auto rounded bg-primary px-3 py-1.5 text-sm text-primary-fg disabled:opacity-40"
@@ -193,19 +198,24 @@ export function ExternalPanel({ onClose }: { onClose: () => void }) {
   const [filter, setFilter] = useState<'all' | 'pm2' | 'launchd'>('all')
 
   useEffect(() => {
+    let cancelled = false
     void (async () => {
       try {
-        setEntries(await api.externalScan())
+        const list = await api.externalScan()
+        if (!cancelled) setEntries(list)
       } catch (e) {
-        setError(errorText(e))
+        if (!cancelled) setError(errorText(e))
       }
     })()
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   const shown = (entries ?? []).filter((e) => filter === 'all' || e.source === filter)
 
   return (
-    <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/50 p-6">
+    <div className="fixed inset-0 z-30 flex items-center justify-center bg-scrim p-6">
       <div
         ref={dialogRef}
         tabIndex={-1}
@@ -217,7 +227,7 @@ export function ExternalPanel({ onClose }: { onClose: () => void }) {
         <div className="flex flex-wrap items-center gap-2">
           <h2 className="text-base font-semibold">外部服务（只读）</h2>
           <span className="text-xs text-muted">launchd 与 PM2 已在跑，这里只呈现事实，不接管</span>
-          <button onClick={onClose} className="ml-auto rounded border border-border px-2 py-1 text-xs ">
+          <button type="button" onClick={onClose} className="ml-auto rounded border border-border px-2 py-1 text-xs ">
             关闭
           </button>
         </div>
@@ -225,6 +235,7 @@ export function ExternalPanel({ onClose }: { onClose: () => void }) {
         <div className="mt-3 flex gap-1 text-xs">
           {(['all', 'launchd', 'pm2'] as const).map((f) => (
             <button
+              type="button"
               key={f}
               onClick={() => setFilter(f)}
               className={`rounded border px-2 py-0.5 transition-colors ${
@@ -285,6 +296,7 @@ export function ExternalPanel({ onClose }: { onClose: () => void }) {
                     </td>
                     <td className="py-1">
                       <button
+                        type="button"
                         onClick={() => void api.revealFile(e.config_path)}
                         className="rounded border border-border px-1.5 py-0.5 text-[10px] "
                       >
