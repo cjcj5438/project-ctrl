@@ -153,6 +153,12 @@ fn real_vite_dev_server_on_shifted_port() {
 
     let argv: Vec<String> = vec!["pnpm".into(), "dev".into()];
     let (planned, extra) = ports::plan_argv(wanted, pick.port, &argv, &repo);
+    // 该测试真的要去起 vite：CI runner 上没有 pnpm 时跳过（不是产品问题）。
+    // 前置条件写成显式 skip，而不是让 spawn 失败被当成回归。
+    if crate::execenv::resolve("pnpm", &crate::execenv::base_path()).is_none() {
+        eprintln!("跳过：PATH 里没有 pnpm（CI 环境），无法真起 vite");
+        return;
+    }
     assert!(
         planned.ends_with(&["--".to_string(), "--port".to_string(), pick.port.to_string()])
             || planned.ends_with(&["--port".to_string(), pick.port.to_string()]),
