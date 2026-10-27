@@ -394,6 +394,10 @@ function ServiceCard({
   const [containers, setContainers] = useState<ContainerView[] | null>(null)
   const [containersErr, setContainersErr] = useState<string | null>(null)
   const [logErr, setLogErr] = useState<string | null>(null)
+  // #63：跟随停止失败的独立错误位——dockerLogsStop 只在 cleanup（已收起/卸载）里调，
+  // 写 logErr 的话渲染点在 {open &&} 门内、且重开时被清零，错误实际不可见。
+  // stopErr 渲染在常驻卡片头，下次成功跟随后才清除。
+  const [stopErr, setStopErr] = useState<string | null>(null)
   const logRef = useRef<HTMLPreElement | null>(null)
   // 日志快照的请求序号：展开 effect 与 docker effect 各拉一次 serviceLogs，
   // 后发先至的旧快照必须丢弃，否则它会覆盖已追加的增量行。
@@ -478,6 +482,7 @@ function ServiceCard({
         const l = await api.serviceLogs(project.id, name)
         if (alive && req === logReq.current && seq === dockerSeq.current) setLines(l)
         await api.dockerLogs(project.id, name)
+        if (alive && seq === dockerSeq.current) setStopErr(null)
       } catch (e) {
         // 跟随失败必须可见：静默吞掉会让面板卡在"暂无输出"，无从排查
         if (alive && seq === dockerSeq.current) setLogErr(errorText(e))
@@ -493,8 +498,11 @@ function ServiceCard({
         // 只有"没有后继者"（真正收起）时才停本轮的流。
         if (seq !== dockerSeq.current) return
         api.dockerLogsStop(project.id, name).catch((e) => {
-          // 停止失败必须可见：流可能还在后端常驻（compose logs -f 孤儿）
-          setLogErr((prev) => prev ?? `日志跟随停止失败：${errorText(e)}`)
+          // 停止失败必须可见：流可能还在后端常驻（compose logs -f 孤儿）。
+          // 不能写 logErr（门内+重开清零，见 stopErr 声明处注释）。
+          const msg = `日志跟随停止失败：${errorText(e)}`
+          console.warn(msg)
+          setStopErr(msg)
         })
       })
     }
@@ -515,6 +523,7 @@ function ServiceCard({
         <span className="text-muted">{line.label}</span>
         {line.detail && <span className="font-mono text-[11px] text-muted">{line.detail}</span>}
         {spec.docker && <span className="rounded border border-success/40 bg-success/10 px-1 text-[10px] text-fg">docker</span>}
+        {stopErr && <span className="truncate text-[10px] text-error" title={stopErr}>停止失败</span>}
         <span className="ml-auto font-mono text-[10px] text-muted">{view.layer === 'descriptor' ? '.json' : 'db'}</span>
       </button>
 
