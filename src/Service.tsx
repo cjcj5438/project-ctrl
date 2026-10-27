@@ -14,6 +14,7 @@ import {
   type ServiceView,
 } from './api'
 import { Button } from './components'
+import { applyBatch, applySnapshot, type LogCursor } from './logCursor'
 import { subscribe } from './util'
 const PHASE_LABEL: Record<Phase, string> = {
   Idle: '未运行',
@@ -388,6 +389,10 @@ function ServiceCard({
   const isRunning = status?.phase === 'Running'
   const isStep = status?.phase === 'Step'
   const [lines, setLines] = useState<string[]>([])
+  // 日志游标（Part3a）：快照与增量按 (epoch, seq) 对账，不重不漏。
+  // lines 与 cursor 都在 ref 里二元组推进：合并是"读-改-写"临界区，
+  // 用函数式 setLines 读不到最新游标，必须同步读写 ref 再 setLines 同步渲染。
+  const logState = useRef<{ lines: string[]; cursor: LogCursor | null }>({ lines: [], cursor: null })
   const [problems, setProblems] = useState<string[] | null>(null)
   const [preflightErr, setPreflightErr] = useState<string | null>(null)
   const [containers, setContainers] = useState<ContainerView[] | null>(null)
@@ -398,23 +403,28 @@ function ServiceCard({
   // stopErr 渲染在常驻卡片头，下次成功跟随后才清除。
   const [stopErr, setStopErr] = useState<string | null>(null)
   const logRef = useRef<HTMLPreElement | null>(null)
-  // 日志快照的请求序号：展开 effect 与 docker effect 各拉一次 serviceLogs，
-  // 后发先至的旧快照必须丢弃，否则它会覆盖已追加的增量行。
-  const logReq = useRef(0)
 
   // 展开时才拉日志 + 预检，避免无谓 IO
   useEffect(() => {
     if (!open) return
-    const req = ++logReq.current
     let alive = true
+    // 新一轮展开：游标重置，快照与增量从头对账。
+    logState.current = { lines: [], cursor: null }
+    setLines([])
     setProblems(null)
     setPreflightErr(null)
+    const mergeSnap = (snap: { epoch: number; next: number; lines: string[] }) => {
+      if (!alive) return
+      const st = applySnapshot(logState.current, snap)
+      if (st === logState.current) return // 晚到/旧快照：忽略
+      logState.current = st
+      setLines(st.lines)
+    }
     void (async () => {
       try {
-        const l = await api.serviceLogs(project.id, name)
-        if (alive && req === logReq.current) setLines(l)
+        mergeSnap(await api.serviceLogs(project.id, name))
       } catch (e) {
-        if (alive && req === logReq.current) setLogErr(errorText(e))
+        if (alive) setLogErr(errorText(e))
       }
       try {
         const pf = await api.servicePreflight(project.id, name)
@@ -427,10 +437,30 @@ function ServiceCard({
         if (alive) setPreflightErr(errorText(e))
       }
     })()
-    return subscribe<{ key: string; lines: string[] }>('svc:log', (e) => {
-      if (e.payload.key !== statusKey(project.id, name)) return
-      setLines((prev) => [...prev, ...e.payload.lines].slice(-2000))
-    })
+    const fillGap = () => {
+      // 订阅生效后补缝：缝隙内 emit 的行经 since 拉回（Z2b）。
+      const cur = logState.current.cursor
+      if (!alive || !cur) return
+      void api
+        .serviceLogsSince(project.id, name, cur.epoch, cur.next)
+        .then((snap) => mergeSnap(snap))
+        .catch(() => {})
+    }
+    return subscribe<{ key: string; epoch: number; base: number; lines: string[] }>(
+      'svc:log',
+      (e) => {
+        if (e.payload.key !== statusKey(project.id, name)) return
+        const st = applyBatch(logState.current, {
+          epoch: e.payload.epoch,
+          base: e.payload.base,
+          lines: e.payload.lines,
+        })
+        if (st === logState.current) return // 旧 epoch/全重复：忽略
+        logState.current = st
+        setLines(st.lines)
+      },
+      fillGap,
+    )
   }, [open, project.id, name])
 
   useEffect(() => {
@@ -474,14 +504,29 @@ function ServiceCard({
     if (!open || !spec.docker) return
     const seq = ++dockerSeq.current
     let alive = true
-    const req = ++logReq.current
     setLogErr(null)
+    const mergeSnap = (snap: { epoch: number; next: number; lines: string[] }) => {
+      if (!alive || seq !== dockerSeq.current) return
+      const st = applySnapshot(logState.current, snap)
+      if (st === logState.current) return // 晚到/旧快照：忽略
+      logState.current = st
+      setLines(st.lines)
+    }
     const started = (async () => {
       try {
-        const l = await api.serviceLogs(project.id, name)
-        if (alive && req === logReq.current && seq === dockerSeq.current) setLines(l)
-        await api.dockerLogs(project.id, name)
-        if (alive && seq === dockerSeq.current) setStopErr(null)
+        mergeSnap(await api.serviceLogs(project.id, name))
+        // 认领新流：dockerLogs 在后端 bump epoch 并清空环。
+        // 若返回的 epoch 与游标不一致 → 旧游标作废，重置后补拉新 epoch 全量。
+        const ep = await api.dockerLogs(project.id, name)
+        if (alive && seq === dockerSeq.current) {
+          setStopErr(null)
+          const cur = logState.current.cursor
+          if (!cur || cur.epoch !== ep) {
+            logState.current = { lines: [], cursor: { epoch: ep, next: 0 } }
+            setLines([])
+            mergeSnap(await api.serviceLogsSince(project.id, name, ep, 0))
+          }
+        }
       } catch (e) {
         // 跟随失败必须可见：静默吞掉会让面板卡在"暂无输出"，无从排查
         if (alive && seq === dockerSeq.current) setLogErr(errorText(e))

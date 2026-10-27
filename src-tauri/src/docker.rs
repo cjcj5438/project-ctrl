@@ -201,7 +201,7 @@ impl DockerLogs {
         // 两路读线程只管往 pending 里攒，另起一个冲刷线程按时间 emit：
         // `logs -f` 吐完历史后会阻塞等新行（不 EOF），攒满 N 行才推会让输出少
         // 的容器第一批永远到不了 UI。语义与受管服务的 spawn_flusher 一致。
-        let pending: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let pending: std::sync::Arc<std::sync::Mutex<Vec<(u64, String)>>> = Default::default();
         let readers = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         if let Some(out) = out {
             readers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -238,13 +238,13 @@ impl DockerLogs {
         Ok(Self { child: std::sync::Arc::new(std::sync::Mutex::new(child)), epoch })
     }
 
-    /// 读线程：逐行进环形缓冲，并交给冲刷线程攒批（不在这里 emit）。
+    /// 读线程：逐行进环形缓冲（拿 seq），并交给冲刷线程攒批（不在这里 emit）。
     fn pump(
         sup: crate::supervisor::Supervisor,
         key: String,
         epoch: u64,
         stream: Box<dyn std::io::Read + Send>,
-        pending: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        pending: std::sync::Arc<std::sync::Mutex<Vec<(u64, String)>>>,
         readers: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) {
         std::thread::spawn(move || {
@@ -252,15 +252,15 @@ impl DockerLogs {
             let reader = std::io::BufReader::new(stream);
             for line in reader.split(b'\n') {
                 let Ok(bytes) = line else { break };
-                if sup.docker_epoch(&key) != Some(epoch) {
+                if matches!(sup.docker_epoch(&key), Some(e) if e != epoch) {
                     break;
                 }
                 let text = String::from_utf8_lossy(&bytes).trim_end_matches('\r').to_string();
-                sup.push_docker_line(&key, text.clone());
+                let (_, seq) = sup.push_docker_line(&key, text.clone());
                 let mut g = pending.lock().unwrap_or_else(|e| e.into_inner());
                 // 上限是内存保险：极长的构建输出不应该在冲刷线程睡觉时无限堆积
                 if g.len() < crate::supervisor::LOG_BATCH * 10 {
-                    g.push(text);
+                    g.push((seq, text));
                 }
             }
             readers.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -268,6 +268,7 @@ impl DockerLogs {
     }
 
     /// 每 `LOG_FLUSH` 把攒下的行推一次；两路读线程都结束后再推最后一批后退出。
+    /// emit 带 (epoch, base)：前端按 seq 去重/补缝。
     ///
     /// 若代号已前进（新流顶掉了本流）：直接丢弃尾批退出——旧行的归宿是旧面板，
     /// 推给新流会污染它的首屏。
@@ -279,31 +280,37 @@ impl DockerLogs {
         project_id: i64,
         name: String,
         epoch: u64,
-        pending: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        pending: std::sync::Arc<std::sync::Mutex<Vec<(u64, String)>>>,
         readers: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) {
         std::thread::spawn(move || loop {
             std::thread::sleep(crate::supervisor::LOG_FLUSH);
-            if sup.docker_epoch(&key) != Some(epoch) {
+            if matches!(sup.docker_epoch(&key), Some(e) if e != epoch) {
                 return;
             }
-            let take = |pending: &std::sync::Arc<std::sync::Mutex<Vec<String>>>| -> Vec<String> {
+            let take = |pending: &std::sync::Arc<std::sync::Mutex<Vec<(u64, String)>>>| -> Vec<(u64, String)> {
                 let mut g = pending.lock().unwrap_or_else(|e| e.into_inner());
                 std::mem::take(&mut *g)
             };
             let batch = take(&pending);
             if !batch.is_empty() {
+                let base = batch[0].0;
+                let lines = batch.into_iter().map(|(_, l)| l).collect();
                 sink.log(&crate::supervisor::LogPayload {
                     key: key.clone(),
                     project_id,
                     name: name.clone(),
-                    lines: batch,
+                    epoch,
+                    base,
+                    lines,
                 });
             }
             if readers.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                 let tail = take(&pending);
                 if !tail.is_empty() {
-                    sink.log(&crate::supervisor::LogPayload { key, project_id, name, lines: tail });
+                    let base = tail[0].0;
+                    let lines = tail.into_iter().map(|(_, l)| l).collect();
+                    sink.log(&crate::supervisor::LogPayload { key, project_id, name, epoch, base, lines });
                 }
                 return;
             }

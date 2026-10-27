@@ -102,7 +102,7 @@ fn wait_logs_nonempty(h: &Harness, id: i64, name: &str) -> Value {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let got = h.invoke("service_logs", json!({ "id": id, "name": name })).unwrap();
-        let nonempty = got.as_array().map(|a| !a.is_empty()).unwrap_or(false);
+        let nonempty = got.get("lines").and_then(|a| a.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
         if nonempty || std::time::Instant::now() >= deadline {
             return got;
         }
@@ -237,12 +237,10 @@ fn ipc_start_stop_and_logs() {
     // sample 的 server.js 首行打印 booting（加这一行对其他测试无害：
     // 它们不断言日志内容，logsargs 那个 save 后不起服务、读的是空缓冲）。
     let logs = wait_logs_nonempty(&h, id, "api");
+    let lines = logs.get("lines").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+    assert!(!lines.is_empty(), "启动后 5 秒内 service_logs 应非空：{logs}");
     assert!(
-        logs.as_array().map(|a| !a.is_empty()).unwrap_or(false),
-        "启动后 5 秒内 service_logs 应非空：{logs}"
-    );
-    assert!(
-        logs.as_array().unwrap().iter().any(|l| l.as_str().unwrap_or_default().contains("booting")),
+        lines.iter().any(|l| l.as_str().unwrap_or_default().contains("booting")),
         "应收到启动行：{logs}"
     );
 
@@ -1183,7 +1181,8 @@ fn ipc_service_logs_accepts_frontend_arg_shape() {
         .invoke("service_logs", json!({ "id": id, "name": "api" }))
         .expect("前端形状 { id, name } 必须被 service_logs 接受");
     // #75：save 后未启动，缓冲是空的——精确断言空数组（is_array 太弱，非空数组也能过）。
-    assert_eq!(got, json!([]), "未启动的服务日志应为空数组：{got}");
+    assert_eq!(got.get("lines").and_then(|a| a.as_array()).cloned().unwrap_or_default(), Vec::<Value>::new(), "未启动的服务日志应为空：{got}");
+    assert_eq!(got.get("next").and_then(|n| n.as_u64()), Some(0), "空快照 next 应为 0：{got}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

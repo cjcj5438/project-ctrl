@@ -217,6 +217,15 @@ export interface LogPayload {
   key: string
   project_id: number
   name: string
+  epoch: number
+  base: number
+  lines: string[]
+}
+
+/** 快照（与服务端 `LogSnapshot` 一致）。 */
+export interface LogSnapshot {
+  epoch: number
+  next: number
   lines: string[]
 }
 
@@ -259,7 +268,9 @@ export const api = {
     invoke<string>('solidify_descriptor', { id, names, overwrite, confirm: confirmEnv }),
   readDescriptor: (id: number) => invoke<string | null>('read_descriptor', { id }),
   serviceStatus: () => invoke<ServiceStatus[]>('service_status'),
-  serviceLogs: (id: number, name: string) => invoke<string[]>('service_logs', { id, name }),
+  serviceLogs: (id: number, name: string) => invoke<LogSnapshot>('service_logs', { id, name }),
+  serviceLogsSince: (id: number, name: string, epoch: number, cursor: number) =>
+    invoke<LogSnapshot>('service_logs_since', { id, name, epoch, cursor }),
   servicePreflight: (id: number, name: string, step?: string) =>
     invoke<string[]>('service_preflight', { id, name, step: step ?? null }),
   serviceStart: (id: number, name: string) => invoke<ServiceStatus>('service_start', { id, name }),

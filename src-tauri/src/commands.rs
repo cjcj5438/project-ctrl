@@ -449,8 +449,20 @@ pub fn service_status<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Vec<Servic
 }
 
 #[tauri::command]
-pub fn service_logs<R: tauri::Runtime>(app: tauri::AppHandle<R>, id: i64, name: String) -> Vec<String> {
-    supervisor::state(&app).logs_of(&supervisor::key_of(id, &name))
+pub fn service_logs<R: tauri::Runtime>(app: tauri::AppHandle<R>, id: i64, name: String) -> supervisor::LogSnapshot {
+    supervisor::state(&app).snapshot_logs(&supervisor::key_of(id, &name))
+}
+
+/// 补缝：订阅缝隙/晚到快照后，按游标拉取缺失行（见 `Supervisor::logs_since`）。
+#[tauri::command]
+pub fn service_logs_since<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    id: i64,
+    name: String,
+    epoch: u64,
+    cursor: u64,
+) -> supervisor::LogSnapshot {
+    supervisor::state(&app).logs_since(&supervisor::key_of(id, &name), epoch, cursor)
 }
 
 /// 空数组 = 可执行；否则每条是「为什么不能点」。

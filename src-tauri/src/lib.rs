@@ -61,6 +61,7 @@ fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R>
             commands::read_descriptor,
             commands::service_status,
             commands::service_logs,
+            commands::service_logs_since,
             commands::service_preflight,
             commands::service_start,
             commands::service_stop,

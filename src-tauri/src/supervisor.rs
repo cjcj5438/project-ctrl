@@ -88,7 +88,26 @@ pub struct LogPayload {
     pub key: String,
     pub project_id: i64,
     pub name: String,
+    /// 本批行所属的流代号（与快照 `LogSnapshot.epoch` 同源）。
+    pub epoch: u64,
+    /// `lines[0]` 的序号；后续行按 +1 递增。前端按它去重/补缝。
+    pub base: u64,
     pub lines: Vec<String>,
+}
+
+/// 日志快照（Part3a 游标协议）：某 key 在同一把锁内一次取全的
+/// （流代号，下一序号，环内行）。`lines[i]` 的序号是 `next - lines.len() + i`。
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct LogSnapshot {
+    pub epoch: u64,
+    pub next: u64,
+    pub lines: Vec<String>,
+}
+
+impl LogSnapshot {
+    pub fn empty() -> Self {
+        Self { epoch: 0, next: 0, lines: Vec::new() }
+    }
 }
 
 /// 状态 / 日志的出口。
@@ -190,11 +209,18 @@ impl Run {
 #[derive(Default)]
 struct Inner {
     runs: Mutex<HashMap<String, Run>>,
-    logs: Mutex<HashMap<String, VecDeque<String>>>,
+    logs: Mutex<HashMap<String, LogStream>>,
     gen: AtomicU64,
     shutting_down: AtomicBool,
-    /// docker 日志流的代号：新流开始即 +1，旧流的残留行据此丢弃。
-    docker_epochs: Mutex<HashMap<String, u64>>,
+}
+
+/// 某 key 的日志流：代号 + 序号分配 + 环形缓冲，三者在同一把 `logs` 锁内原子推进。
+/// （Part3a：之前 epoch 与行分属两把锁，`begin` 的 bump+clear 与泵的 push 交错会撕裂。）
+#[derive(Default)]
+struct LogStream {
+    epoch: u64,
+    next: u64,
+    buf: VecDeque<(u64, String)>,
 }
 
 /// 进程表 + 日志缓冲 + 代号计数器。`Clone` 共享同一份内部状态，便于交给读线程。
@@ -272,42 +298,84 @@ impl Supervisor {
         }
     }
 
+    /// 开一个新日志流代号并清空缓冲（docker 跟随 / 受管 spawn 前调）。
+    /// bump + clear + next 归零在同一把锁内原子完成。
+    pub fn begin_log_epoch(&self, key: &str) -> u64 {
+        let mut g = self.inner.logs.lock().unwrap_or_else(|e| e.into_inner());
+        let s = g.entry(key.to_string()).or_default();
+        s.epoch += 1;
+        s.next = 0;
+        s.buf.clear();
+        s.epoch
+    }
+
     /// 开一个新的 docker 日志流代号（旧流的读线程随后会自行退出）。
     pub fn begin_docker_logs(&self, key: &str) -> u64 {
-        let mut g = self.inner.docker_epochs.lock().unwrap_or_else(|e| e.into_inner());
-        let next = g.get(key).copied().unwrap_or(0) + 1;
-        g.insert(key.to_string(), next);
-        self.clear_logs(key);
-        next
+        self.begin_log_epoch(key)
     }
 
     pub fn docker_epoch(&self, key: &str) -> Option<u64> {
-        let g = self.inner.docker_epochs.lock().unwrap_or_else(|e| e.into_inner());
-        g.get(key).copied()
+        let g = self.inner.logs.lock().unwrap_or_else(|e| e.into_inner());
+        g.get(key).map(|s| s.epoch)
     }
 
     /// docker 日志直接进同一个环形缓冲（前端不需要第二套通道）。
-    pub fn push_docker_line(&self, key: &str, line: String) {
-        self.push_line(key, line);
+    /// 返回该行的 (epoch, seq)：泵把它们一并交给冲刷线程，emit 时带出。
+    pub fn push_docker_line(&self, key: &str, line: String) -> (u64, u64) {
+        self.push_line(key, line)
     }
 
     pub fn clear_logs(&self, key: &str) {
-        let mut g = self.inner.logs.lock().unwrap_or_else(|e| e.into_inner());
-        g.insert(key.to_string(), VecDeque::new());
+        self.begin_log_epoch(key);
     }
 
-    pub fn logs_of(&self, key: &str) -> Vec<String> {
+    /// 快照：(epoch, next, 行) 在同一把锁内一次取全，不存在跨锁撕裂。
+    pub fn snapshot_logs(&self, key: &str) -> LogSnapshot {
         let g = self.inner.logs.lock().unwrap_or_else(|e| e.into_inner());
-        g.get(key).map(|q| q.iter().cloned().collect()).unwrap_or_default()
+        g.get(key)
+            .map(|s| LogSnapshot {
+                epoch: s.epoch,
+                next: s.next,
+                lines: s.buf.iter().map(|(_, l)| l.clone()).collect(),
+            })
+            .unwrap_or_else(LogSnapshot::empty)
     }
 
-    fn push_line(&self, key: &str, line: String) {
-        let mut g = self.inner.logs.lock().unwrap_or_else(|e| e.into_inner());
-        let q = g.entry(key.to_string()).or_default();
-        q.push_back(line);
-        while q.len() > LOG_CAP {
-            q.pop_front();
+    /// 补缝：返回同 epoch 下 seq >= cursor 的行；epoch 已变则返回新 epoch 全量。
+    pub fn logs_since(&self, key: &str, epoch: u64, cursor: u64) -> LogSnapshot {
+        let g = self.inner.logs.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(s) = g.get(key) else { return LogSnapshot::empty() };
+        if s.epoch != epoch {
+            return LogSnapshot {
+                epoch: s.epoch,
+                next: s.next,
+                lines: s.buf.iter().map(|(_, l)| l.clone()).collect(),
+            };
         }
+        LogSnapshot {
+            epoch: s.epoch,
+            next: s.next,
+            lines: s.buf.iter().filter(|(seq, _)| *seq >= cursor).map(|(_, l)| l.clone()).collect(),
+        }
+    }
+
+    /// 只剩测试用：产品路径走 `snapshot_logs`（带游标）。
+    #[cfg(test)]
+    pub fn logs_of(&self, key: &str) -> Vec<String> {
+        self.snapshot_logs(key).lines
+    }
+
+    /// 行进环并分配序号（同锁原子）。返回 (epoch, seq)。
+    fn push_line(&self, key: &str, line: String) -> (u64, u64) {
+        let mut g = self.inner.logs.lock().unwrap_or_else(|e| e.into_inner());
+        let s = g.entry(key.to_string()).or_default();
+        let seq = s.next;
+        s.next += 1;
+        s.buf.push_back((seq, line));
+        while s.buf.len() > LOG_CAP {
+            s.buf.pop_front();
+        }
+        (s.epoch, seq)
     }
 
     /// 把一次退出结果应用到状态。`gen` 不匹配说明是我们主动 stop 的，忽略。
@@ -480,19 +548,31 @@ impl Supervisor {
         }
         // 两个读线程把行推给一个带定时器的冲刷线程：只按「有新行」触发会让
         // 「打印一行然后安静」的服务（如 `env`）的日志一直不出现。
-        let pending: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        // pending 存 (seq, 行)：冲刷线程 emit 时带出 base，前端按 seq 去重/补缝。
+        let pending: Arc<Mutex<Vec<(u64, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let readers = Arc::new(AtomicU64::new(streams.len() as u64));
+        // 本次 attach 的流代号：restart 后旧 flusher 凭它自杀，不污染新流首屏。
+        let epoch = self.docker_epoch(&key).unwrap_or(0);
         for stream in streams {
             let sup = self.clone();
             let pending = pending.clone();
             let readers = readers.clone();
             let k = key.clone();
             std::thread::spawn(move || {
-                sup.pump_logs(&k, stream, pending);
+                sup.pump_logs(&k, stream, pending, epoch);
                 readers.fetch_sub(1, Ordering::SeqCst);
             });
         }
-        Self::spawn_flusher(spec.project_id, spec.name.clone(), key.clone(), pending, readers, sink.clone());
+        Self::spawn_flusher(
+            self.clone(),
+            spec.project_id,
+            spec.name.clone(),
+            key.clone(),
+            epoch,
+            pending,
+            readers,
+            sink.clone(),
+        );
         Self::watch_exit(self.clone(), sink, spec, gen, child);
     }
 
@@ -667,45 +747,71 @@ impl Supervisor {
     }
 
     /// 每 `LOG_FLUSH` 把攒下的行推一次；两个读线程都结束后再推最后一批后退出。
+    /// emit 带 (epoch, base)：前端按 seq 去重/补缝。epoch 已前进则自杀（旧流尾批不污染新流）。
+    #[allow(clippy::too_many_arguments)]
     fn spawn_flusher(
+        sup: Supervisor,
         project_id: i64,
         name: String,
         key: String,
-        pending: Arc<Mutex<Vec<String>>>,
+        epoch: u64,
+        pending: Arc<Mutex<Vec<(u64, String)>>>,
         readers: Arc<AtomicU64>,
         sink: Arc<dyn Sink>,
     ) {
         std::thread::spawn(move || loop {
             std::thread::sleep(LOG_FLUSH);
-            let take = |pending: &Arc<Mutex<Vec<String>>>| -> Vec<String> {
+            // 全新 key（无流）且 epoch==0 时放行：门只杀"代号已前进"的旧线程。
+            if matches!(sup.docker_epoch(&key), Some(e) if e != epoch) {
+                return;
+            }
+            let take = |pending: &Arc<Mutex<Vec<(u64, String)>>>| -> Vec<(u64, String)> {
                 let mut g = pending.lock().unwrap_or_else(|e| e.into_inner());
                 std::mem::take(&mut *g)
             };
-            let batch = take(&pending);
-            if !batch.is_empty() {
-                sink.log(&LogPayload { key: key.clone(), project_id, name: name.clone(), lines: batch });
-            }
+            let emit = |batch: Vec<(u64, String)>| {
+                if batch.is_empty() {
+                    return;
+                }
+                let base = batch[0].0;
+                let lines = batch.into_iter().map(|(_, l)| l).collect();
+                sink.log(&LogPayload { key: key.clone(), project_id, name: name.clone(), epoch, base, lines });
+            };
+            emit(take(&pending));
             if readers.load(Ordering::SeqCst) == 0 {
                 let tail = take(&pending);
                 if !tail.is_empty() {
-                    sink.log(&LogPayload { key, project_id, name, lines: tail });
+                    // 尾批的 key 被 move：重建 payload（只走一次）。
+                    let base = tail[0].0;
+                    let lines = tail.into_iter().map(|(_, l)| l).collect();
+                    sink.log(&LogPayload { key, project_id, name, epoch, base, lines });
                 }
                 return;
             }
         });
     }
 
-    /// 读线程：逐行进环形缓冲，并交给冲刷线程攒批（不在这里 emit）。
-    fn pump_logs(&self, key: &str, stream: Box<dyn Read + Send>, pending: Arc<Mutex<Vec<String>>>) {
+    /// 读线程：逐行进环形缓冲（拿 seq），并交给冲刷线程攒批（不在这里 emit）。
+    /// epoch 已前进（restart/新流顶掉）则退出：旧读线程不再往新流的环里写。
+    fn pump_logs(
+        &self,
+        key: &str,
+        stream: Box<dyn Read + Send>,
+        pending: Arc<Mutex<Vec<(u64, String)>>>,
+        epoch: u64,
+    ) {
         let reader = BufReader::new(stream);
         for line in reader.split(b'\n') {
             let Ok(bytes) = line else { break };
+            if matches!(self.docker_epoch(key), Some(e) if e != epoch) {
+                break;
+            }
             let text = String::from_utf8_lossy(&bytes).trim_end_matches('\r').to_string();
-            self.push_line(key, text.clone());
+            let (_, seq) = self.push_line(key, text.clone());
             let mut g = pending.lock().unwrap_or_else(|e| e.into_inner());
             // 上限是内存保险：极长的构建输出不应该在冲刷线程睡觉时无限堆积
             if g.len() < LOG_BATCH * 10 {
-                g.push(text);
+                g.push((seq, text));
             }
         }
     }
@@ -2062,5 +2168,97 @@ mod tests {
                 .collect()
         })
         .unwrap_or_default()
+    }
+
+    #[test]
+    fn log_snapshot_and_push_are_atomic_under_concurrency() {
+        // Part3a：多线程并发 push + snapshot：每次快照内部 (epoch,next,行) 必须自洽——
+        // 行数与 next 对得上（无撕裂），且最终全序无重复无缺口。
+        let sup = Supervisor::default();
+        let key = "1/lograce";
+        sup.begin_log_epoch(key);
+        let epoch = sup.docker_epoch(key).unwrap();
+        let writers: Vec<_> = (0..4)
+            .map(|w| {
+                let sup = sup.clone();
+                std::thread::spawn(move || {
+                    for i in 0..500 {
+                        sup.push_docker_line(key, format!("w{w}-{i}"));
+                    }
+                })
+            })
+            .collect();
+        // 边写边采：每次快照序号连续（buf 内 seq 严格递增且 next == 末seq+1）。
+        for _ in 0..50 {
+            let snap = sup.snapshot_logs(key);
+            assert_eq!(snap.epoch, epoch);
+            assert!(snap.lines.len() as u64 <= snap.next, "行数不得超过 next：{}", snap.lines.len());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        let snap = sup.snapshot_logs(key);
+        assert_eq!(snap.next, 2000, "4 线程×500 行必须全部分配序号");
+        // 环容量 2000 恰好装下：全序无重复无缺口。
+        assert_eq!(snap.lines.len(), 2000);
+        let mut seen = std::collections::HashSet::new();
+        for l in &snap.lines {
+            assert!(seen.insert(l.clone()), "重复行：{l}");
+        }
+        for w in 0..4 {
+            for i in 0..500 {
+                assert!(seen.contains(&format!("w{w}-{i}")), "缺行 w{w}-{i}");
+            }
+        }
+    }
+
+    #[test]
+    fn logs_since_fills_gap_and_resets_on_epoch_change() {
+        // Part3a：since 补缝——同 epoch 只返 cursor 之后；epoch 变了返新 epoch 全量。
+        let sup = Supervisor::default();
+        let key = "1/since";
+        let e1 = sup.begin_log_epoch(key);
+        for i in 0..5 {
+            sup.push_docker_line(key, format!("a{i}"));
+        }
+        let mid = sup.snapshot_logs(key);
+        assert_eq!((mid.epoch, mid.next), (e1, 5));
+        for i in 5..8 {
+            sup.push_docker_line(key, format!("a{i}"));
+        }
+        let fill = sup.logs_since(key, e1, mid.next);
+        assert_eq!(fill.epoch, e1);
+        assert_eq!(fill.next, 8);
+        assert_eq!(fill.lines, vec!["a5".to_string(), "a6".to_string(), "a7".to_string()]);
+        // 晚到快照的反面：cursor 已到最新 → 空增量（前端据此不覆盖）。
+        let none = sup.logs_since(key, e1, 8);
+        assert!(none.lines.is_empty());
+        // 新 epoch：旧游标失效，返新 epoch 全量。
+        let e2 = sup.begin_log_epoch(key);
+        assert_ne!(e1, e2);
+        sup.push_docker_line(key, "b0".into());
+        let fresh = sup.logs_since(key, e1, 8);
+        assert_eq!(fresh.epoch, e2);
+        assert_eq!(fresh.lines, vec!["b0".to_string()]);
+    }
+
+    #[test]
+    fn fresh_key_spawn_collects_logs_without_prior_begin() {
+        // 门回归锁：全新 key 直接 spawn（无 clear/begin），pump/flusher 的 epoch 门
+        // 不得把第一批行拦掉（None vs Some(0) 误判曾导致 0 行）。
+        let sup = Supervisor::default();
+        let sink = Arc::new(Collector::default());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hi.sh"), "#!/bin/sh\necho hello-fresh\nsleep 30\n").unwrap();
+        let sh = dir.path().join("hi.sh").to_string_lossy().into_owned();
+        let mut sp = spec("1/freshlog", vec!["sh", &sh], Restart::Never);
+        sp.base = dir.path().to_path_buf();
+        sup.spawn(sink, sp).unwrap();
+        assert!(
+            wait_for(|| !sup.logs_of("1/freshlog").is_empty(), 5000),
+            "全新 key spawn 后应收到日志"
+        );
+        sup.stop("1/freshlog");
     }
 }

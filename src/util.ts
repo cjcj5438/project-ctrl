@@ -24,7 +24,11 @@ export function splitTags(s: string): string[] {
  * （快开快关卡片 / StrictMode remount 时监听常驻累积）。
  * 这里用 cleaned 标志关门：迟到即直接调用，保证不泄漏。
  */
-export function subscribe<T>(event: EventName, handler: EventCallback<T>): () => void {
+export function subscribe<T>(
+  event: EventName,
+  handler: EventCallback<T>,
+  onReady?: () => void,
+): () => void {
   let unlisten: UnlistenFn | null = null
   let cleaned = false
   void listen<T>(event, handler).then((f) => {
@@ -32,6 +36,8 @@ export function subscribe<T>(event: EventName, handler: EventCallback<T>): () =>
       f()
     } else {
       unlisten = f
+      // 订阅真正生效后回调：调用方在此补缝（since 拉取），杀订阅缝隙丢行（Z2b）。
+      onReady?.()
     }
   })
   return () => {
