@@ -109,7 +109,33 @@ export default function ServiceSection({
       ps.services.forEach((v) => {
         if (v.status) next[statusKey(project.id, v.spec.name)] = v.status
       })
-      setStatuses(next)
+      // docker-only 不进 supervisor：后端 v.status 恒为 null，整表替换会把
+      // Running 快照冲回「未运行」。对这类服务现算一次 dockerSnapshot；
+      // 失败（daemon 没起等）则不写入，由下面的 prev 回退保留旧快照。
+      const dockerOnly = ps.services.filter(
+        (v) => !v.spec.run && v.spec.docker && !(statusKey(project.id, v.spec.name) in next),
+      )
+      const snaps = await Promise.all(
+        dockerOnly.map(async (v) => {
+          try {
+            return await dockerSnapshot(project.id, v.spec.name, null)
+          } catch {
+            return null
+          }
+        }),
+      )
+      snaps.forEach((st) => {
+        if (st) next[st.key] = st
+      })
+      setStatuses((prev) => {
+        const merged = { ...next }
+        // 后端无状态且现算失败的键：保留旧快照（服务仍存在才留，已删的不留）
+        ps.services.forEach((v) => {
+          const k = statusKey(project.id, v.spec.name)
+          if (!(k in merged) && k in prev) merged[k] = prev[k]
+        })
+        return merged
+      })
       onError(null)
     } catch (e) {
       onError(errorText(e))
