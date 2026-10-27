@@ -314,7 +314,7 @@ export default function App() {
               onChange={(e) => setQuery(e.target.value)}
               placeholder="按名称搜索…"
               aria-label="按名称搜索"
-              className="w-56 rounded-lg border border-border bg-surface py-1.5 pl-7 pr-3 text-sm focus:border-accent focus:outline-none"
+              className="w-56 rounded-lg border border-border bg-surface py-1.5 pl-7 pr-3 text-sm focus:border-accent"
             />
           </div>
           <div className="ml-auto flex items-center gap-2">

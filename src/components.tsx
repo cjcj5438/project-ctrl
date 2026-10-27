@@ -59,7 +59,7 @@ export function IconButton({
 }
 
 const FIELD =
-  'w-full rounded-md border border-border bg-surface px-2 py-1 text-sm text-fg placeholder:text-muted/70 focus:border-accent focus:outline-none'
+  'w-full rounded-md border border-border bg-surface px-2 py-1 text-sm text-fg placeholder:text-muted/70 focus:border-accent'
 
 export function Input({ className = '', ...rest }: InputHTMLAttributes<HTMLInputElement>) {
   return <input {...rest} className={`${FIELD} ${className}`} />

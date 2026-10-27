@@ -84,11 +84,15 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* 焦点可见：全站统一，键盘导航必须看得见 */
+/* 焦点可见：全站统一，键盘导航必须看得见。
+   对话框容器用 tabIndex={-1} 接受编程聚焦，它不是可交互控件，不该画描边。 */
 :focus-visible {
   outline: 2px solid var(--ring);
   outline-offset: 2px;
   border-radius: 4px;
+}
+[role='dialog']:focus-visible {
+  outline: none;
 }
 
 /* 尊重减弱动效 */

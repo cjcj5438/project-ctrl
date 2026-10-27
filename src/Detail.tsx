@@ -171,7 +171,7 @@ export default function DetailView({
                     if (e.key === 'Enter') void addTag()
                   }}
                   placeholder="添加 tag…"
-                  className="w-32 rounded-full border border-border bg-surface px-2 py-0.5 text-xs focus:border-accent focus:outline-none"
+                  className="w-32 rounded-full border border-border bg-surface px-2 py-0.5 text-xs focus:border-accent"
                 />
                 <button onClick={addTag} className="rounded-full border border-border px-2 py-0.5 text-xs ">
                   添加

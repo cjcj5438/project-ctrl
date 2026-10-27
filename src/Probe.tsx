@@ -88,7 +88,7 @@ export default function ProbePanel({ onClose, onDone }: { onClose: () => void; o
         role="dialog"
         aria-modal="true"
         aria-label="批量探测"
-        className="flex max-h-[85vh] w-full max-w-3xl flex-col rounded-xl border border-border bg-surface p-5 focus:outline-none"
+        className="flex max-h-[85vh] w-full max-w-3xl flex-col rounded-xl border border-border bg-surface p-5"
       >
         <div className="flex items-center gap-3">
           <h2 className="text-base font-semibold">批量探测</h2>
@@ -212,7 +212,7 @@ export function ExternalPanel({ onClose }: { onClose: () => void }) {
         role="dialog"
         aria-modal="true"
         aria-label="外部服务（只读）"
-        className="flex max-h-[85vh] w-full max-w-3xl flex-col rounded-xl border border-border bg-surface p-5 focus:outline-none"
+        className="flex max-h-[85vh] w-full max-w-3xl flex-col rounded-xl border border-border bg-surface p-5"
       >
         <div className="flex flex-wrap items-center gap-2">
           <h2 className="text-base font-semibold">外部服务（只读）</h2>
