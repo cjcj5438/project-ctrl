@@ -14,6 +14,7 @@ import {
   type ServiceStatus,
   type ServiceView,
 } from './api'
+import { Button } from './components'
 
 const PHASE_LABEL: Record<Phase, string> = {
   Idle: '未运行',
@@ -370,22 +371,22 @@ function ServiceCard({
           )}
 
           <div className="flex flex-wrap gap-1.5 text-[11px]">
-            <button
+            <Button
+              variant="primary"
+              size="sm"
               onClick={() => void act(`start-${name}`, async () => void (await api.serviceStart(project.id, name)))}
               disabled={busy !== null || isRunning || isStep || problems.length > 0 || !spec.run}
               title={problems[0] ?? (!spec.run ? '该服务没有 run 命令' : '')}
-              className="rounded bg-success px-2 py-0.5 text-white disabled:opacity-40"
             >
               启动
-            </button>
-            <button
+            </Button>
+            <Button size="sm"
               onClick={() => void act(`stop-${name}`, async () => void (await api.serviceStop(project.id, name)))}
               disabled={busy !== null || (!isRunning && !isStep)}
-              className="rounded border border-border px-2 py-0.5 disabled:opacity-40 "
             >
               停止
-            </button>
-            <button
+            </Button>
+            <Button size="sm"
               onClick={() =>
                 void act(`restart-${name}`, async () => {
                   await api.serviceStop(project.id, name)
@@ -393,28 +394,25 @@ function ServiceCard({
                 })
               }
               disabled={busy !== null || isStep || !spec.run}
-              className="rounded border border-border px-2 py-0.5 disabled:opacity-40 "
             >
               重启
-            </button>
-            <button
+            </Button>
+            <Button size="sm"
               onClick={() => void act(`url-${name}`, async () => void (await api.openServiceUrl(project.id, name)))}
               disabled={status?.port == null}
-              className="rounded border border-border px-2 py-0.5 disabled:opacity-40 "
             >
               打开
-            </button>
+            </Button>
             {(spec.steps ?? []).map((s) => (
-              <button
+              <Button size="sm"
                 key={s.name}
                 onClick={() =>
                   void act(`step-${name}-${s.name}`, async () => void (await api.serviceStep(project.id, name, s.name)))
                 }
                 disabled={busy !== null || isRunning || isStep}
-                className="rounded border border-border px-2 py-0.5 disabled:opacity-40 "
               >
                 {stepLabel(s)}
-              </button>
+              </Button>
             ))}
             {spec.docker && (
               <>
@@ -430,7 +428,7 @@ function ServiceCard({
                 >
                   compose up
                 </button>
-                <button
+                <Button size="sm"
                   onClick={() =>
                     void act(`down-${name}`, async () => {
                       await api.dockerDown(project.id, name)
@@ -438,10 +436,9 @@ function ServiceCard({
                     })
                   }
                   disabled={busy !== null}
-                  className="rounded border border-border px-2 py-0.5 disabled:opacity-40 "
                 >
                   compose down
-                </button>
+                </Button>
               </>
             )}
             <button
@@ -558,13 +555,12 @@ function MeOverride({
         <input type="checkbox" checked={keep} onChange={(e) => setKeep(e.target.checked)} />
         退出后保留进程
       </label>
-      <button
+      <Button size="sm"
         onClick={save}
         disabled={!dirty}
-        className="rounded border border-border px-2 py-0.5 disabled:opacity-40 "
       >
         保存
-      </button>
+      </Button>
     </div>
   )
 }
