@@ -418,8 +418,8 @@ function ServiceCard({
               variant="primary"
               size="sm"
               onClick={() => void act(`start-${name}`, async () => void (await api.serviceStart(project.id, name)))}
-              disabled={busy !== null || isRunning || isStep || problems === null || (problems?.length ?? 0) > 0 || !!preflightErr || !spec.run}
-              title={problems === null ? '预检中…' : (problems?.[0] ?? preflightErr ?? (!spec.run ? '该服务没有 run 命令' : ''))}
+              disabled={busy !== null || isRunning || isStep || problems === null || (problems?.length ?? 0) > 0 || !!preflightErr || (!spec.run && !spec.docker)}
+              title={problems === null ? '预检中…' : (problems?.[0] ?? preflightErr ?? (!spec.run && !spec.docker ? '该服务没有 run 命令' : ''))}
             >
               {problems === null ? '预检中…' : '启动'}
             </Button>
@@ -436,7 +436,7 @@ function ServiceCard({
                   await api.serviceStart(project.id, name)
                 })
               }
-              disabled={busy !== null || isStep || !spec.run}
+              disabled={busy !== null || isStep || (!spec.run && !spec.docker)}
             >
               重启
             </Button>
