@@ -88,16 +88,38 @@ pub fn run_capture(
     cwd: &Path,
     timeout: Duration,
 ) -> std::io::Result<RunOutcome> {
-    let mut child = Command::new(program)
-        .args(args)
+    run_capture_env(
+        program,
+        args,
+        cwd,
+        timeout,
+        &[
+            ("GIT_OPTIONAL_LOCKS", "0"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_PAGER", "cat"),
+        ],
+    )
+}
+
+/// 同 `run_capture`，但由调用方决定附加的环境变量（不设置 `GIT_OPTIONAL_LOCKS` 之外的默认值）。
+/// 用于需要写 `.git` 的命令（fetch / pull / clone）。
+pub fn run_capture_env(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+    envs: &[(&str, &str)],
+) -> std::io::Result<RunOutcome> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .current_dir(cwd)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_PAGER", "cat")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn()?;
     let pid = child.id();
     #[cfg(not(test))]
     let _ = pid;
@@ -160,7 +182,7 @@ fn truncate_utf8(s: String, max: usize) -> (String, bool) {
 }
 
 /// 把一次执行结果整理成面板文本。
-fn build_result(out: RunOutcome) -> GitResult {
+pub(crate) fn build_result(out: RunOutcome) -> GitResult {
     let (stdout, t1) = truncate_utf8(String::from_utf8_lossy(&out.stdout).into_owned(), MAX_OUTPUT);
     let (stderr, t2) = truncate_utf8(String::from_utf8_lossy(&out.stderr).into_owned(), MAX_OUTPUT);
     let truncated = t1 || t2;
@@ -219,7 +241,7 @@ mod tests {
 
     /// 用固定身份、禁用用户全局/系统配置执行 git（建仓、提交用）。
     fn git(dir: &Path, args: &[&str]) {
-        let st = Command::new("git")
+        let out = Command::new("git")
             .args(args)
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "t")
@@ -230,11 +252,14 @@ mod tests {
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .output()
             .unwrap();
-        assert!(st.success(), "git {args:?} failed");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed ({:?}) in {dir:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
 
     fn init(dir: &Path) {

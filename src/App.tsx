@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { api, type ProjectInfo, type ScanCandidate } from './api'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import {
+  api,
+  type ImportReport,
+  type ProjectInfo,
+  type ScanCandidate,
+  type ServiceStatus,
+} from './api'
 import DetailView from './Detail'
 import UpdateBanner from './Update'
 import { humanSize } from './format'
@@ -33,6 +40,16 @@ export default function App() {
   const [modal, setModal] = useState<Modal | null>(null)
   const [modalInput, setModalInput] = useState('')
   const [detailId, setDetailId] = useState<number | null>(null)
+
+  // 有服务处于运行中/过渡态的项目 id（来自 svc:state 事件，不轮询）
+  const [running, setRunning] = useState<Set<number>>(new Set())
+
+  // 克隆 / PM2 导入的独立浮层状态（不塞进既有 Modal 联合类型）
+  const [cloneOpen, setCloneOpen] = useState(false)
+  const [cloneUrl, setCloneUrl] = useState('')
+  const [cloneDir, setCloneDir] = useState<string | null>(null)
+  const [cloneBusy, setCloneBusy] = useState(false)
+  const [pm2Report, setPm2Report] = useState<ImportReport | null>(null)
 
   // 项目大小：仅前端内存缓存（key = id + 路径），会话内不重复计算；null 表示计算失败
   const [sizes, setSizes] = useState<Record<string, number | null>>({})
@@ -83,6 +100,47 @@ export default function App() {
 
   useEffect(() => {
     refresh()
+  }, [])
+
+  // 运行状态：初始化一次 + 订阅 svc:state（不轮询）
+  useEffect(() => {
+    let alive = true
+    let un: UnlistenFn | null = null
+    const apply = (list: ServiceStatus[]) => {
+      if (!alive) return
+      setRunning(
+        new Set(
+          list
+            .filter((s) => s.phase === 'Running' || s.phase === 'Building' || s.phase === 'Installing')
+            .map((s) => s.project_id),
+        ),
+      )
+    }
+    void (async () => {
+      try {
+        apply(await api.serviceStatus())
+      } catch {
+        /* 后端不可用时保持空集合 */
+      }
+      un = await listen<ServiceStatus>('svc:state', (e) => {
+        if (!alive) return
+        const id = e.payload.project_id
+        const active =
+          e.payload.phase === 'Running' ||
+          e.payload.phase === 'Building' ||
+          e.payload.phase === 'Installing'
+        setRunning((prev) => {
+          const next = new Set(prev)
+          if (active) next.add(id)
+          else next.delete(id)
+          return next
+        })
+      })
+    })()
+    return () => {
+      alive = false
+      if (un) un()
+    }
   }, [])
 
   const filterTags = useMemo(() => {
@@ -250,6 +308,18 @@ export default function App() {
             >
               添加单个项目…
             </button>
+            <button
+              onClick={() => setCloneOpen(true)}
+              className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+            >
+              从 GitHub 克隆…
+            </button>
+            <button
+              onClick={() => void run(async () => setPm2Report(await api.importPm2()))}
+              className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+            >
+              导入 PM2 配置
+            </button>
           </div>
         </header>
 
@@ -326,6 +396,13 @@ export default function App() {
             >
               <div className="flex items-center gap-2">
                 <h2 className="truncate font-semibold">{p.name}</h2>
+                {running.has(p.id) && (
+                  <span
+                    className="shrink-0 inline-block h-2 w-2 rounded-full bg-emerald-500"
+                    title="服务运行中"
+                    aria-hidden
+                  />
+                )}
                 {p.missing && (
                   <span className="shrink-0 rounded bg-red-100 px-1.5 py-0.5 text-xs text-red-700 dark:bg-red-900 dark:text-red-200">
                     路径丢失
@@ -542,7 +619,101 @@ export default function App() {
             </div>
           </div>
         )}
+        {cloneOpen && (
+          <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/40 p-6">
+            <div className="w-full max-w-md rounded-xl bg-white p-5 dark:bg-neutral-900">
+              <h3 className="font-semibold">从 GitHub 克隆</h3>
+              <p className="mt-1 text-xs text-neutral-500">
+                支持 https / ssh 地址。克隆完成后自动加入管理器。
+              </p>
+              <input
+                autoFocus
+                value={cloneUrl}
+                onChange={(e) => setCloneUrl(e.target.value)}
+                placeholder="https://github.com/owner/repo.git"
+                className="mt-3 w-full rounded-lg border border-neutral-300 bg-white px-3 py-1.5 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-800"
+              />
+              <div className="mt-2 flex items-center gap-2">
+                <button
+                  onClick={() => void run(async () => setCloneDir(await pickDirectory()))}
+                  className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+                >
+                  选择父目录…
+                </button>
+                <span className="truncate text-xs text-neutral-500" title={cloneDir ?? ''}>
+                  {cloneDir ?? '未选择'}
+                </span>
+              </div>
+              <div className="mt-4 flex justify-end gap-2">
+                <button
+                  onClick={() => setCloneOpen(false)}
+                  className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={() =>
+                    void run(async () => {
+                      if (!cloneDir) throw new Error('请先选择父目录')
+                      setCloneBusy(true)
+                      try {
+                        await api.cloneRepo(cloneUrl.trim(), cloneDir)
+                        setCloneOpen(false)
+                        setCloneUrl('')
+                        setCloneDir(null)
+                        await refresh()
+                      } finally {
+                        setCloneBusy(false)
+                      }
+                    })
+                  }
+                  disabled={cloneBusy || !cloneUrl.trim() || !cloneDir}
+                  className="rounded-lg bg-blue-600 px-3 py-1.5 text-sm text-white disabled:opacity-40"
+                >
+                  {cloneBusy ? '克隆中…' : '克隆'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {pm2Report && (
+          <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/40 p-6">
+            <div className="w-full max-w-md rounded-xl bg-white p-5 dark:bg-neutral-900">
+              <h3 className="font-semibold">导入 PM2 配置</h3>
+              <p className="mt-2 text-sm">新增 {pm2Report.imported.length} 个项目的配方。</p>
+              <ReportList title="已跳过" items={pm2Report.skipped} />
+              <ReportList title="问题" items={pm2Report.errors} />
+              <div className="mt-4 flex justify-end">
+                <button
+                  onClick={() => {
+                    setPm2Report(null)
+                    void refresh()
+                  }}
+                  className="rounded-lg bg-blue-600 px-3 py-1.5 text-sm text-white"
+                >
+                  关闭
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
+    </div>
+  )
+}
+
+/** 导入报告里的一段（空则不渲染）。 */
+function ReportList({ title, items }: { title: string; items: string[] }) {
+  if (items.length === 0) return null
+  return (
+    <div className="mt-3">
+      <div className="text-xs font-semibold text-neutral-500">{title}</div>
+      <ul className="mt-1 list-inside list-disc text-xs">
+        {items.map((t) => (
+          <li key={t}>{t}</li>
+        ))}
+      </ul>
     </div>
   )
 }

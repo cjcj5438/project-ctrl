@@ -2,6 +2,8 @@ import { useCallback, useState } from 'react'
 import { api, errorText, type ProjectInfo } from './api'
 import { humanSize } from './format'
 import ReadmeSection from './Readme'
+import ServiceSection from './Service'
+import SourceSection from './Source'
 import { pickDirectory } from './util'
 
 /** 详情页：项目信息 + tag 编辑 + 打开按钮 + README 区域。 */
@@ -226,6 +228,9 @@ export default function DetailView({
                 </pre>
               </div>
             )}
+
+            <SourceSection project={project} />
+            <ServiceSection project={project} onError={onError} />
 
             <ReadmeSection key={project.path} projectId={project.id} onDirtyChange={onDirtyChange} onError={onError} />
           </>

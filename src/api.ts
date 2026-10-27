@@ -39,6 +39,66 @@ export function isConflict(e: unknown): e is { kind: 'conflict'; current_mtime: 
   return typeof e === 'object' && e !== null && 'kind' in e && e.kind === 'conflict'
 }
 
+export type Phase = 'Idle' | 'Installing' | 'Building' | 'Running' | 'Stopped' | 'Crashed' | 'Failed'
+
+export interface ServiceStatus {
+  project_id: number
+  phase: Phase
+  port: number | null
+  pid: number | null
+  exit_code: number | null
+  note: string | null
+}
+
+export interface ServiceConfig {
+  install: string[] | null
+  build: string[] | null
+  start: string[]
+  dev_port: number | null
+  requires_ports: number[]
+  env: Record<string, string>
+  node_pin: string | null
+  toolchain: string[]
+  origin: string
+}
+
+export interface DetectResult {
+  package_manager: string | null
+  install: string[] | null
+  build: string[] | null
+  start_candidates: string[][]
+  dev_port: number | null
+  requires_ports: number[]
+  node_pin: string | null
+  toolchain: string[]
+  problems: string[]
+}
+
+export interface SourceInfo {
+  is_repo: boolean
+  branch: string | null
+  detached: boolean
+  upstream: string | null
+  dirty: number
+  ahead: number
+  behind: number
+  can_fetch: boolean
+  can_pull: boolean
+  pull_blocked_by: string | null
+}
+
+export interface ImportReport {
+  imported: number[]
+  skipped: string[]
+  errors: string[]
+}
+
+/** 事件 payload（与服务端 `LogPayload` 一致）。 */
+export interface LogPayload {
+  project_id: number
+  lines: string[]
+}
+
 export function errorText(e: unknown): string {
   if (typeof e === 'string') return e
   if (typeof e === 'object' && e !== null && 'message' in e) return String(e.message)
@@ -70,4 +130,24 @@ export const api = {
   openExternal: (url: string) => invoke<void>('open_external', { url }),
   runGit: (id: number, kind: 'status' | 'log') => invoke<GitResult>('run_git', { id, kind }),
   projectSize: (id: number) => invoke<number>('project_size', { id }),
+
+  serviceConfig: (id: number) => invoke<ServiceConfig | null>('service_config', { id }),
+  saveServiceConfig: (id: number, config: ServiceConfig) =>
+    invoke<void>('save_service_config', { id, config }),
+  deleteServiceConfig: (id: number) => invoke<void>('delete_service_config', { id }),
+  detectService: (id: number) => invoke<DetectResult>('detect_service', { id }),
+  serviceStatus: () => invoke<ServiceStatus[]>('service_status'),
+  serviceLogs: (id: number) => invoke<string[]>('service_logs', { id }),
+  servicePreflight: (id: number, step: 'install' | 'build' | 'start') =>
+    invoke<string[]>('service_preflight', { id, step }),
+  serviceStart: (id: number) => invoke<ServiceStatus>('service_start', { id }),
+  serviceStop: (id: number) => invoke<void>('service_stop', { id }),
+  serviceStep: (id: number, step: 'install' | 'build') => invoke<void>('service_step', { id, step }),
+  openServiceUrl: (id: number) => invoke<void>('open_service_url', { id }),
+
+  sourceInfo: (id: number) => invoke<SourceInfo>('source_info', { id }),
+  sourceFetch: (id: number) => invoke<GitResult>('source_fetch', { id }),
+  sourcePull: (id: number) => invoke<GitResult>('source_pull', { id }),
+  cloneRepo: (url: string, parentDir: string) => invoke<number>('clone_repo', { url, parentDir }),
+  importPm2: () => invoke<ImportReport>('import_pm2'),
 }

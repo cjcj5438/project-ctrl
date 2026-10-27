@@ -30,6 +30,11 @@ pub fn open_db() -> rusqlite::Result<Connection> {
            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
            tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
            PRIMARY KEY (project_id, tag_id)
+         );
+         CREATE TABLE IF NOT EXISTS services (
+           project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+           config TEXT NOT NULL,
+           managed_at INTEGER NOT NULL
          );",
     )?;
     Ok(conn)
@@ -154,6 +159,28 @@ pub fn delete_tag(conn: &Connection, name: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// 取项目的服务配方（JSON 字符串）。无记录为 None。
+pub fn service_config(conn: &Connection, project_id: i64) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT config FROM services WHERE project_id = ?1", params![project_id], |r| r.get(0))
+        .optional()
+}
+
+/// 写入 / 覆盖服务配方。
+pub fn set_service_config(conn: &Connection, project_id: i64, json: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO services (project_id, config, managed_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(project_id) DO UPDATE SET config = excluded.config, managed_at = excluded.managed_at",
+        params![project_id, json, now_secs()],
+    )?;
+    Ok(())
+}
+
+/// 删除服务配方（项目本身保留）。
+pub fn delete_service_config(conn: &Connection, project_id: i64) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM services WHERE project_id = ?1", params![project_id])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,7 +191,8 @@ mod tests {
             "PRAGMA foreign_keys = ON;
              CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, added_at INTEGER NOT NULL);
              CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
-             CREATE TABLE project_tags (project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE, PRIMARY KEY (project_id, tag_id));",
+             CREATE TABLE project_tags (project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE, PRIMARY KEY (project_id, tag_id));
+             CREATE TABLE services (project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, config TEXT NOT NULL, managed_at INTEGER NOT NULL);",
         )
         .unwrap();
         conn
