@@ -67,7 +67,7 @@ pub fn pm2_entries_from(path: &Path) -> Vec<ExternalEntry> {
         .map(|a| {
             let mut command = a.script.clone().map(|s| vec![s]);
             if let (Some(cmd), Some(args)) = (command.as_mut(), a.args.as_ref()) {
-                cmd.extend(args.split_whitespace().map(|s| s.to_string()));
+                cmd.extend(split_args(args));
             }
             ExternalEntry {
                 source: "pm2".into(),
@@ -100,7 +100,25 @@ pub fn launchd_entries(home: &Path) -> Vec<ExternalEntry> {
         if path.extension().map(|x| x != "plist").unwrap_or(true) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let path_s = path.to_string_lossy().into_owned();
+        // #57：二进制 plist 先用 plutil 转文本；彻底损坏的记一条可解释的条目而不是丢弃。
+        let text = match plist_text(&path) {
+            Ok(t) => t,
+            Err(note) => {
+                out.push(ExternalEntry {
+                    source: "launchd".into(),
+                    name: path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                    cwd: None,
+                    managed_project: None,
+                    declared: false,
+                    note,
+                    config_path: path_s,
+                    command: None,
+                    changed_at: file_mtime(&path),
+                });
+                continue;
+            }
+        };
         let label = plist_string(&text, "Label").unwrap_or_else(|| {
             path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
         });
@@ -128,6 +146,79 @@ pub fn launchd_entries(home: &Path) -> Vec<ExternalEntry> {
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// 读 plist 文本：UTF-8 文本直接读；二进制则用 `plutil -convert xml1 -o -` 转文本（#57）。
+/// 都失败 → 返回 note 文案，调用方记一条可解释的条目而不是丢弃。
+fn plist_text(path: &Path) -> Result<String, String> {
+    let raw = std::fs::read(path).map_err(|_| "无法解析的 plist（二进制/损坏）".to_string())?;
+    // 二进制 plist 以 `bplist` 魔数开头：必须经 plutil 转文本，直接当 UTF-8 读会误判。
+    if raw.starts_with(b"bplist") {
+        let out = std::process::Command::new("/usr/bin/plutil")
+            .args(["-convert", "xml1", "-o", "-", &path.to_string_lossy()])
+            .output();
+        return match out {
+            Ok(o) if o.status.success() => String::from_utf8(o.stdout)
+                .map_err(|_| "无法解析的 plist（二进制/损坏）".to_string()),
+            _ => Err("无法解析的 plist（二进制/损坏）".to_string()),
+        };
+    }
+    // 文本形态：必须含 plist 结构标记，否则是损坏文件（不能按"已安装"显示）。
+    let text = String::from_utf8(raw).map_err(|_| "无法解析的 plist（二进制/损坏）".to_string())?;
+    if text.contains("<plist") || text.contains("<dict") || text.contains("<key>") {
+        Ok(text)
+    } else {
+        Err("无法解析的 plist（二进制/损坏）".to_string())
+    }
+}
+
+/// 切分 PM2 `args` 字符串（#79）：支持单/双引号与反斜杠转义。
+///
+/// 规则：空白分隔；`"…"`/`'…'` 内空白保留；`\x` 转义为字面 `x`（含 `\"`、`\'`、`\ `）；
+/// 未闭合的引号按到串尾结束处理（不报错，尽量还原用户意图）。
+pub(crate) fn split_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut in_word = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                cur.push(next);
+                in_word = true;
+            }
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else {
+                cur.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            _ if c.is_whitespace() => {
+                if in_word {
+                    out.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            _ => {
+                cur.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        out.push(cur);
+    }
     out
 }
 
@@ -176,7 +267,7 @@ pub fn annotate(entries: &mut [ExternalEntry], projects: &[(String, Vec<String>)
         let cwd = crate::logic::normalize_path(cwd);
         if let Some((path, names)) = projects.iter().find(|(p, _)| *p == cwd) {
             e.managed_project = Some(path.clone());
-            e.declared = names.iter().any(|n| *n == e.name);
+            e.declared = names.contains(&e.name);
         }
     }
 }
@@ -192,7 +283,7 @@ pub struct Drift {
 }
 
 pub fn drift_of(entry: &ExternalEntry, declared_cmd: Option<&[String]>) -> Option<Drift> {
-    let Some(declared) = declared_cmd else { return None };
+    let declared = declared_cmd?;
     let external = entry.command.as_deref().unwrap_or(&[]);
     if external.is_empty() || declared.is_empty() {
         return None;
@@ -323,5 +414,62 @@ mod tests {
     fn missing_pm2_and_launchd_yield_empty_not_error() {
         let d = tempfile::tempdir().unwrap();
         assert!(scan(d.path()).is_empty());
+    }
+
+    #[test]
+    fn binary_plist_is_converted_not_skipped() {
+        let d = tempfile::tempdir().unwrap();
+        let agents = d.path().join("Library/LaunchAgents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let plist = agents.join("bin.plist");
+        std::fs::write(
+            &plist,
+            "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>ai.test.binary</string><key>ProgramArguments</key><array><string>/bin/echo</string></array></dict></plist>",
+        )
+        .unwrap();
+        // 现场转二进制（plutil 是 macOS 系统工具，测试可用）
+        let st = std::process::Command::new("/usr/bin/plutil")
+            .args(["-convert", "binary1", &plist.to_string_lossy()])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        assert!(std::fs::read(&plist).unwrap().starts_with(b"bplist"), "应确为二进制 plist");
+        // 二进制 → plutil 转回文本 → 条目仍在
+        let entries = launchd_entries(d.path());
+        assert!(entries.iter().any(|e| e.name == "ai.test.binary"), "{entries:?}");
+        // 彻底损坏的 plist → 记一条可解释的条目而不是丢弃
+        std::fs::write(&plist, b"\x00\x01\x02garbage-not-plist".as_slice()).unwrap();
+        let entries = launchd_entries(d.path());
+        let e = entries.iter().find(|e| e.config_path == plist.to_string_lossy()).expect("损坏的 plist 也要有条目");
+        assert!(e.note.contains("无法解析"), "{}", e.note);
+    }
+
+    #[test]
+    fn split_args_handles_quotes_and_escapes() {
+        assert!(split_args("").is_empty());
+        assert_eq!(split_args("--port 8080"), vec!["--port", "8080"]);
+        assert_eq!(split_args("--msg \"hello world\""), vec!["--msg", "hello world"]);
+        assert_eq!(split_args("--msg 'it works'"), vec!["--msg", "it works"]);
+        assert_eq!(split_args("--path a\\ b"), vec!["--path", "a b"]);
+        assert_eq!(split_args("\"a\\\"b\""), vec!["a\"b"]);
+        assert_eq!(split_args("a'b'c"), vec!["abc"]);
+    }
+
+    #[test]
+    fn drift_of_empty_declared_is_none() {
+        // #41 补点：drift_reports_command_mismatch_only 已覆盖一致→None、mismatch+detail、
+        // 外部空命令→None；这里只补它没断言的「声明为空数组 → None」。
+        let e = ExternalEntry {
+            source: "launchd".into(),
+            name: "ai.test".into(),
+            cwd: None,
+            managed_project: None,
+            declared: true,
+            note: String::new(),
+            config_path: "/x.plist".into(),
+            command: Some(vec!["node".into(), "hub.js".into()]),
+            changed_at: None,
+        };
+        assert!(drift_of(&e, Some(&[])).is_none(), "声明为空数组时不做判断");
     }
 }

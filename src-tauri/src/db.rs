@@ -19,21 +19,40 @@ pub fn data_dir() -> PathBuf {
 }
 
 /// 有序迁移列表。索引 i 表示「升到版本 i+1」。
-const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[migrate_to_v1];
+const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[migrate_to_v1, migrate_to_v2];
 
 /// 打开（必要时迁移）数据库。
 pub fn open_db() -> rusqlite::Result<Connection> {
     let dir = data_dir();
     std::fs::create_dir_all(&dir).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    restrict_db_permissions(&dir.join("data.db"));
     let mut conn = Connection::open(dir.join("data.db"))?;
+    restrict_db_permissions(&dir.join("data.db"));
     migrate(&mut conn)?;
     Ok(conn)
+}
+
+/// #26：data.db 含服务 env，必须 0600。新建/存量都在 open 路径修复。
+fn restrict_db_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(path) else { return };
+    if meta.permissions().mode() & 0o077 != 0 {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 /// 把连接升到最新 schema 版本（幂等，测试也用这个建库）。
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let latest = MIGRATIONS.len() as i64;
+    if current > latest {
+        // #25：库比 App 新（降级/旧版本打开新库）：拒绝而不是静默读写未知 schema。
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+            format!("数据库版本（{current}）高于本 App 支持的版本（{latest}），请升级 App 后再打开"),
+        ))));
+    }
     for (idx, step) in MIGRATIONS.iter().enumerate() {
         let version = idx as i64 + 1;
         if current >= version {
@@ -48,6 +67,7 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
 }
 
 /// v1：建基线表；若检测到 v0.2.0 的单配方 `services` 表则整表重建并转换。
+/// 解析失败或 validate 非法的行 → 隔离表（#61），不产生幽灵服务、不丢原 JSON。
 fn migrate_to_v1(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS projects (
@@ -74,14 +94,57 @@ fn migrate_to_v1(conn: &Connection) -> rusqlite::Result<()> {
         };
         conn.execute_batch("DROP TABLE services;")?;
         create_services(conn)?;
+        create_services_quarantine(conn)?;
         for (project_id, json) in rows {
-            let legacy: services::LegacyServiceConfig = serde_json::from_str(&json).unwrap_or_default();
+            let parsed: Result<services::LegacyServiceConfig, _> = serde_json::from_str(&json);
+            let legacy = match parsed {
+                Ok(l) => l,
+                Err(e) => {
+                    quarantine(conn, project_id, &json, &format!("legacy JSON 解析失败：{e}"))?;
+                    continue;
+                }
+            };
             let (spec, derived) = services::from_legacy(&legacy);
+            let problems = spec.validate();
+            if !problems.is_empty() {
+                quarantine(conn, project_id, &json, &format!("转换后校验失败：{}", problems.join("；")))?;
+                continue;
+            }
             insert_service(conn, project_id, &spec, &derived)?;
+        }
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM services_quarantine", [], |r| r.get(0))?;
+        if n > 0 {
+            eprintln!("db 迁移：{n} 行 legacy 配置已隔离到 services_quarantine（原 JSON 保留）");
         }
     } else {
         create_services(conn)?;
     }
+    Ok(())
+}
+
+/// v2：隔离表。已升级过的库（user_version=1）走这条补上；新库经 v1→v2 链同样得到。
+fn migrate_to_v2(conn: &Connection) -> rusqlite::Result<()> {
+    create_services_quarantine(conn)
+}
+
+fn create_services_quarantine(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS services_quarantine (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           project_id INTEGER NOT NULL,
+           raw TEXT NOT NULL,
+           error TEXT NOT NULL,
+           quarantined_at INTEGER NOT NULL
+         );",
+    )
+}
+
+/// 坏行进隔离表（原 JSON + 原因都保留，可手工恢复）。
+fn quarantine(conn: &Connection, project_id: i64, raw: &str, error: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO services_quarantine (project_id, raw, error, quarantined_at) VALUES (?1, ?2, ?3, ?4)",
+        params![project_id, raw, error, now_secs()],
+    )?;
     Ok(())
 }
 
@@ -446,6 +509,83 @@ mod tests {
         let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
     }
+
+    #[test]
+    fn newer_schema_is_rejected_with_upgrade_hint() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        conn.pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 5).unwrap();
+        let err = migrate(&mut conn).unwrap_err().to_string();
+        assert!(err.contains("升级"), "{err}");
+    }
+
+    #[test]
+    fn busy_timeout_is_configured() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let ms: i64 = conn.pragma_query_value(None, "busy_timeout", |r| r.get(0)).unwrap();
+        assert_eq!(ms, 5000, "并发写不应立刻 database is locked");
+    }
+
+    #[test]
+    fn new_database_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let _data = crate::test_support::ScopedDataDir::new(dir.path());
+        let db_path = dir.path().join("data.db");
+        // 预置 0644 存量 → open 后修复为 0600
+        std::fs::write(&db_path, b"").unwrap();
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        open_db().unwrap();
+        let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "存量 data.db 应被修复为 0600");
+        // 新建库同样 0600
+        std::fs::remove_file(&db_path).unwrap();
+        open_db().unwrap();
+        let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "新建 data.db 应为 0600");
+    }
+
+    #[test]
+    fn corrupt_legacy_rows_are_quarantined_not_ghosted() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, added_at INTEGER NOT NULL);
+             CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+             CREATE TABLE project_tags (project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE, PRIMARY KEY (project_id, tag_id));
+             CREATE TABLE services (project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, config TEXT NOT NULL, managed_at INTEGER NOT NULL);
+             INSERT INTO projects (id, path, added_at) VALUES (7, '/x/good', 1), (8, '/x/bad', 1);
+             INSERT INTO services (project_id, config, managed_at) VALUES
+               (7, '{\"start\":[\"pnpm\",\"dev\"],\"dev_port\":5190}', 2),
+               (8, 'NOT-JSON{{{', 2);",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        // 好行正常
+        let rows = services_of(&conn, 7).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(ServiceSpec::from_json(&rows[0].config).unwrap().run.unwrap(), vec!["pnpm", "dev"]);
+        // 坏行：无幽灵服务，原 JSON 进隔离表
+        assert!(services_of(&conn, 8).unwrap().is_empty(), "坏行不得产生幽灵服务");
+        let q: Vec<(i64, String, String)> = {
+            let mut st = conn.prepare("SELECT project_id, raw, error FROM services_quarantine").unwrap();
+            st.query_map([], |r| Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap())))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].0, 8);
+        assert!(q[0].1.contains("NOT-JSON"), "原 JSON 必须保留：{}", q[0].1);
+        assert!(!q[0].2.is_empty());
+        // 已升级过的库（无 legacy 表）同样有隔离表
+        let fresh = mem();
+        let n: i64 = fresh
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='services_quarantine'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
 }
 
 #[cfg(test)]
@@ -478,7 +618,7 @@ mod real_db_smoke {
         migrate(&mut conn).unwrap();
 
         let after: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert!(after >= 1, "应升到 v1（之前是 {before}）");
+        assert!(after >= 2, "应升到 v2（之前是 {before}）");
         let projects_after: i64 =
             conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0)).unwrap();
         assert_eq!(projects_before, projects_after, "项目数量不能变");

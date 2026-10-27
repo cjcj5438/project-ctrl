@@ -76,6 +76,8 @@ fn run(cwd: &Path, args: &[String], timeout: Duration) -> Result<std::process::O
             Ok(Some(_)) => break,
             Ok(None) if start.elapsed() > timeout => {
                 let _ = child.kill();
+                // #51：kill 后必须 wait 收尸，否则僵尸进程残留。
+                let _ = child.wait();
                 return Err(format!("docker 超时（{}s）", timeout.as_secs()));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
@@ -330,28 +332,55 @@ pub fn ps(cwd: &Path, spec: &DockerSpec) -> Result<Vec<ContainerView>, String> {
     if !out.status.success() {
         return Err(err_text(&out));
     }
-    let raw = text(&out);
+    let views = parse_ps_output(&out)?;
+    if spec.services.is_empty() {
+        return Ok(views);
+    }
+    Ok(views.into_iter().filter(|v| spec.services.contains(&v.service)).collect())
+}
+
+/// 解析 `docker compose ps --format json` 的输出（#27）。
+///
+/// 只读 stdout（stderr 的 WARN 不得污染 JSON）；任一行解析失败 → 整个 ps 返回
+/// Err（带行号与原文摘要），不再静默吞成空列表。
+fn parse_ps_output(out: &std::process::Output) -> Result<Vec<ContainerView>, String> {
+    let raw = String::from_utf8_lossy(&out.stdout);
     let mut views = Vec::new();
     // compose 可能输出 JSON 数组，也可能是每行一个 JSON 对象
     let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(views);
+    }
     if trimmed.starts_with('[') {
-        if let Ok(rows) = serde_json::from_str::<Vec<PsRow>>(trimmed) {
-            views.extend(rows.into_iter().map(into_view));
-        }
+        let rows: Vec<PsRow> = serde_json::from_str(trimmed).map_err(|e| {
+            format!("docker ps 输出解析失败：{e}（原文摘要：{}）", summarize(trimmed))
+        })?;
+        views.extend(rows.into_iter().map(into_view));
     } else {
-        for line in trimmed.lines() {
+        for (idx, line) in trimmed.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(row) = serde_json::from_str::<PsRow>(line) {
-                views.push(into_view(row));
-            }
+            let row: PsRow = serde_json::from_str(line).map_err(|e| {
+                format!("docker ps 第 {} 行解析失败：{e}（原文：{}）", idx + 1, summarize(line))
+            })?;
+            views.push(into_view(row));
         }
     }
-    if !spec.services.is_empty() {
-        views.retain(|v| spec.services.contains(&v.service));
-    }
     Ok(views)
+}
+
+/// 原文摘要：截断到 120 字符，避免把超长输出塞进错误信息。
+fn summarize(s: &str) -> String {
+    const LIMIT: usize = 120;
+    if s.len() <= LIMIT {
+        return s.to_string();
+    }
+    let mut end = LIMIT;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 fn into_view(row: PsRow) -> ContainerView {
@@ -444,5 +473,30 @@ mod tests {
         let lines = "{\"Name\":\"a\",\"Service\":\"web\",\"State\":\"exited\",\"Status\":\"Exited (0)\",\"Publishers\":[]}";
         let rows: Vec<PsRow> = lines.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(into_view(rows.into_iter().next().unwrap()).state, "exited");
+    }
+
+    #[test]
+    fn ps_parses_stdout_only_and_fails_loudly() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::Output;
+        let ok_row = "{\"Name\":\"g6-postgres-1\",\"Service\":\"postgres\",\"State\":\"running\",\"Status\":\"Up\",\"Publishers\":[]}";
+        // stderr 有 WARN 也不得污染解析
+        let out = Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: format!("{ok_row}\n").into_bytes(),
+            stderr: b"WARN: using default tag\n".to_vec(),
+        };
+        let views = parse_ps_output(&out).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].service, "postgres");
+        // stdout 非 JSON → 整个 ps 返回 Err（带行号/原文摘要），不再吞成空列表
+        let bad = Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: format!("{ok_row}\nNOT-JSON{{{{\n").into_bytes(),
+            stderr: Vec::new(),
+        };
+        let err = parse_ps_output(&bad).unwrap_err();
+        assert!(err.contains('2'), "{err}");
+        assert!(err.contains("NOT-JSON"), "{err}");
     }
 }

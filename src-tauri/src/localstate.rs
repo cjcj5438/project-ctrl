@@ -14,8 +14,89 @@
 use crate::services::{Restart, ServiceSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
+/// 进程内写串行锁：`load→改→write` 三段必须原子，否则并发写丢键（#16）。
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 原子写：tmp + fsync + rename（#16），新建文件 0600（#26）。
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{e}"))?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+        f.write_all(bytes).map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+        f.sync_all().map_err(|e| format!("落盘 {} 失败：{e}", path.display()))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+    restrict_permissions(path);
+    Ok(())
+}
+
+/// 存量修复：本 app 的状态文件若 group/other 可读 → 改 0600（#26）。
+fn restrict_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(path) else { return };
+    if meta.permissions().mode() & 0o077 != 0 {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// 文件名/键转义（#15、#50）：`[A-Za-z0-9_-]` 原样，其余字节转 `%XX`（大写十六进制）。
+/// 可逆：读路径按文件名反推 key 时必须能还原，所以不用哈希。
+fn escape_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// [`escape_key`] 的逆操作：`%XX` 还原字节（非法序列原样保留，不 panic）。
+/// 目前只有测试用它做 roundtrip 断言；读路径按收养凭据 JSON 里的 key 直接定位文件，无需反推。
+#[cfg(test)]
+fn unescape_filename(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let (h, l) = (bytes[i + 1], bytes[i + 2]);
+            if let (Some(h), Some(l)) = (hex_val(h), hex_val(l)) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
+}
 pub fn root() -> PathBuf {
     crate::db::data_dir()
 }
@@ -37,11 +118,13 @@ fn ports_path() -> PathBuf {
 }
 
 /// 单服务的本机覆盖（用户意图）。
+///
+/// `port_offset` 是**加法语义**：期望端口 = `ports.listen + port_offset`（#53）。
+/// 不是绝对端口——旧注释写错了，这里以实现与 plan.rs 为准。
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct Override {
-    /// 优先使用的端口（与声明里的 `ports.listen` 冲突时以本机为准），
-    /// 以及上次被顺延后的稳定偏移。
+    /// 加到声明 `ports.listen` 上的偏移量（0 = 不偏移）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_offset: Option<u16>,
     /// 退出 App 时是否保留进程（下次打开重新收养）。
@@ -67,6 +150,26 @@ impl Override {
     }
 }
 
+/// `set_service_override` 的 patch 形状（#22 三态语义）。
+///
+/// 每个字段三态：absent（字段缺席）= 不变；`null` = 删除该键；值 = 设置。
+/// `env` 逐键三态：缺席的键不变，`null` 值的键删除，有值的键设置/覆盖。
+/// `env_files` 整体三态：absent 不变，`null` 清空，数组整体替换。
+/// 外层 `patch: null`（`set_override` 的 `None`）= 删除整个服务的覆盖。
+///
+/// JSON 示例：`{"port_offset": null}` 只清偏移；`{"keep_alive": true}` 只设保留；
+/// `{}` 什么都不改；`{"env": {"A": "1", "B": null}}` 设 A 删 B。
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct OverridePatch {
+    pub port_offset: Option<Option<u16>>,
+    pub keep_alive: Option<Option<bool>>,
+    pub restart: Option<Option<Restart>>,
+    #[serde(default)]
+    pub env: Option<BTreeMap<String, Option<String>>>,
+    pub env_files: Option<Option<Vec<String>>>,
+}
+
 /// `overrides.json` 的整份内容：`{ "<project path>": { "<service name>": {...} } }`。
 ///
 /// 值一律保留原始 JSON：认不出的顶层键、认不出的服务键、服务覆盖里的未知字段
@@ -77,44 +180,75 @@ pub struct Overrides {
     pub projects: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
 }
 
-/// 写入一个服务的覆盖（`None` = 删除该键）。已知字段逐项合并，未知字段原样保留。
+/// 写入一个服务的覆盖（#22 三态，见 [`OverridePatch`]）。
+///
+/// `None` = 删除整个服务的覆盖；`Some(patch)` 按字段三态合并：
+/// absent 不变、`null` 删键、值设置。未知字段原样保留。
+/// 合并后已知字段全空且无未知字段 → 删整条。
 pub fn set_override(
     o: &mut Overrides,
     project_path: &str,
     service: &str,
-    patch: Option<&Override>,
+    patch: Option<&OverridePatch>,
 ) -> Result<(), String> {
-    match patch {
-        Some(ov) if !ov.is_empty() => {
-            let new = serde_json::to_value(ov).map_err(|e| format!("序列化覆盖失败：{e}"))?;
-            let entry = o
-                .projects
-                .entry(project_path.to_string())
-                .or_default()
-                .entry(service.to_string());
-            match (entry, new) {
-                (std::collections::btree_map::Entry::Occupied(mut occ), serde_json::Value::Object(new)) => {
-                    if let serde_json::Value::Object(old) = occ.get_mut() {
-                        for (k, v) in new {
-                            old.insert(k, v);
-                        }
-                    } else {
-                        occ.insert(serde_json::Value::Object(new));
-                    }
+    let Some(patch) = patch else {
+        if let Some(services) = o.projects.get_mut(project_path) {
+            services.remove(service);
+        }
+        o.projects.retain(|_, v| !v.is_empty());
+        return Ok(());
+    };
+    let services = o.projects.entry(project_path.to_string()).or_default();
+    let entry = services.entry(service.to_string()).or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if !entry.is_object() {
+        *entry = serde_json::Value::Object(Default::default());
+    }
+    let obj = entry.as_object_mut().expect("刚保证是 object");
+    apply_scalar(obj, "port_offset", &patch.port_offset)?;
+    apply_scalar(obj, "keep_alive", &patch.keep_alive)?;
+    apply_scalar(obj, "restart", &patch.restart)?;
+    apply_scalar(obj, "env_files", &patch.env_files)?;
+    if let Some(env_patch) = &patch.env {
+        let env_obj = obj
+            .entry("env".to_string())
+            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+        if !env_obj.is_object() {
+            *env_obj = serde_json::Value::Object(Default::default());
+        }
+        let map = env_obj.as_object_mut().expect("刚保证是 object");
+        for (k, v) in env_patch {
+            match v {
+                Some(val) => {
+                    map.insert(k.clone(), serde_json::Value::String(val.clone()));
                 }
-                (std::collections::btree_map::Entry::Vacant(vac), v) => {
-                    vac.insert(v);
-                }
-                (std::collections::btree_map::Entry::Occupied(mut occ), v) => {
-                    occ.insert(v);
+                None => {
+                    map.remove(k);
                 }
             }
         }
-        _ => {
-            if let Some(services) = o.projects.get_mut(project_path) {
-                services.remove(service);
-            }
-            o.projects.retain(|_, v| !v.is_empty());
+        if map.is_empty() {
+            obj.remove("env");
+        }
+    }
+    let known_gone = ["port_offset", "keep_alive", "restart", "env", "env_files"]
+        .iter()
+        .all(|k| !obj.contains_key(*k));
+    if known_gone && obj.is_empty() {
+        services.remove(service);
+    }
+    o.projects.retain(|_, v| !v.is_empty());
+    Ok(())
+}
+
+/// 单字段三态合并：absent 不变，`None` 删键，`Some` 设置。
+fn apply_scalar<T: Serialize>(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str, patch: &Option<Option<T>>) -> Result<(), String> {
+    match patch {
+        None => {}
+        Some(None) => {
+            obj.remove(key);
+        }
+        Some(Some(v)) => {
+            obj.insert(key.to_string(), serde_json::to_value(v).map_err(|e| format!("序列化覆盖失败：{e}"))?);
         }
     }
     Ok(())
@@ -122,6 +256,7 @@ pub fn set_override(
 
 pub fn load_overrides() -> Result<Overrides, String> {
     let p = overrides_path();
+    restrict_permissions(&p);
     match std::fs::read_to_string(&p) {
         Ok(t) if t.trim().is_empty() => Ok(Overrides::default()),
         Ok(t) => serde_json::from_str(&t).map_err(|e| format!("overrides.json 解析失败：{e}")),
@@ -130,13 +265,25 @@ pub fn load_overrides() -> Result<Overrides, String> {
     }
 }
 
+#[cfg(test)]
 pub fn save_overrides(o: &Overrides) -> Result<(), String> {
-    let p = overrides_path();
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建数据目录失败：{e}"))?;
-    }
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    save_overrides_locked(o)
+}
+
+/// 锁内原子修改：`load→f→save` 全程持有 `WRITE_LOCK`（#16），多线程并发不丢键。
+/// commands 层与测试里的 load-modify-save 都应走这里，不要手写三段。
+pub fn modify_overrides(f: impl FnOnce(&mut Overrides) -> Result<(), String>) -> Result<(), String> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut o = load_overrides()?;
+    f(&mut o)?;
+    save_overrides_locked(&o)
+}
+
+/// `WRITE_LOCK` 已持有时调用。
+fn save_overrides_locked(o: &Overrides) -> Result<(), String> {
     let json = serde_json::to_string_pretty(o).map_err(|e| format!("序列化 overrides 失败：{e}"))?;
-    std::fs::write(&p, format!("{json}\n")).map_err(|e| format!("写入 overrides.json 失败：{e}"))
+    atomic_write(&overrides_path(), format!("{json}\n").as_bytes())
 }
 
 /// 端口观测值：`{ "<project path>#<service>": port }`。
@@ -147,14 +294,23 @@ pub struct ObservedPorts {
 }
 
 fn observed_key(project_path: &str, service: &str) -> String {
-    format!("{project_path}#{service}")
+    format!("{}#{}", escape_key(project_path), escape_key(service))
 }
 
 pub fn load_ports() -> ObservedPorts {
-    std::fs::read_to_string(ports_path())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    let p = ports_path();
+    restrict_permissions(&p);
+    match std::fs::read_to_string(&p) {
+        Ok(t) => serde_json::from_str(&t).unwrap_or_else(|e| {
+            eprintln!("ports.json 解析失败，已按空处理：{e}");
+            ObservedPorts::default()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ObservedPorts::default(),
+        Err(e) => {
+            eprintln!("ports.json 读取失败，已按空处理：{e}");
+            ObservedPorts::default()
+        }
+    }
 }
 
 pub fn observed_port(project_path: &str, service: &str) -> Option<u16> {
@@ -162,34 +318,35 @@ pub fn observed_port(project_path: &str, service: &str) -> Option<u16> {
 }
 
 pub fn remember_port(project_path: &str, service: &str, port: u16) {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut ports = load_ports();
     if ports.map.get(&observed_key(project_path, service)) == Some(&port) {
         return;
     }
     ports.map.insert(observed_key(project_path, service), port);
-    let _ = write_ports(&ports);
+    let _ = write_ports_locked(&ports);
 }
 
-fn write_ports(ports: &ObservedPorts) -> Result<(), String> {
-    if let Err(e) = std::fs::create_dir_all(state_dir()) {
-        return Err(format!("创建状态目录失败：{e}"));
-    }
+/// `WRITE_LOCK` 已持有时调用（#16：load-modify-write 全程串行）。
+fn write_ports_locked(ports: &ObservedPorts) -> Result<(), String> {
     let json = serde_json::to_string_pretty(ports).map_err(|e| e.to_string())?;
-    std::fs::write(ports_path(), format!("{json}\n")).map_err(|e| format!("写入 ports.json 失败：{e}"))
+    atomic_write(&ports_path(), format!("{json}\n").as_bytes())
 }
 
 /// 收养凭据落盘 / 读取 / 清除。
 pub fn write_adopt(rec: &crate::supervisor::AdoptRecord) -> Result<(), String> {
-    std::fs::create_dir_all(run_dir()).map_err(|e| format!("创建 run 目录失败：{e}"))?;
     let json = serde_json::to_string_pretty(rec).map_err(|e| e.to_string())?;
-    std::fs::write(adopt_path(&rec.key), json).map_err(|e| format!("写入收养凭据失败：{e}"))
+    atomic_write(&adopt_path(&rec.key), json.as_bytes())
 }
 
 pub fn read_adopts() -> Vec<crate::supervisor::AdoptRecord> {
     let Ok(rd) = std::fs::read_dir(run_dir()) else { return Vec::new() };
     rd.filter_map(|e| e.ok())
         .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|e| {
+            restrict_permissions(&e.path());
+            std::fs::read_to_string(e.path()).ok()
+        })
         .filter_map(|t| serde_json::from_str::<crate::supervisor::AdoptRecord>(&t).ok())
         .collect()
 }
@@ -199,11 +356,7 @@ pub fn clear_adopt(key: &str) {
 }
 
 fn adopt_path(key: &str) -> PathBuf {
-    let safe: String = key
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect();
-    run_dir().join(format!("{safe}.json"))
+    run_dir().join(format!("{}.json", escape_key(key)))
 }
 
 /// 把声明与该服务的本机覆盖合成「实际执行用的声明」。
@@ -223,6 +376,17 @@ pub fn apply_override(spec: &ServiceSpec, ov: Option<&Override>) -> (ServiceSpec
     }
     // port_offset 由调用方按「带偏移的期望端口」处理，这里只记在返回值里
     (out, ov.keep_alive.unwrap_or(false))
+}
+
+/// 期望端口 = `listen + offset`（加法语义，#53）。溢出返回 Err 交给调用方处理，
+/// 不再 saturating 钳到 65535（钳位会让多个服务撞到同一端口还静默通过）。
+///
+/// 注意：plan.rs 的 `wanted_port` 目前仍是旧 saturating 路径（另一 slice 的文件，
+/// 本 slice 不能改）：集成者需在 plan.rs 里把
+/// `r.spec.ports.listen.map(|p| p.saturating_add(r.port_offset))`
+/// 切换为 `r.spec.ports.listen.map(|p| checked_apply_offset(p, r.port_offset)).transpose()?`。
+pub fn checked_apply_offset(listen: u16, offset: u16) -> Result<u16, String> {
+    listen.checked_add(offset).ok_or_else(|| format!("端口溢出：{listen} + 偏移 {offset} 超出 65535"))
 }
 
 /// 读单个服务的覆盖。未知字段不影响解析；解析不了就当没有覆盖。
@@ -278,7 +442,7 @@ mod tests {
         let mut o: Overrides =
             serde_json::from_str(r#"{"/x/a":{"api":{"port_offset":1,"hand_written":"keep me"}}}"#)
                 .unwrap();
-        let patch = Override { keep_alive: Some(true), ..Default::default() };
+        let patch = OverridePatch { keep_alive: Some(Some(true)), ..Default::default() };
         set_override(&mut o, "/x/a", "api", Some(&patch)).unwrap();
         let back = serde_json::to_string(&o).unwrap();
         assert!(back.contains("hand_written"), "{back}");
@@ -290,7 +454,7 @@ mod tests {
     #[test]
     fn removing_last_override_drops_the_project_entry() {
         let mut o = Overrides::default();
-        let patch = Override { keep_alive: Some(true), ..Default::default() };
+        let patch = OverridePatch { keep_alive: Some(Some(true)), ..Default::default() };
         set_override(&mut o, "/x/a", "api", Some(&patch)).unwrap();
         assert!(o.projects.contains_key("/x/a"));
         set_override(&mut o, "/x/a", "api", None).unwrap();
@@ -298,12 +462,151 @@ mod tests {
     }
 
     #[test]
-    fn empty_patch_is_a_delete() {
+    fn empty_patch_is_a_noop() {
         let mut o = Overrides::default();
-        let patch = Override { keep_alive: Some(true), ..Default::default() };
+        let patch = OverridePatch { keep_alive: Some(Some(true)), ..Default::default() };
         set_override(&mut o, "/x/a", "api", Some(&patch)).unwrap();
-        set_override(&mut o, "/x/a", "api", Some(&Override::default())).unwrap();
+        // 空 patch（全 absent）= 不变，不再是删除（#22 语义变更）
+        set_override(&mut o, "/x/a", "api", Some(&OverridePatch::default())).unwrap();
+        assert_eq!(
+            service_override(&o, "/x/a", "api").and_then(|v| v.keep_alive),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn adopt_path_collision_avoided_and_roundtrip() {
+        let a = adopt_path("api v2");
+        let b = adopt_path("api.v2");
+        assert_ne!(a, b, "不同 key 必须落不同文件");
+        for key in ["api v2", "api.v2", "12/my service: with spaces", "100%/确"] {
+            let p = adopt_path(key);
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(!name.contains('/'), "{name}");
+            assert!(name.ends_with(".json"));
+            let stem = name.strip_suffix(".json").unwrap();
+            assert_eq!(unescape_filename(stem), key, "文件名必须可逆回 key");
+        }
+    }
+
+    #[test]
+    fn overlapping_writes_do_not_lose_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let _data = crate::test_support::ScopedDataDir::new(dir.path());
+        // ports：多线程并发 remember_port 不丢键
+        let n_threads = 8usize;
+        let n_each = 25usize;
+        std::thread::scope(|s| {
+            for t in 0..n_threads {
+                s.spawn(move || {
+                    for i in 0..n_each {
+                        remember_port("/x/concurrent", &format!("svc-{t}-{i}"), 5000 + t as u16);
+                    }
+                });
+            }
+        });
+        let ports = load_ports();
+        assert_eq!(ports.map.len(), n_threads * n_each, "{:?}", ports.map.keys().take(5));
+        // overrides：多线程并发 modify_overrides 不丢服务
+        std::thread::scope(|s| {
+            for t in 0..n_threads {
+                s.spawn(move || {
+                    for i in 0..n_each {
+                        let name = format!("svc-{t}-{i}");
+                        modify_overrides(|o| {
+                            let patch = OverridePatch {
+                                keep_alive: Some(Some(true)),
+                                ..Default::default()
+                            };
+                            set_override(o, "/x/concurrent", &name, Some(&patch))
+                        })
+                        .unwrap();
+                    }
+                });
+            }
+        });
+        let o = load_overrides().unwrap();
+        assert_eq!(o.projects["/x/concurrent"].len(), n_threads * n_each);
+    }
+
+    #[test]
+    fn override_patch_tristate_merge() {
+        // 设值
+        let mut o = Overrides::default();
+        let patch = OverridePatch { port_offset: Some(Some(5)), keep_alive: Some(Some(true)), ..Default::default() };
+        set_override(&mut o, "/x/a", "api", Some(&patch)).unwrap();
+        let got = service_override(&o, "/x/a", "api").unwrap();
+        assert_eq!(got.port_offset, Some(5));
+        assert_eq!(got.keep_alive, Some(true));
+        // 单字段删除：port_offset=null 只删该键，不动 keep_alive
+        let del = OverridePatch { port_offset: Some(None), ..Default::default() };
+        set_override(&mut o, "/x/a", "api", Some(&del)).unwrap();
+        let got = service_override(&o, "/x/a", "api").unwrap();
+        assert_eq!(got.port_offset, None);
+        assert_eq!(got.keep_alive, Some(true));
+        // absent=不变：空 patch 不动已有值
+        set_override(&mut o, "/x/a", "api", Some(&OverridePatch::default())).unwrap();
+        let got = service_override(&o, "/x/a", "api").unwrap();
+        assert_eq!(got.keep_alive, Some(true));
+        // null patch=整服务删除
+        set_override(&mut o, "/x/a", "api", None).unwrap();
         assert!(service_override(&o, "/x/a", "api").is_none());
+        // env 三态：设值 / 删键（null 值） / 不变
+        let mut o = Overrides::default();
+        let patch = OverridePatch { env: Some([("A".into(), Some("1".into())), ("B".into(), Some("2".into()))].into_iter().collect()), ..Default::default() };
+        set_override(&mut o, "/x/a", "api", Some(&patch)).unwrap();
+        let m = BTreeMap::from([("B".to_string(), None)]);
+        set_override(&mut o, "/x/a", "api", Some(&OverridePatch { env: Some(m), ..Default::default() })).unwrap();
+        let got = service_override(&o, "/x/a", "api").unwrap();
+        assert_eq!(got.env.get("A").map(String::as_str), Some("1"));
+        assert!(!got.env.contains_key("B"));
+    }
+
+    #[test]
+    fn ports_key_with_hash_roundtrips() {
+        // "#/x#y" 类 key 不得与分隔符串扰：读写必须回到同一条目
+        let dir = tempfile::tempdir().unwrap();
+        let _data = crate::test_support::ScopedDataDir::new(dir.path());
+        remember_port("/x#proj", "a#b", 5199);
+        assert_eq!(observed_port("/x#proj", "a#b"), Some(5199));
+        remember_port("/x", "proj#a#b", 5200);
+        assert_eq!(observed_port("/x#proj", "a#b"), Some(5199), "含 # 的 key 不得串扰");
+        assert_eq!(observed_port("/x", "proj#a#b"), Some(5200));
+    }
+
+    #[test]
+    fn checked_apply_offset_rejects_overflow() {
+        assert_eq!(checked_apply_offset(5000, 10).unwrap(), 5010);
+        assert!(checked_apply_offset(65530, 10).is_err(), "溢出必须报错而不是钳到 65535");
+    }
+
+    #[test]
+    fn state_files_are_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let _data = crate::test_support::ScopedDataDir::new(dir.path());
+        save_overrides(&Overrides::default()).unwrap();
+        remember_port("/x/a", "api", 5000);
+        let rec = crate::supervisor::AdoptRecord {
+            key: "1/api".into(), project_id: 1, name: "api".into(), pid: 1, pgid: 1,
+            argv: vec!["x".into()], cwd: "/tmp".into(), started_at: 1, port: None, keep_alive: false,
+        };
+        write_adopt(&rec).unwrap();
+        for p in [overrides_path(), ports_path(), adopt_path(&rec.key)] {
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} 权限应为 0600", p.display());
+        }
+        // 存量 0644 → 下次 open/load 后修复为 0600
+        for p in [overrides_path(), ports_path(), adopt_path(&rec.key)] {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        load_overrides().unwrap();
+        load_ports();
+        read_adopts();
+        for p in [overrides_path(), ports_path(), adopt_path(&rec.key)] {
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "存量 {} 应被修复为 0600", p.display());
+        }
     }
 
     #[test]
