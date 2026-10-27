@@ -185,7 +185,9 @@ export default function ServiceSection({
           setEnvConfirm(msg)
           return
         }
-        onError(msg)
+        // 非确认类错误必须抛给外层 act：内层吞掉正常返回的话，
+        // act 的 onError(null) 会把刚设的错误立刻清掉（静默失败）。
+        throw e
       }
     })
   const services = data?.services ?? []
