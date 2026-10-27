@@ -41,6 +41,8 @@ struct Publisher {
 }
 
 /// 组装 `docker compose` 的公共前缀参数（多 `-f` 按声明顺序叠加）。
+/// 只剩测试用：产品路径统一走 `checked_base_args`（#18 终检）。
+#[cfg(test)]
 pub fn base_args(spec: &DockerSpec) -> Vec<String> {
     let mut args: Vec<String> = vec!["compose".into()];
     for f in &spec.files {
@@ -52,6 +54,22 @@ pub fn base_args(spec: &DockerSpec) -> Vec<String> {
         args.push(p.clone());
     }
     args
+}
+
+/// 带越界终检的参数组装（#18）：每个 `-f` 都经 canonicalize 确认仍在项目内。
+/// `up/down/ps/follow` 的 cwd 即 `Resolved.base`，与 `-f` 的相对路径同基准。
+fn checked_base_args(cwd: &Path, spec: &DockerSpec) -> Result<Vec<String>, String> {
+    let mut args: Vec<String> = vec!["compose".into()];
+    for f in &spec.files {
+        let p = crate::services::resolve_within(cwd, f)?;
+        args.push("-f".into());
+        args.push(p.display().to_string());
+    }
+    if let Some(p) = &spec.project_name {
+        args.push("-p".into());
+        args.push(p.clone());
+    }
+    Ok(args)
 }
 
 fn docker_bin() -> String {
@@ -89,7 +107,7 @@ fn run(cwd: &Path, args: &[String], timeout: Duration) -> Result<std::process::O
 
 /// `docker compose up -d [services...]`。
 pub fn up(cwd: &Path, spec: &DockerSpec) -> Result<String, String> {
-    let mut args = base_args(spec);
+    let mut args = checked_base_args(cwd, spec)?;
     args.push("up".into());
     args.push("-d".into());
     args.extend(spec.services.iter().cloned());
@@ -102,7 +120,7 @@ pub fn up(cwd: &Path, spec: &DockerSpec) -> Result<String, String> {
 
 /// `docker compose down`（只针对声明的文件组合，不删卷）。
 pub fn down(cwd: &Path, spec: &DockerSpec) -> Result<String, String> {
-    let mut args = base_args(spec);
+    let mut args = checked_base_args(cwd, spec)?;
     args.push("down".into());
     if !spec.services.is_empty() {
         // `down` 不接受服务名；用 stop 表达「只停这几个」
@@ -154,7 +172,7 @@ impl DockerLogs {
         name: &str,
         bin: String,
     ) -> Result<Self, String> {
-        let mut args = base_args(spec);
+        let mut args = checked_base_args(cwd, spec)?;
         args.push("logs".into());
         args.push("-f".into());
         args.push("--tail".into());
@@ -323,7 +341,7 @@ impl DockerLogs {
 
 /// `docker compose ps --format json`（compose v2 输出 JSON 行）。
 pub fn ps(cwd: &Path, spec: &DockerSpec) -> Result<Vec<ContainerView>, String> {
-    let mut args = base_args(spec);
+    let mut args = checked_base_args(cwd, spec)?;
     args.push("ps".into());
     args.push("--format".into());
     args.push("json".into());
@@ -498,5 +516,31 @@ mod tests {
         let err = parse_ps_output(&bad).unwrap_err();
         assert!(err.contains('2'), "{err}");
         assert!(err.contains("NOT-JSON"), "{err}");
+    }
+
+    #[test]
+    fn compose_file_symlink_escape_is_rejected() {
+        // #18：docker.files 经链接指向仓库外 → up/ps/follow 之前先拒绝。
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("evil.yml"), "services: {}\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            outside.path().join("evil.yml"),
+            dir.path().join("compose.yml"),
+        )
+        .unwrap();
+        let spec = DockerSpec {
+            files: vec!["compose.yml".into()],
+            project_name: None,
+            services: vec![],
+        };
+        let err = checked_base_args(dir.path(), &spec).unwrap_err();
+        assert!(err.contains("越界"), "{err}");
+        // 项目内正常文件放行，且解析为绝对路径（docker 不再看到相对穿越写法）。
+        std::fs::write(dir.path().join("ok.yml"), "services: {}\n").unwrap();
+        let spec = DockerSpec { files: vec!["ok.yml".into()], project_name: None, services: vec![] };
+        let args = checked_base_args(dir.path(), &spec).unwrap();
+        assert!(args.iter().any(|a| a.ends_with("ok.yml") && a.starts_with('/')), "{args:?}");
     }
 }

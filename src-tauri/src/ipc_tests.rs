@@ -1007,6 +1007,8 @@ fn ipc_exit_stops_all_docker_log_followers() {
     std::fs::write(&script, "#!/bin/sh\nsleep 300\n").unwrap();
     std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let bin = script.to_string_lossy().into_owned();
+    // #18 终检要求 -f 文件真实存在：假脚本不读它，建空文件过检即可。
+    std::fs::write(dir.path().join("x.yml"), "services: {}\n").unwrap();
     let spec = DockerSpec { files: vec!["x.yml".into()], project_name: None, services: vec![] };
     let sup = h.app.state::<crate::supervisor::Supervisor>().inner().clone();
     let sink = std::sync::Arc::new(crate::supervisor::Collector::default());
@@ -1079,6 +1081,8 @@ fn ipc_docker_log_group_stops_child_process_too() {
     std::fs::write(&script, "#!/bin/sh\nsleep 300 & wait\n").unwrap();
     std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 
+    // #18 终检要求 -f 文件真实存在：假脚本不读它，建空文件过检即可。
+    std::fs::write(dir.path().join("x.yml"), "services: {}\n").unwrap();
     let spec = DockerSpec { files: vec!["x.yml".into()], project_name: None, services: vec![] };
     let sup = h.app.state::<crate::supervisor::Supervisor>().inner().clone();
     let sink = std::sync::Arc::new(crate::supervisor::Collector::default());
@@ -1199,6 +1203,8 @@ fn ipc_docker_logs_small_output_reaches_ui_promptly() {
     std::fs::write(&script, "#!/bin/sh\necho one\necho two\necho three\nsleep 300\n").unwrap();
     std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 
+    // #18 终检要求 -f 文件真实存在：假脚本不读它，建空文件过检即可。
+    std::fs::write(dir.path().join("x.yml"), "services: {}\n").unwrap();
     let spec = DockerSpec { files: vec!["x.yml".into()], project_name: None, services: vec![] };
     let sup = h.app.state::<crate::supervisor::Supervisor>().inner().clone();
     let sink = std::sync::Arc::new(crate::supervisor::Collector::default());

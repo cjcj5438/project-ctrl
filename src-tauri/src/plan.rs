@@ -43,10 +43,19 @@ impl Resolved {
     }
 
     /// 服务的实际工作目录（项目根 + 声明的 cwd），并确认它存在。
+    ///
+    /// #18：执行前 canonicalize 终检——`cwd: "link"`（→/etc）这类符号链接穿越
+    /// 只靠词法校验挡不住，必须要求解析后仍位于项目内。
     pub fn cwd(&self) -> Result<PathBuf, String> {
         let dir = match self.spec.cwd.as_deref() {
-            Some(rel) if !rel.is_empty() => self.base.join(rel),
-            _ => self.base.clone(),
+            Some(rel) if !rel.is_empty() => {
+                crate::services::resolve_within(&self.base, rel)
+                    .map_err(|e| format!("{}：{e}", self.spec.name))?
+            }
+            _ => self
+                .base
+                .canonicalize()
+                .map_err(|e| format!("{}：项目目录不可用：{e}", self.spec.name))?,
         };
         if !dir.is_dir() {
             return Err(format!("{}：目录不存在（{}）", self.spec.name, dir.display()));
@@ -55,14 +64,23 @@ impl Resolved {
     }
 
     /// 该服务的 env 文件绝对路径（声明 + 本机追加）。
-    pub fn env_file_paths(&self) -> Vec<PathBuf> {
+    ///
+    /// #18：每个文件都经 canonicalize 终检，越界/不存在直接拒绝启动，
+    /// 不再“原样 join 后读仓库外文件”。
+    pub fn env_file_paths(&self) -> Result<Vec<PathBuf>, String> {
         let mut names = self.spec.env_files.clone();
         for f in &self.override_env_files {
             if !names.contains(f) {
                 names.push(f.clone());
             }
         }
-        names.into_iter().map(|n| self.base.join(n)).collect()
+        names
+            .into_iter()
+            .map(|n| {
+                crate::services::resolve_within(&self.base, &n)
+                    .map_err(|e| format!("{}：{e}", self.spec.name))
+            })
+            .collect()
     }
 }
 
@@ -269,7 +287,7 @@ pub fn build_plan(
     };
 
     let mut env: BTreeMap<String, String> = BTreeMap::new();
-    for f in r.env_file_paths() {
+    for f in r.env_file_paths()? {
         let text = std::fs::read_to_string(&f).map_err(|e| format!("读取 {} 失败：{e}", f.display()))?;
         for (k, v) in execenv::parse_env_file(&text) {
             env.insert(k, v);
@@ -330,7 +348,7 @@ pub fn build_plan(
 pub fn build_step_plan(r: &Resolved, step: &Step) -> Result<SpawnSpec, String> {
     let cwd = r.cwd()?;
     let mut env: BTreeMap<String, String> = BTreeMap::new();
-    for f in r.env_file_paths() {
+    for f in r.env_file_paths()? {
         let text = std::fs::read_to_string(&f).map_err(|e| format!("读取 {} 失败：{e}", f.display()))?;
         for (k, v) in execenv::parse_env_file(&text) {
             env.insert(k, v);
@@ -646,5 +664,48 @@ mod tests {
         let mut r = res("a", &[]);
         r.spec.cwd = Some("../outside".into());
         assert!(r.cwd().is_err());
+    }
+
+    #[test]
+    fn cwd_symlink_escape_is_rejected_before_spawn() {
+        // #18：`cwd: "link"`（→/etc）词法合法，必须在执行前 canonicalize 终检拦下。
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc", dir.path().join("link")).unwrap();
+        let mut r = res("a", &[]);
+        r.base = dir.path().to_path_buf();
+        r.spec.cwd = Some("link".into());
+        let err = r.cwd().unwrap_err();
+        assert!(err.contains("越界"), "{err}");
+    }
+
+    #[test]
+    fn env_file_symlink_escape_is_rejected_before_spawn() {
+        // #18：env 文件经链接指向仓库外 → build_plan 拒绝，不读外部内容。
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.env"), "LEAKED=1\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.env"),
+            dir.path().join("evil.env"),
+        )
+        .unwrap();
+        let mut r = res("a", &[]);
+        r.base = dir.path().to_path_buf();
+        r.spec.env_files = vec!["evil.env".into()];
+        let err = build_plan("/tmp", &r, &HashSet::new()).unwrap_err();
+        assert!(err.contains("越界"), "{err}");
+    }
+
+    #[test]
+    fn env_file_absolute_path_is_rejected_before_spawn() {
+        // #19 纵深：即使某条入库路径绕过 validate，执行前终检仍拒绝绝对路径。
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = res("a", &[]);
+        r.base = dir.path().to_path_buf();
+        r.spec.env_files = vec!["/etc/hostname".into()];
+        let err = build_plan("/tmp", &r, &HashSet::new()).unwrap_err();
+        assert!(err.contains("相对路径"), "{err}");
     }
 }

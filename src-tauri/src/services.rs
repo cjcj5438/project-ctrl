@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 /// 描述文件格式版本。比本版本新的文件整体拒绝读取。
 pub const SCHEMA_VERSION: u32 = 1;
@@ -250,6 +251,29 @@ pub fn parse_descriptor(text: &str) -> Result<Descriptor, String> {
 /// 描述文件（cwd/env_files/docker.files）与本机覆盖层（env_files）共用同一规则。
 pub fn is_project_relative(p: &str) -> bool {
     !p.is_empty() && !p.starts_with('/') && !p.split('/').any(|seg| seg == "..")
+}
+
+/// 执行前终检（#18）：`base.join(rel)` 经 canonicalize 后必须仍位于 base 内。
+/// 只做词法校验挡不住 `cwd: "link"`（→/etc）这类符号链接穿越；`readme::resolve_within`
+/// 要求目标是文件（图片场景），这里 cwd 须是目录、env/docker 文件须存在，各自另判。
+pub fn resolve_within(base: &Path, rel: &str) -> Result<PathBuf, String> {
+    if rel.is_empty() {
+        return Err("路径不能为空".to_string());
+    }
+    if rel.starts_with('/') {
+        return Err(format!("路径必须是项目内的相对路径（{rel}）"));
+    }
+    let base_canon =
+        base.canonicalize().map_err(|e| format!("项目目录不可用（{}）：{e}", base.display()))?;
+    let canon = base
+        .join(rel)
+        .canonicalize()
+        .map_err(|_| format!("路径不存在（{rel}）"))?;
+    if canon.starts_with(&base_canon) {
+        Ok(canon)
+    } else {
+        Err(format!("路径越界：{rel} 指向项目之外"))
+    }
 }
 
 pub fn to_descriptor_json(d: &Descriptor) -> Result<String, String> {
@@ -510,5 +534,21 @@ mod tests {
         assert!(!s.validate().is_empty());
         let s = ServiceSpec { env_files: vec!["../secret".into()], ..minimal() };
         assert!(!s.validate().is_empty());
+    }
+
+    #[test]
+    fn resolve_within_blocks_symlink_dotdot_and_absolute() {
+        // #18 终检：链接穿越 / .. / 绝对路径 / 不存在全部拒绝，项目内放行。
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ok.env"), "A=1\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc", dir.path().join("link")).unwrap();
+        assert!(super::resolve_within(dir.path(), "ok.env").is_ok());
+        assert!(super::resolve_within(dir.path(), "link").unwrap_err().contains("越界"));
+        assert!(super::resolve_within(dir.path(), "../x").is_err());
+        assert!(super::resolve_within(dir.path(), "/etc/hostname").unwrap_err().contains("相对路径"));
+        assert!(super::resolve_within(dir.path(), "missing.env").unwrap_err().contains("不存在"));
+        let _ = outside;
     }
 }
