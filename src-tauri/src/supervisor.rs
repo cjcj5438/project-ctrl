@@ -829,6 +829,22 @@ fn lstart_string(unix_secs: i64) -> String {
     }
 }
 
+/// 优雅回收一个外部进程组：TERM → 等 300ms → 仍在则 KILL。
+/// 用于 docker 日志跟随这类「不是受管服务、但同样会留下孤儿」的子进程。
+pub fn reclaim_group_graceful(pgid: i32) {
+    if pgid <= 0 {
+        return;
+    }
+    Supervisor::kill_group(pgid, "-TERM");
+    let deadline = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < deadline && Supervisor::group_alive(pgid) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if Supervisor::group_alive(pgid) {
+        Supervisor::kill_group(pgid, "-KILL");
+    }
+}
+
 /// 回收一个进程组（App 在被强杀/崩溃后留下的孤儿）。`commands::adopt_existing` 使用。
 ///
 /// 先按进程组杀；若进程组不存在（记录里的 pgid 并非组长，或组已解散但进程仍活着），

@@ -142,17 +142,6 @@ fn plist_string(text: &str, key: &str) -> Option<String> {
     Some(after[..close].trim().to_string())
 }
 
-/// 取数组里第一个 `<string>`（`ProgramArguments` 的第一个元素通常是可执行文件）。
-fn plist_first_array_item(text: &str, key: &str) -> Option<String> {
-    let needle = format!("<key>{key}</key>");
-    let at = text.find(&needle)?;
-    let rest = &text[at + needle.len()..];
-    let open = rest.find("<string>")?;
-    let after = &rest[open + "<string>".len()..];
-    let close = after.find("</string>")?;
-    Some(after[..close].trim().to_string())
-}
-
 /// 取 `<array>` 里的全部 `<string>`。
 fn plist_array(text: &str, key: &str) -> Vec<String> {
     let needle = format!("<key>{key}</key>");
@@ -248,7 +237,7 @@ mod tests {
             plist_string(text, "WorkingDirectory").as_deref(),
             Some("/Users/x/my/omp-mobile")
         );
-        assert_eq!(plist_first_array_item(text, "ProgramArguments").as_deref(), Some("/Users/x/hub"));
+        assert_eq!(plist_array(text, "ProgramArguments").first().map(String::as_str), Some("/Users/x/hub"));
     }
 
     #[test]

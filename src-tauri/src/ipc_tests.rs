@@ -799,3 +799,221 @@ fn ipc_external_scan_reports_drift_and_reloads() {
         .unwrap();
     assert_eq!(hit2["drift"], Value::Null, "一致后不该再报漂移：{hit2}");
 }
+
+/// 退出时必须停掉 compose 日志跟随，否则每次 Cmd+Q 都漏一个 `docker compose logs -f`。
+///
+/// 这是实测过的失败模式：父进程退出后子进程被 launchd 收养（PPID 变 1）继续跑。
+#[test]
+fn ipc_exit_stops_all_docker_log_followers() {
+    use crate::docker::DockerLogs;
+    use crate::services::DockerSpec;
+    use tauri::Manager;
+
+    let h = Harness::new("dockerlogs");
+    let dir = tempfile::tempdir().unwrap();
+    // 不用真 docker：用一个长命的 `sh` 冒充日志流，is_alive 判定才可控
+    let spec = DockerSpec { files: vec!["x.yml".into()], project_name: None, services: vec![] };
+    let sup = h.app.state::<crate::supervisor::Supervisor>().inner().clone();
+    let sink = std::sync::Arc::new(crate::supervisor::Collector::default());
+
+    // 直接构造两条流（不依赖 docker 是否安装）
+    let mut logs = Vec::new();
+    for name in ["a", "b"] {
+        let l = DockerLogs::follow(&sup, sink.clone(), dir.path(), &spec, 77, name)
+            .expect("应能开始跟随");
+        assert!(l.is_alive(), "刚起的跟随进程应存活");
+        logs.push(l);
+    }
+
+    // 登记进 registry（模拟 UI 展开时的行为）
+    {
+        let reg = h.app.state::<crate::commands::DockerLogsRegistry>();
+        let mut g = reg.0.lock().unwrap();
+        for (i, l) in logs.into_iter().enumerate() {
+            let pid = l.pid();
+            g.insert(format!("77/{}", i), l);
+            assert!(pid_is_running(pid), "登记后进程应还在");
+        }
+        assert_eq!(g.len(), 2);
+    }
+
+    // 记下 pid 以便断言「进程真的死了」，而不只是登记表被清空
+    let mut pids = Vec::new();
+    {
+        let reg = h.app.state::<crate::commands::DockerLogsRegistry>();
+        let g = reg.0.lock().unwrap();
+        for l in g.values() {
+            pids.push(l.pid());
+        }
+    }
+    assert_eq!(pids.len(), 2);
+
+    // 模拟退出钩子里的那一步
+    h.app.state::<crate::commands::DockerLogsRegistry>().stop_all();
+
+    let reg = h.app.state::<crate::commands::DockerLogsRegistry>();
+    assert_eq!(reg.len(), 0, "退出后登记表必须清空");
+    for pid in pids {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut dead = false;
+        while std::time::Instant::now() < deadline {
+            if !pid_is_running(pid) {
+                dead = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(dead, "退出后日志跟随进程 {pid} 必须被回收，不能留给 launchd");
+    }
+}
+
+/// 关键细节：`docker compose` 的日志跟随有两层进程（CLI + 插件）。
+/// 只 kill 第一层会留下插件继续跟随，所以必须按**进程组**停。
+#[test]
+fn ipc_docker_log_group_stops_child_process_too() {
+    use crate::docker::DockerLogs;
+    use crate::services::DockerSpec;
+    use tauri::Manager;
+
+    let h = Harness::new("logptree");
+    let dir = tempfile::tempdir().unwrap();
+    // 用 sh 冒充「docker compose + 插件子进程」的两层结构
+    let script = dir.path().join("fake-docker");
+    std::fs::write(&script, "#!/bin/sh\n# 模拟插件子进程：sleep 在同一个进程组里\nsleep 300\n").unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    let spec = DockerSpec { files: vec!["x.yml".into()], project_name: None, services: vec![] };
+    let sup = h.app.state::<crate::supervisor::Supervisor>().inner().clone();
+    let sink = std::sync::Arc::new(crate::supervisor::Collector::default());
+
+    // 让 follow 用的 docker_bin 指向我们的假脚本：通过 PATH 前置实现
+    let mut logs = DockerLogs::follow_with_bin(
+        &sup,
+        sink,
+        dir.path(),
+        &spec,
+        88,
+        "grp",
+        script.to_string_lossy().into_owned(),
+    )
+    .expect("应能开始跟随");
+    let pid = logs.pid();
+    assert!(pid_is_running(pid), "跟随进程应存活");
+
+    // 找出同组的 sleep 子进程
+    let child = std::process::Command::new("/bin/ps")
+        .args(["-o", "pid=,pgid=", "-A"])
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| {
+                    let mut it = l.split_whitespace();
+                    let p: u32 = it.next()?.parse().ok()?;
+                    let g: i32 = it.next()?.parse().ok()?;
+                    (g == pid as i32 && p != pid).then_some(p)
+                })
+                .collect::<Vec<u32>>()
+        })
+        .unwrap_or_default();
+
+    DockerLogs::stop(logs);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    assert!(!pid_is_running(pid), "父进程必须退出");
+    for c in &child {
+        assert!(!pid_is_running(*c), "同组的子进程 {c} 也必须退出（否则会留下孤儿）");
+    }
+}
+
+/// 进程是否真的还活着（僵尸也算死：它们不再占用任何资源语义）。
+fn pid_is_running(pid: u32) -> bool {
+    std::process::Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .map(|o| {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let st = s.trim();
+            !st.is_empty() && !st.starts_with('Z')
+        })
+        .unwrap_or(false)
+}
+
+/// 前端 `api.serviceLogs` 实际发的形状是 `{ id, name }`：改名后必须仍被接受。
+///
+/// 退化史：`service_logs` 的 Rust 参数曾叫 `project_id`（Tauri 按 camelCase 读成
+/// `projectId`），前端发 `id` 导致缺参报错；Service.tsx 的 docker effect 里这行在
+/// `dockerLogs` 之前，catch 又吞错，结果是跟随进程根本没起、面板永远 0 行。
+#[test]
+fn ipc_service_logs_accepts_frontend_arg_shape() {
+    let h = Harness::new("logsargs");
+    let dir = std::env::temp_dir().join(format!("pc-ipc-logsargs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    sample_service(&dir);
+    let path = dir.to_string_lossy().into_owned();
+    let id = add_project(&h, &path);
+    h.invoke(
+        "save_service",
+        json!({ "id": id, "spec": { "name": "api", "run": ["node", "server.js"] } }),
+    )
+    .expect("save");
+    // exact shape sent by src/api.ts `serviceLogs(id, name)`
+    let got = h
+        .invoke("service_logs", json!({ "id": id, "name": "api" }))
+        .expect("前端形状 { id, name } 必须被 service_logs 接受");
+    assert!(got.is_array(), "应返回行数组：{got}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// compose 跟随输出不足一批（<200 行）时也必须 promptly 送达 UI。
+///
+/// 退化史：docker pump 只在攒满 200 行或 EOF 时 emit；`logs -f` 在吐完历史后会
+/// 阻塞等新行（不 EOF），输出少的容器（如 postgres 的 checkpoint 日志）第一批
+/// 永远到不了前端，面板卡在 0 行。
+#[test]
+fn ipc_docker_logs_small_output_reaches_ui_promptly() {
+    use crate::docker::DockerLogs;
+    use crate::services::DockerSpec;
+    use tauri::Manager;
+
+    let h = Harness::new("logflush");
+    let dir = tempfile::tempdir().unwrap();
+    // 冒充 `docker compose logs -f`：吐 3 行后阻塞（等新日志，不退出）
+    let script = dir.path().join("fake-docker");
+    std::fs::write(&script, "#!/bin/sh\necho one\necho two\necho three\nsleep 300\n").unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    let spec = DockerSpec { files: vec!["x.yml".into()], project_name: None, services: vec![] };
+    let sup = h.app.state::<crate::supervisor::Supervisor>().inner().clone();
+    let sink = std::sync::Arc::new(crate::supervisor::Collector::default());
+    let logs = DockerLogs::follow_with_bin(
+        &sup,
+        sink.clone(),
+        dir.path(),
+        &spec,
+        88,
+        "tiny",
+        script.to_string_lossy().into_owned(),
+    )
+    .expect("应能开始跟随");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let got = loop {
+        let n: usize = sink.logs.lock().unwrap().iter().map(|p| p.lines.len()).sum();
+        if n >= 3 {
+            break n;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "3 行输出应在 3 秒内送达 UI（实际只收到 {n} 行）：攒批不能等满 200 行"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!(got, 3);
+    // 内容必须有序到达（不丢不乱）
+    let lines: Vec<String> =
+        sink.logs.lock().unwrap().iter().flat_map(|p| p.lines.clone()).collect();
+    assert_eq!(lines, vec!["one".to_string(), "two".to_string(), "three".to_string()]);
+    DockerLogs::stop(logs);
+}

@@ -123,6 +123,12 @@ pub fn run() {
         // 两条都要收子进程，否则关掉 App 后服务继续裸跑、占着端口。
         if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
             use tauri::Manager;
+            // ① compose 日志跟随是独立子进程：父进程退出后它会被 launchd 收养继续跑，
+            //    所以必须先显式停掉，否则每退出一次就漏一个 `docker compose logs -f`。
+            if let Some(reg) = app.try_state::<commands::DockerLogsRegistry>() {
+                reg.stop_all();
+            }
+            // ② 受管服务进程：保留 keep_alive 的，收掉其余的。
             if let Some(sup) = app.try_state::<supervisor::Supervisor>() {
                 commands::register_adoptable(&sup);
             }

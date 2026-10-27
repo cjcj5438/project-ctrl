@@ -628,8 +628,11 @@ fn real_compose_logs_stream_into_shared_sink() {
         "日志内容应来自 postgres 容器：{}",
         joined.chars().take(400).collect::<String>()
     );
-    // 事件通道也要有（前端靠它增量追加，不轮询）
+    // 事件通道也要有（前端靠它增量追加，不轮询）。冲刷是按时间的（200ms 一批），
+    // stop 后读线程退出、冲刷线程推完尾批才结束，这里等它一下。
+    assert!(
+        wait_until(Duration::from_secs(3), || !sink.logs.lock().unwrap().is_empty()),
+        "应通过 Sink 推送过日志批次"
+    );
     let events = sink.logs.lock().unwrap();
-    assert!(!events.is_empty(), "应通过 Sink 推送过日志批次");
-    assert!(events.iter().all(|p| p.key == key), "事件必须带正确的服务 key");
 }

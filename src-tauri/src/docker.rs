@@ -138,6 +138,20 @@ impl DockerLogs {
         project_id: i64,
         name: &str,
     ) -> Result<Self, String> {
+        Self::follow_with_bin(sup, sink, cwd, spec, project_id, name, docker_bin())
+    }
+
+    /// 同 [`follow`]，但可指定 docker 可执行文件（测试用假脚本模拟两层进程）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn follow_with_bin(
+        sup: &crate::supervisor::Supervisor,
+        sink: std::sync::Arc<dyn crate::supervisor::Sink>,
+        cwd: &Path,
+        spec: &DockerSpec,
+        project_id: i64,
+        name: &str,
+        bin: String,
+    ) -> Result<Self, String> {
         let mut args = base_args(spec);
         args.push("logs".into());
         args.push("-f".into());
@@ -146,43 +160,76 @@ impl DockerLogs {
         args.push("--no-color".into());
         args.extend(spec.services.iter().cloned());
 
-        let mut child = Command::new(docker_bin())
-            .args(&args)
+        let mut cmd = Command::new(bin);
+        cmd.args(&args)
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("无法执行 docker logs：{e}"))?;
-
+            .stderr(Stdio::piped());
+        {
+            // 独立进程组：`docker compose` 会再 spawn `cli-plugins/docker-compose`，
+            // 只 kill 第一层会留下插件子进程继续跟随日志。
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let mut child = cmd.spawn().map_err(|e| format!("无法执行 docker logs：{e}"))?;
         let svc_key = crate::supervisor::key_of(project_id, name);
         let epoch = sup.begin_docker_logs(&svc_key);
         // 先取走管道，再把 Child 本体交给句柄（stop 时 kill）
         let out = child.stdout.take();
         let err = child.stderr.take();
+        // 两路读线程只管往 pending 里攒，另起一个冲刷线程按时间 emit：
+        // `logs -f` 吐完历史后会阻塞等新行（不 EOF），攒满 N 行才推会让输出少
+        // 的容器第一批永远到不了 UI。语义与受管服务的 spawn_flusher 一致。
+        let pending: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let readers = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         if let Some(out) = out {
-            Self::pump(sup.clone(), sink.clone(), svc_key.clone(), project_id, name.to_string(), epoch, Box::new(out));
+            readers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Self::pump(
+                sup.clone(),
+                svc_key.clone(),
+                epoch,
+                Box::new(out),
+                pending.clone(),
+                readers.clone(),
+            );
         }
         if let Some(err) = err {
-            Self::pump(sup.clone(), sink.clone(), svc_key.clone(), project_id, name.to_string(), epoch, Box::new(err));
+            readers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Self::pump(
+                sup.clone(),
+                svc_key.clone(),
+                epoch,
+                Box::new(err),
+                pending.clone(),
+                readers.clone(),
+            );
         }
+        Self::spawn_flusher(
+            sup.clone(),
+            sink,
+            svc_key,
+            project_id,
+            name.to_string(),
+            epoch,
+            pending,
+            readers,
+        );
         Ok(Self { child: std::sync::Arc::new(std::sync::Mutex::new(child)), epoch })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// 读线程：逐行进环形缓冲，并交给冲刷线程攒批（不在这里 emit）。
     fn pump(
         sup: crate::supervisor::Supervisor,
-        sink: std::sync::Arc<dyn crate::supervisor::Sink>,
         key: String,
-        project_id: i64,
-        name: String,
         epoch: u64,
         stream: Box<dyn std::io::Read + Send>,
+        pending: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        readers: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) {
         std::thread::spawn(move || {
             use std::io::BufRead;
             let reader = std::io::BufReader::new(stream);
-            let mut batch: Vec<String> = Vec::new();
             for line in reader.split(b'\n') {
                 let Ok(bytes) = line else { break };
                 if sup.docker_epoch(&key) != Some(epoch) {
@@ -190,16 +237,41 @@ impl DockerLogs {
                 }
                 let text = String::from_utf8_lossy(&bytes).trim_end_matches('\r').to_string();
                 sup.push_docker_line(&key, text.clone());
-                batch.push(text);
-                if batch.len() >= crate::supervisor::LOG_BATCH {
-                    sink.log(&crate::supervisor::LogPayload {
-                        key: key.clone(),
-                        project_id,
-                        name: name.clone(),
-                        lines: std::mem::take(&mut batch),
-                    });
+                let mut g = pending.lock().unwrap_or_else(|e| e.into_inner());
+                // 上限是内存保险：极长的构建输出不应该在冲刷线程睡觉时无限堆积
+                if g.len() < crate::supervisor::LOG_BATCH * 10 {
+                    g.push(text);
                 }
             }
+            readers.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
+    /// 每 `LOG_FLUSH` 把攒下的行推一次；两路读线程都结束后再推最后一批后退出。
+    ///
+    /// 若代号已前进（新流顶掉了本流）：直接丢弃尾批退出——旧行的归宿是旧面板，
+    /// 推给新流会污染它的首屏。
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_flusher(
+        sup: crate::supervisor::Supervisor,
+        sink: std::sync::Arc<dyn crate::supervisor::Sink>,
+        key: String,
+        project_id: i64,
+        name: String,
+        epoch: u64,
+        pending: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        readers: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        std::thread::spawn(move || loop {
+            std::thread::sleep(crate::supervisor::LOG_FLUSH);
+            if sup.docker_epoch(&key) != Some(epoch) {
+                return;
+            }
+            let take = |pending: &std::sync::Arc<std::sync::Mutex<Vec<String>>>| -> Vec<String> {
+                let mut g = pending.lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::take(&mut *g)
+            };
+            let batch = take(&pending);
             if !batch.is_empty() {
                 sink.log(&crate::supervisor::LogPayload {
                     key: key.clone(),
@@ -208,18 +280,42 @@ impl DockerLogs {
                     lines: batch,
                 });
             }
+            if readers.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                let tail = take(&pending);
+                if !tail.is_empty() {
+                    sink.log(&crate::supervisor::LogPayload { key, project_id, name, lines: tail });
+                }
+                return;
+            }
         });
     }
 
+    /// 停掉整条日志跟随：先 TERM 进程组，短暂等待，仍未退出则 KILL。
+    ///
+    /// 必须按**进程组**停：`docker compose` 的行为主体在插件子进程里，
+    /// 只杀父进程会让插件继续跟随日志（实测留下 PPID=1 的孤儿）。
     pub fn stop(self) {
-        if let Ok(mut c) = self.child.lock() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+        let Ok(mut c) = self.child.lock() else { return };
+        let pgid = c.id() as i32;
+        crate::supervisor::reclaim_group_graceful(pgid);
+        let _ = c.wait();
     }
 
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// 跟随进程的 pid（测试断言进程存活/回收用）。
+    #[cfg(test)]
+    pub fn pid(&self) -> u32 {
+        self.child.lock().map(|c| c.id()).unwrap_or(0)
+    }
+
+    /// 跟随进程是否仍在跑（供退出清理的回归测试断言）。
+    #[cfg(test)]
+    pub fn is_alive(&self) -> bool {
+        let Ok(mut c) = self.child.lock() else { return false };
+        matches!(c.try_wait(), Ok(None))
     }
 }
 

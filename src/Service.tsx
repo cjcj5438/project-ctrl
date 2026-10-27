@@ -267,6 +267,7 @@ function ServiceCard({
   const [lines, setLines] = useState<string[]>([])
   const [problems, setProblems] = useState<string[]>([])
   const [containers, setContainers] = useState<ContainerView[] | null>(null)
+  const [logErr, setLogErr] = useState<string | null>(null)
   const logRef = useRef<HTMLPreElement | null>(null)
 
   // 展开时才拉日志 + 预检，避免无谓 IO
@@ -314,24 +315,34 @@ function ServiceCard({
 
   // compose 日志：展开且有 docker 时跟随，收起时停止（容器本身不受影响）。
   // 输出走与服务相同的 svc:log 通道。
+  // 注意 deps 用 dockerKey（字符串）而不用 spec.docker 对象：父组件每次 load 都会
+  // 重建 view/spec 对象，对象引用每次都变会导致 effect 反复重跑；而 cleanup 里的
+  // dockerLogsStop 是 fire-and-forget 的异步请求，可能落在下一次 dockerLogs 之后
+  // 到达后端、把刚开的新流杀掉（面板变空白且无 follower）。
+  const dockerKey = spec.docker
+    ? `${spec.docker.files.join('+')}\n${spec.docker.project_name ?? ''}\n${spec.docker.services.join('+')}`
+    : ''
   useEffect(() => {
     if (!open || !spec.docker) return
     let alive = true
+    setLogErr(null)
     void (async () => {
       try {
         const l = await api.serviceLogs(project.id, name)
         if (alive) setLines(l)
         await api.dockerLogs(project.id, name)
-      } catch {
-        /* docker 不可用时不打断面板 */
+      } catch (e) {
+        // 跟随失败必须可见：静默吞掉会让面板卡在"暂无输出"，无从排查
+        if (alive) setLogErr(errorText(e))
       }
     })()
     return () => {
       alive = false
+      setLogErr(null)
       void api.dockerLogsStop(project.id, name).catch(() => {})
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, spec.docker, project.id, name])
+  }, [open, dockerKey, project.id, name])
 
   const stepLabel = (s: { name: string }) => s.name
 
@@ -346,7 +357,7 @@ function ServiceCard({
         <span className="font-semibold">{name}</span>
         <span className="text-muted">{line.label}</span>
         {line.detail && <span className="font-mono text-[11px] text-muted">{line.detail}</span>}
-        {spec.docker && <span className="rounded bg-blue-100 px-1 text-[10px] text-fg ">docker</span>}
+        {spec.docker && <span className="rounded border border-accent/40 bg-accent/10 px-1 text-[10px] text-fg">docker</span>}
         <span className="ml-auto font-mono text-[10px] text-muted">{view.layer === 'descriptor' ? '.json' : 'db'}</span>
       </button>
 
@@ -491,11 +502,16 @@ function ServiceCard({
                 清空
               </button>
             </div>
+            {logErr && (
+              <div className="border-b border-border bg-error/10 px-2 py-1 font-mono text-[11px] break-all text-error ">
+                日志跟随失败：{logErr}
+              </div>
+            )}
             <pre
               ref={logRef}
               className="max-h-[40vh] select-text overflow-auto whitespace-pre-wrap p-2 font-mono text-[11px] leading-relaxed"
             >
-              {lines.length === 0 ? '（暂无输出）' : lines.join('\n')}
+              {lines.length === 0 && !logErr ? '（暂无输出）' : lines.join('\n')}
             </pre>
           </div>
         </div>

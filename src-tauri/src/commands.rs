@@ -440,8 +440,8 @@ pub fn service_status<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Vec<Servic
 }
 
 #[tauri::command]
-pub fn service_logs<R: tauri::Runtime>(app: tauri::AppHandle<R>, project_id: i64, name: String) -> Vec<String> {
-    supervisor::state(&app).logs_of(&supervisor::key_of(project_id, &name))
+pub fn service_logs<R: tauri::Runtime>(app: tauri::AppHandle<R>, id: i64, name: String) -> Vec<String> {
+    supervisor::state(&app).logs_of(&supervisor::key_of(id, &name))
 }
 
 /// 空数组 = 可执行；否则每条是「为什么不能点」。
@@ -1287,7 +1287,7 @@ pub fn import_pm2() -> Result<ImportReport, String> {
     Ok(report)
 }
 
-/// App 退出前的收尾：
+/// App 退出前的收尾：先停所有 compose 日志跟随，再处理受管进程。
 /// - 声明了 `keep_alive` 的服务保留进程，并把凭据标记为「可收养」；
 /// - 其余服务杀掉，并清掉凭据（避免下次启动对死 pid 做收养尝试）。
 pub fn register_adoptable(sup: &supervisor::Supervisor) {
@@ -1417,3 +1417,25 @@ mod name_tests {
 /// 正在跟随的 compose 日志流（按服务 key 登记，供停止与清理）。
 #[derive(Default)]
 pub struct DockerLogsRegistry(pub std::sync::Mutex<std::collections::HashMap<String, crate::docker::DockerLogs>>);
+
+impl DockerLogsRegistry {
+    /// 停掉全部日志跟随并清空登记表。
+    ///
+    /// App 退出时必须调用：`docker compose logs -f` 是**独立子进程**，父进程一旦退出，
+    /// 它会被 launchd 收养继续跑（实测 PPID 变成 1），每次退出就漏一个。
+    pub fn stop_all(&self) {
+        let mut g = match self.0.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        for (_, logs) in g.drain() {
+            crate::docker::DockerLogs::stop(logs);
+        }
+    }
+
+    /// 当前登记的流数量（测试断言退出清理用）。
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.0.lock().map(|g| g.len()).unwrap_or(0)
+    }
+}
