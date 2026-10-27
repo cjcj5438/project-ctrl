@@ -471,24 +471,10 @@ function ServiceCard({
             <Button size="sm"
               onClick={() => void act(`stop-${name}`, async () => {
                 await api.serviceStop(project.id, name)
-                // 与启动对称：docker-only 停后把快照置回 Stopped 并刷新容器表
-                // （本地进程的 Stopped 事件随后会覆盖同一条，无害）。
-                if (spec.docker && !spec.run) {
-                  onStatus({
-                    key: statusKey(project.id, name),
-                    project_id: project.id,
-                    name,
-                    phase: 'Stopped',
-                    step: null,
-                    port: status?.port ?? null,
-                    pid: null,
-                    exit_code: null,
-                    note: null,
-                    restarts: 0,
-                    started_at: 0,
-                  })
-                  await loadContainers()
-                }
+                // 停止语义（与后端约定）：serviceStop 对 docker-only 不碰容器，
+                // 只停日志跟随/解绑——因此不写回 Stopped（容器还在 running，
+                // 写 Stopped 是假信息）。
+                // 本地进程的 Stopped 事件随后会覆盖同一条，无害。
               })}
               disabled={busy !== null || (!isRunning && !isStep)}
             >
