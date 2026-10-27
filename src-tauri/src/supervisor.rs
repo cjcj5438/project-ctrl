@@ -1038,6 +1038,9 @@ struct PsSnapshot {
 fn ps_snapshot(pid: u32) -> Result<PsSnapshot, String> {
     let out = Command::new("/bin/ps")
         .args(["-o", "pgid=,lstart=,command=", "-p", &pid.to_string()])
+        // #45：ps 的 lstart 受 locale 影响（中文下变成 `二 10/27 …`，词数错位导致
+        // 解析失败→拒绝收养→变孤儿）。钉死 C locale，输出恒为英文。
+        .env("LC_ALL", "C")
         .output()
         .map_err(|e| format!("无法执行 ps：{e}"))?;
     if !out.status.success() {
@@ -2260,5 +2263,30 @@ mod tests {
             "全新 key spawn 后应收到日志"
         );
         sup.stop("1/freshlog");
+    }
+
+    #[test]
+    fn ps_snapshot_ignores_chinese_locale() {
+        // #45：即使进程环境是中文 locale，ps_snapshot 也必须拿到英文 lstart
+        // （LC_ALL=C 钉死）。对照：不用 LC_ALL=C 时中文 ps 输出 4 词 lstart，
+        // 按 5 词切会把 command 首词吃进 lstart，导致解析失败。
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let zh = Command::new("/bin/ps")
+            .args(["-o", "pgid=,lstart=,command=", "-p", &pid.to_string()])
+            .env("LC_ALL", "zh_CN.UTF-8")
+            .output()
+            .unwrap();
+        let zh_line = String::from_utf8_lossy(&zh.stdout);
+        let zh_line = zh_line.lines().next().unwrap_or("").trim();
+        // 前置：本机中文 ps 确实与英文形状不同（否则测试空测）。
+        let en_words: Vec<&str> = zh_line.split_whitespace().collect();
+        let snap = ps_snapshot(pid).expect("C locale 下快照必须成功");
+        assert!(parse_lstart(&snap.lstart).is_some(), "lstart 必须可解析：{}", snap.lstart);
+        // C locale 输出恒为英文 5 词 lstart。
+        assert_eq!(snap.lstart.split_whitespace().count(), 5, "lstart 应为 5 词：{}", snap.lstart);
+        let _ = en_words;
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
