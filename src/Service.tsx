@@ -573,6 +573,15 @@ function ServiceCard({
             <Button size="sm"
               onClick={() =>
                 void act(`restart-${name}`, async () => {
+                  // docker-only 不进 supervisor：serviceStop 是空操作、up 对运行中栈是
+                  // no-op，stop+start 等于什么都没做。真重启 = down→up→写回快照。
+                  if (!spec.run && spec.docker) {
+                    await api.dockerDown(project.id, name)
+                    await api.dockerUp(project.id, name)
+                    await loadContainers()
+                    onStatus(await dockerSnapshot(project.id, name, status))
+                    return
+                  }
                   await api.serviceStop(project.id, name)
                   const st = await api.serviceStart(project.id, name)
                   onStatus(st)
