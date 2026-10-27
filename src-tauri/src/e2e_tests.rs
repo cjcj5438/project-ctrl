@@ -635,4 +635,5 @@ fn real_compose_logs_stream_into_shared_sink() {
         "应通过 Sink 推送过日志批次"
     );
     let events = sink.logs.lock().unwrap();
+    assert!(events.iter().all(|p| p.key == key), "事件必须带正确的服务 key");
 }
