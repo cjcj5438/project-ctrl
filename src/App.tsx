@@ -9,6 +9,10 @@ import {
 } from './api'
 import DetailView from './Detail'
 import UpdateBanner from './Update'
+import ProbePanel, { ExternalPanel } from './Probe'
+import { StatusDot } from './components'
+import { IconMonitor, IconMoon, IconPencil, IconSearch, IconSun, IconX } from './icons'
+import { applyTheme, loadTheme, saveTheme, watchSystemTheme, type ThemeMode } from './theme'
 import { humanSize } from './format'
 import { pickDirectory, splitTags } from './util'
 
@@ -44,6 +48,9 @@ export default function App() {
   // 有服务处于运行中/过渡态的项目 id（来自 svc:state 事件，不轮询）
   const [running, setRunning] = useState<Set<number>>(new Set())
   const [statuses, setStatuses] = useState<Record<string, ServiceStatus>>({})
+  const [view, setView] = useState<'projects' | 'services'>('projects')
+  const [probeOpen, setProbeOpen] = useState(false)
+  const [externalOpen, setExternalOpen] = useState(false)
   const statusesRef = useRef<Record<string, ServiceStatus>>({})
 
   // 克隆 / PM2 导入的独立浮层状态（不塞进既有 Modal 联合类型）
@@ -152,6 +159,18 @@ export default function App() {
     projects.forEach((p) => p.auto_tags.forEach((t) => auto.add(t)))
     return [...new Set([...allTags, ...auto])].sort((a, b) => a.localeCompare(b, 'zh-CN'))
   }, [allTags, projects])
+
+  // 运维条：所有活跃/异常服务，按「异常 > 运行中 > 其它」排序。
+  // 空数组时整条不渲染——没有运行中的服务就没有运维条，不做空装饰。
+  const opsRows = useMemo(() => {
+    const rank = (st: ServiceStatus) =>
+      st.phase === 'Crashed' || st.phase === 'Failed' ? 0 : st.phase === 'Running' ? 1 : 2
+    return Object.values(statuses)
+      .filter((st) => st.phase === 'Running' || st.phase === 'Step' || st.phase === 'Crashed' || st.phase === 'Failed')
+      .sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name))
+  }, [statuses])
+
+  const projectName = (id: number) => projects.find((p) => p.id === id)?.name ?? `#${id}`
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase()
@@ -281,61 +300,98 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-neutral-100 text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100">
+    <div className="min-h-screen bg-surface-raised text-fg ">
       <UpdateBanner />
       <div className="mx-auto max-w-6xl px-6 py-6">
         <header className="flex flex-wrap items-center gap-3">
           <h1 className="text-xl font-bold">项目管理</h1>
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="按名称搜索…"
-            className="ml-4 w-56 rounded-lg border border-neutral-300 bg-white px-3 py-1.5 text-sm outline-none focus:border-blue-500 dark:border-neutral-700 dark:bg-neutral-900"
-          />
+          <div className="relative ml-2">
+            <span className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-muted">
+              <IconSearch size={14} />
+            </span>
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="按名称搜索…"
+              aria-label="按名称搜索"
+              className="w-56 rounded-lg border border-border bg-surface py-1.5 pl-7 pr-3 text-sm focus:border-accent focus:outline-none"
+            />
+          </div>
           <div className="ml-auto flex items-center gap-2">
             <button
               onClick={() => setSort(NEXT_SORT[sort])}
-              className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+              className="rounded-lg border border-border px-3 py-1.5 text-sm "
               title="切换排序"
             >
               排序：{SORT_LABEL[sort]}
             </button>
             <button
               onClick={doScan}
-              className="rounded-lg bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-700"
+              className="rounded-lg border border-transparent bg-info px-3 py-1.5 text-sm text-white hover:brightness-110"
             >
               扫描文件夹…
             </button>
             <button
               onClick={doAddSingle}
-              className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+              className="rounded-lg border border-border px-3 py-1.5 text-sm "
             >
               添加单个项目…
             </button>
             <button
               onClick={() => setCloneOpen(true)}
-              className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+              className="rounded-lg border border-border px-3 py-1.5 text-sm "
             >
               从 GitHub 克隆…
             </button>
             <button
-              onClick={() => void run(async () => setPm2Report(await api.importPm2()))}
-              className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+              onClick={() => setProbeOpen(true)}
+              className="rounded-lg border border-border px-3 py-1.5 text-sm "
+              title="只读扫描所有项目的可启动方式，勾选后只写本机"
             >
-              导入 PM2 配置
+              批量探测…
             </button>
+            <button
+              onClick={() => setExternalOpen(true)}
+              className="rounded-lg border border-border px-3 py-1.5 text-sm "
+              title="launchd 与 PM2 的只读视图"
+            >
+              外部服务…
+            </button>
+            <ThemeButton />
           </div>
         </header>
 
         {error && (
-          <div className="mt-4 rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-800 dark:bg-red-950 dark:text-red-200">
+          <div className="mt-4 rounded-lg border border-error/50 bg-error/10 px-3 py-2 text-sm text-error">
             {error}
           </div>
         )}
 
+        {/* 双视图：项目（默认）与服务；服务视图只显示运行态，不是「另一个列表」 */}
+        <div className="mt-4 flex items-center gap-1 text-sm" role="group" aria-label="视图切换">
+          {(['projects', 'services'] as const).map((v) => (
+            <button
+              key={v}
+              aria-pressed={view === v}
+              onClick={() => setView(v)}
+              className={`rounded-md px-2.5 py-1 ${
+                view === v ? 'bg-surface text-fg shadow-sm' : 'text-muted hover:text-fg'
+              }`}
+            >
+              {v === 'projects' ? '项目' : '服务'}
+              {v === 'services' && opsRows.length > 0 && (
+                <span className="ml-1.5 text-xs text-muted">{opsRows.length}</span>
+              )}
+            </button>
+          ))}
+        </div>
+
+        {/* 运维条：只在有活跃/异常服务时出现 */}
+        {view === 'projects' && opsRows.length > 0 && <OpsBar rows={opsRows} projectName={projectName} onOpen={setDetailId} />}
+
         <div className="mt-4 flex flex-wrap items-center gap-2">
-          <span className="text-sm text-neutral-500">筛选：</span>
-          {filterTags.length === 0 && <span className="text-sm text-neutral-400">暂无 tag</span>}
+          <span className="text-sm text-muted">筛选：</span>
+          {filterTags.length === 0 && <span className="text-sm text-muted">暂无 tag</span>}
           {filterTags.map((t) => {
             const active = selected.includes(t)
             const manual = allTags.includes(t)
@@ -344,10 +400,10 @@ export default function App() {
                 key={t}
                 className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs ${
                   active
-                    ? 'border-blue-600 bg-blue-600 text-white'
+                    ? 'border-primary bg-primary text-primary-fg'
                     : manual
-                      ? 'border-neutral-300 bg-white dark:border-neutral-700 dark:bg-neutral-900'
-                      : 'border-dashed border-neutral-400 bg-neutral-200 dark:border-neutral-600 dark:bg-neutral-800'
+                      ? 'border-border bg-surface text-fg'
+                      : 'border-dashed border-border bg-surface-raised text-muted'
                 }`}
               >
                 <button
@@ -365,17 +421,19 @@ export default function App() {
                         setModalInput(t)
                         setModal({ kind: 'renameTag', tag: t })
                       }}
-                      className="opacity-50 hover:opacity-100"
+                      className="opacity-60 transition-opacity hover:opacity-100"
+                      aria-label={`重命名 ${t}`}
                       title="改名"
                     >
-                      ✎
+                      <IconPencil size={12} />
                     </button>
                     <button
                       onClick={() => setModal({ kind: 'deleteTag', tag: t })}
-                      className="opacity-50 hover:opacity-100"
+                      className="opacity-60 transition-opacity hover:opacity-100"
+                      aria-label={`删除 ${t}`}
                       title="删除"
                     >
-                      ✕
+                      <IconX size={12} />
                     </button>
                   </>
                 )}
@@ -383,62 +441,74 @@ export default function App() {
             )
           })}
           {selected.length > 0 && (
-            <button onClick={() => setSelected([])} className="text-xs text-blue-600">
+            <button onClick={() => setSelected([])} className="text-xs text-info hover:underline">
               清除筛选
             </button>
           )}
         </div>
 
-        <div className="mt-4 text-sm text-neutral-500">共 {visible.length} 个项目</div>
+        {view === 'projects' && <div className="mt-4 text-sm text-muted">共 {visible.length} 个项目</div>}
 
+        {view === 'projects' && (
         <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {visible.map((p) => (
             <div
               key={p.id}
+              role="button"
+              tabIndex={0}
+              aria-label={`打开项目 ${p.name}`}
               onClick={() => setDetailId(p.id)}
-              className="cursor-pointer rounded-xl border border-neutral-200 bg-white p-4 shadow-sm transition hover:border-blue-400 dark:border-neutral-800 dark:bg-neutral-900 dark:hover:border-blue-700"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  setDetailId(p.id)
+                }
+              }}
+              className="cursor-pointer rounded-xl border border-border bg-surface p-4 transition-colors hover:border-accent focus-visible:border-accent"
             >
               <div className="flex items-center gap-2">
                 <h2 className="truncate font-semibold">{p.name}</h2>
                 {running.has(p.id) && (
                   <span
-                    className="shrink-0 inline-block h-2 w-2 rounded-full bg-emerald-500"
+                    className="shrink-0 inline-block h-2 w-2 rounded-full bg-success"
                     title="服务运行中"
                     aria-hidden
                   />
                 )}
                 {p.missing && (
-                  <span className="shrink-0 rounded bg-red-100 px-1.5 py-0.5 text-xs text-red-700 dark:bg-red-900 dark:text-red-200">
+                  <span className="shrink-0 rounded border border-error/40 bg-error/10 px-1.5 py-0.5 text-xs text-error">
                     路径丢失
                   </span>
                 )}
               </div>
-              <div className="mt-1 truncate text-xs text-neutral-500" title={p.path}>
+              <div className="mt-1 truncate text-xs text-muted" title={p.path}>
                 {p.path}
               </div>
-              <div className="mt-1 text-xs text-neutral-500">创建日期：{p.created_date ?? '未知'}</div>
+              <div className="mt-1 text-xs text-muted">创建日期：{p.created_date ?? '未知'}</div>
               {!p.missing && (
-                <div className="mt-1 text-xs text-neutral-500">大小：{formatSize(p)}</div>
+                <div className="mt-1 text-xs text-muted">大小：{formatSize(p)}</div>
               )}
               <div className="mt-2 flex flex-wrap gap-1.5">
                 {p.manual_tags.map((t) => (
                   <span
                     key={t}
-                    className="rounded-full bg-blue-100 px-2 py-0.5 text-xs text-blue-800 dark:bg-blue-900 dark:text-blue-100"
+                    className="inline-flex items-center gap-1 rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-xs text-fg"
                   >
                     {t}
                   </span>
                 ))}
-                {p.auto_tags.map((t) => (
-                  <span
-                    key={t}
-                    className="rounded-full border border-dashed border-neutral-400 px-2 py-0.5 text-xs text-neutral-500 dark:border-neutral-600 dark:text-neutral-300"
-                  >
-                    {t}
-                  </span>
-                ))}
+                {p.auto_tags
+                  .filter((t) => !p.manual_tags.includes(t))
+                  .map((t) => (
+                    <span
+                      key={t}
+                      className="rounded-full border border-dashed border-border px-2 py-0.5 text-xs text-muted"
+                    >
+                      {t}
+                    </span>
+                  ))}
                 {p.manual_tags.length === 0 && p.auto_tags.length === 0 && (
-                  <span className="text-xs text-neutral-400">无 tag</span>
+                  <span className="text-xs text-muted">无 tag</span>
                 )}
               </div>
               <div className="mt-3 flex flex-wrap gap-2 text-xs" onClick={(e) => e.stopPropagation()}>
@@ -446,13 +516,13 @@ export default function App() {
                   <>
                     <button
                       onClick={() => relink(p)}
-                      className="rounded bg-blue-600 px-2 py-1 text-white"
+                      className="rounded bg-primary px-2 py-1 text-primary-fg"
                     >
                       重新关联
                     </button>
                     <button
                       onClick={() => setModal({ kind: 'removeProject', project: p })}
-                      className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+                      className="rounded border border-border px-2 py-1 "
                     >
                       移除
                     </button>
@@ -464,32 +534,32 @@ export default function App() {
                         setModalInput(p.manual_tags.join('，'))
                         setModal({ kind: 'editTags', project: p })
                       }}
-                      className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+                      className="rounded border border-border px-2 py-1 "
                     >
                       编辑 tag
                     </button>
                     <button
                       onClick={() => run(() => api.openInFinder(p.id))}
-                      className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+                      className="rounded border border-border px-2 py-1 "
                     >
                       Finder
                     </button>
                     <button
                       onClick={() => run(() => api.openInIterm(p.id))}
-                      className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+                      className="rounded border border-border px-2 py-1 "
                     >
                       iTerm
                     </button>
                     <button
                       onClick={() => run(() => api.openInVscode(p.id))}
-                      className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+                      className="rounded border border-border px-2 py-1 "
                     >
                       VS Code
                     </button>
                     {p.github_url && (
                       <button
                         onClick={() => run(() => api.openGithub(p.id))}
-                        className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+                        className="rounded border border-border px-2 py-1 "
                       >
                         GitHub
                       </button>
@@ -500,12 +570,15 @@ export default function App() {
             </div>
           ))}
         </div>
+        )}
+
+        {view === 'services' && <ServicesView rows={opsRows} projectName={projectName} onOpen={setDetailId} />}
 
         {scanRoot && (
           <div className="fixed inset-0 flex items-center justify-center bg-black/40 p-6">
-            <div className="max-h-[80vh] w-full max-w-lg overflow-auto rounded-xl bg-white p-5 dark:bg-neutral-900">
+            <div className="max-h-[80vh] w-full max-w-lg overflow-auto rounded-xl bg-surface p-5 ">
               <h3 className="font-semibold">扫描结果：{scanRoot}</h3>
-              <p className="mt-1 text-xs text-neutral-500">
+              <p className="mt-1 text-xs text-muted">
                 已加入管理的不显示；没勾选的不记忆，下次还会出现。
               </p>
               <label className="mt-3 flex items-center gap-2 text-sm">
@@ -534,30 +607,30 @@ export default function App() {
                       }
                     />
                     <span className="font-medium">{c.name}</span>
-                    <span className="truncate text-xs text-neutral-400">{c.path}</span>
+                    <span className="truncate text-xs text-muted">{c.path}</span>
                   </label>
                 ))}
                 {candidates.length === 0 && (
-                  <div className="py-4 text-sm text-neutral-500">没有可加入的新目录。</div>
+                  <div className="py-4 text-sm text-muted">没有可加入的新目录。</div>
                 )}
               </div>
               <input
                 value={batchTags}
                 onChange={(e) => setBatchTags(e.target.value)}
                 placeholder="给所选项目批量打 tag（逗号/空格分隔，可留空）"
-                className="mt-4 w-full rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700 dark:bg-neutral-800"
+                className="mt-4 w-full rounded-lg border border-border px-3 py-1.5 text-sm "
               />
               <div className="mt-4 flex justify-end gap-2">
                 <button
                   onClick={() => setScanRoot(null)}
-                  className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+                  className="rounded-lg border border-border px-3 py-1.5 text-sm "
                 >
                   取消
                 </button>
                 <button
                   onClick={doJoin}
                   disabled={checked.size === 0}
-                  className="rounded-lg bg-blue-600 px-3 py-1.5 text-sm text-white disabled:opacity-40"
+                  className="rounded-lg bg-primary px-3 py-1.5 text-sm text-primary-fg disabled:opacity-40"
                 >
                   加入（{checked.size}）
                 </button>
@@ -568,7 +641,7 @@ export default function App() {
 
         {modal && (
           <div className="fixed inset-0 flex items-center justify-center bg-black/40 p-6">
-            <div className="w-full max-w-sm rounded-xl bg-white p-5 dark:bg-neutral-900">
+            <div className="w-full max-w-sm rounded-xl bg-surface p-5 ">
               {modal.kind === 'deleteTag' ? (
                 <>
                   <h3 className="font-semibold">删除 tag</h3>
@@ -591,30 +664,29 @@ export default function App() {
                     {modal.kind === 'singleTags' && '添加单个项目'}
                   </h3>
                   {modal.kind === 'singleTags' && (
-                    <p className="mt-2 break-all text-xs text-neutral-500">{modal.path}</p>
+                    <p className="mt-2 break-all text-xs text-muted">{modal.path}</p>
                   )}
                   <input
                     autoFocus
                     value={modalInput}
                     onChange={(e) => setModalInput(e.target.value)}
                     placeholder="tag（逗号/空格分隔，可留空）"
-                    className="mt-3 w-full rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700 dark:bg-neutral-800"
+                    className="mt-3 w-full rounded-lg border border-border px-3 py-1.5 text-sm "
                   />
                 </>
               )}
               <div className="mt-4 flex justify-end gap-2">
                 <button
                   onClick={() => setModal(null)}
-                  className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+                  className="rounded-lg border border-border px-3 py-1.5 text-sm "
                 >
                   取消
                 </button>
                 <button
                   onClick={confirmModal}
-                  className={`rounded-lg px-3 py-1.5 text-sm text-white ${
-                    modal.kind === 'deleteTag' || modal.kind === 'removeProject'
-                      ? 'bg-red-600 hover:bg-red-700'
-                      : 'bg-blue-600 hover:bg-blue-700'
+                  className={`rounded-lg px-3 py-1.5 text-sm text-primary-fg ${ modal.kind === 'deleteTag' || modal.kind === 'removeProject'
+                      ? 'bg-error-solid text-white hover:brightness-110'
+                      : 'bg-primary hover:brightness-110'
                   }`}
                 >
                   {modal.kind === 'deleteTag' || modal.kind === 'removeProject' ? '确认' : '确定'}
@@ -625,9 +697,9 @@ export default function App() {
         )}
         {cloneOpen && (
           <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/40 p-6">
-            <div className="w-full max-w-md rounded-xl bg-white p-5 dark:bg-neutral-900">
+            <div className="w-full max-w-md rounded-xl bg-surface p-5 ">
               <h3 className="font-semibold">从 GitHub 克隆</h3>
-              <p className="mt-1 text-xs text-neutral-500">
+              <p className="mt-1 text-xs text-muted">
                 支持 https / ssh 地址。克隆完成后自动加入管理器。
               </p>
               <input
@@ -635,23 +707,23 @@ export default function App() {
                 value={cloneUrl}
                 onChange={(e) => setCloneUrl(e.target.value)}
                 placeholder="https://github.com/owner/repo.git"
-                className="mt-3 w-full rounded-lg border border-neutral-300 bg-white px-3 py-1.5 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-800"
+                className="mt-3 w-full rounded-lg border border-border bg-surface px-3 py-1.5 font-mono text-xs "
               />
               <div className="mt-2 flex items-center gap-2">
                 <button
                   onClick={() => void run(async () => setCloneDir(await pickDirectory()))}
-                  className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+                  className="rounded-lg border border-border px-3 py-1.5 text-sm "
                 >
                   选择父目录…
                 </button>
-                <span className="truncate text-xs text-neutral-500" title={cloneDir ?? ''}>
+                <span className="truncate text-xs text-muted" title={cloneDir ?? ''}>
                   {cloneDir ?? '未选择'}
                 </span>
               </div>
               <div className="mt-4 flex justify-end gap-2">
                 <button
                   onClick={() => setCloneOpen(false)}
-                  className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+                  className="rounded-lg border border-border px-3 py-1.5 text-sm "
                 >
                   取消
                 </button>
@@ -672,7 +744,7 @@ export default function App() {
                     })
                   }
                   disabled={cloneBusy || !cloneUrl.trim() || !cloneDir}
-                  className="rounded-lg bg-blue-600 px-3 py-1.5 text-sm text-white disabled:opacity-40"
+                  className="rounded-lg bg-primary px-3 py-1.5 text-sm text-primary-fg disabled:opacity-40"
                 >
                   {cloneBusy ? '克隆中…' : '克隆'}
                 </button>
@@ -683,7 +755,7 @@ export default function App() {
 
         {pm2Report && (
           <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/40 p-6">
-            <div className="w-full max-w-md rounded-xl bg-white p-5 dark:bg-neutral-900">
+            <div className="w-full max-w-md rounded-xl bg-surface p-5 ">
               <h3 className="font-semibold">导入 PM2 配置</h3>
               <p className="mt-2 text-sm">新增 {pm2Report.imported.length} 个项目的配方。</p>
               <ReportList title="已跳过" items={pm2Report.skipped} />
@@ -694,7 +766,7 @@ export default function App() {
                     setPm2Report(null)
                     void refresh()
                   }}
-                  className="rounded-lg bg-blue-600 px-3 py-1.5 text-sm text-white"
+                  className="rounded-lg bg-primary px-3 py-1.5 text-sm text-primary-fg"
                 >
                   关闭
                 </button>
@@ -702,7 +774,11 @@ export default function App() {
             </div>
           </div>
         )}
+
       </div>
+
+      {probeOpen && <ProbePanel onClose={() => setProbeOpen(false)} onDone={refresh} />}
+      {externalOpen && <ExternalPanel onClose={() => setExternalOpen(false)} />}
     </div>
   )
 }
@@ -712,12 +788,149 @@ function ReportList({ title, items }: { title: string; items: string[] }) {
   if (items.length === 0) return null
   return (
     <div className="mt-3">
-      <div className="text-xs font-semibold text-neutral-500">{title}</div>
+      <div className="text-xs font-semibold text-muted">{title}</div>
       <ul className="mt-1 list-inside list-disc text-xs">
         {items.map((t) => (
           <li key={t}>{t}</li>
         ))}
       </ul>
+    </div>
+  )
+}
+
+/** 主题三档切换：跟随系统 / 浅色 / 深色，立即生效并持久化。 */
+function ThemeButton() {
+  const [mode, setMode] = useState<ThemeMode>(() => loadTheme())
+
+  useEffect(() => {
+    applyTheme(mode)
+    saveTheme(mode)
+  }, [mode])
+
+  // 只有「跟随系统」需要监听系统变化
+  useEffect(() => {
+    if (mode !== 'auto') return
+    return watchSystemTheme(() => applyTheme('auto'))
+  }, [mode])
+
+  const next: Record<ThemeMode, ThemeMode> = { auto: 'light', light: 'dark', dark: 'auto' }
+  const label: Record<ThemeMode, string> = { auto: '跟随系统', light: '浅色', dark: '深色' }
+  const icon = mode === 'light' ? <IconSun size={14} /> : mode === 'dark' ? <IconMoon size={14} /> : <IconMonitor size={14} />
+
+  return (
+    <button
+      onClick={() => setMode(next[mode])}
+      title={`主题：${label[mode]}（点击切换）`}
+      aria-label={`主题：${label[mode]}，点击切换`}
+      className="inline-flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-sm text-muted hover:bg-surface hover:text-fg"
+    >
+      {icon}
+      <span className="text-xs">{label[mode]}</span>
+    </button>
+  )
+}
+
+/** 服务视图：只有运行态，不重复项目列表。空态明确说明「没有服务在跑」。 */
+function ServicesView({
+  rows,
+  projectName,
+  onOpen,
+}: {
+  rows: ServiceStatus[]
+  projectName: (id: number) => string
+  onOpen: (id: number) => void
+}) {
+  if (rows.length === 0) {
+    return (
+      <div className="mt-6 rounded-[var(--radius-card)] border border-dashed border-border p-8 text-center text-sm text-muted">
+        没有正在运行或异常的服务。到项目详情页的「服务」面板里启动，或用工具栏的「批量探测…」。
+      </div>
+    )
+  }
+  return (
+    <div className="mt-4 overflow-hidden rounded-[var(--radius-card)] border border-border">
+      <table className="w-full text-left text-xs">
+        <thead className="bg-surface-raised text-muted">
+          <tr>
+            <th className="px-3 py-2 font-medium">项目</th>
+            <th className="px-3 py-2 font-medium">服务</th>
+            <th className="px-3 py-2 font-medium">状态</th>
+            <th className="px-3 py-2 font-medium">端口</th>
+            <th className="px-3 py-2 font-medium">PID</th>
+            <th className="px-3 py-2 font-medium">重启</th>
+            <th className="px-3 py-2 font-medium">提示</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((st) => {
+            const tone =
+              st.phase === 'Running' ? 'ok' : st.phase === 'Step' ? 'busy' : st.phase === 'Crashed' || st.phase === 'Failed' ? 'bad' : 'idle'
+            return (
+              <tr
+                key={st.key}
+                className="cursor-pointer border-t border-border hover:bg-surface-raised"
+                onClick={() => onOpen(st.project_id)}
+              >
+                <td className="px-3 py-1.5">{projectName(st.project_id)}</td>
+                <td className="px-3 py-1.5 font-medium">{st.name}</td>
+                <td className="px-3 py-1.5">
+                  <StatusDot tone={tone} label={st.step ? `${PHASE_TEXT[st.phase]} · ${st.step}` : PHASE_TEXT[st.phase]} />
+                </td>
+                <td className="px-3 py-1.5 font-mono text-muted">{st.port ?? '—'}</td>
+                <td className="px-3 py-1.5 font-mono text-muted">{st.pid ?? '—'}</td>
+                <td className="px-3 py-1.5 text-muted">{st.restarts > 0 ? st.restarts : '—'}</td>
+                <td className="max-w-[280px] truncate px-3 py-1.5 text-warning" title={st.note ?? ''}>
+                  {st.note ?? ''}
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+const PHASE_TEXT: Record<ServiceStatus['phase'], string> = {
+  Idle: '未运行',
+  Step: '执行中',
+  Running: '运行中',
+  Stopped: '已停止',
+  Crashed: '已崩溃',
+  Failed: '失败',
+}
+
+/** 运维条：一条紧凑的实时状态带，异常优先。 */
+function OpsBar({
+  rows,
+  projectName,
+  onOpen,
+}: {
+  rows: ServiceStatus[]
+  projectName: (id: number) => string
+  onOpen: (id: number) => void
+}) {
+  const bad = rows.filter((r) => r.phase === 'Crashed' || r.phase === 'Failed').length
+  return (
+    <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface-raised px-3 py-2 text-xs">
+      <span className="font-medium text-muted">运行中</span>
+      {rows.slice(0, 6).map((st) => {
+        const tone = st.phase === 'Running' ? 'ok' : st.phase === 'Step' ? 'busy' : 'bad'
+        return (
+          <button
+            key={st.key}
+            onClick={() => onOpen(st.project_id)}
+            className="inline-flex items-center gap-1.5 rounded-full border border-border bg-surface px-2 py-0.5 hover:border-accent"
+            title={`${projectName(st.project_id)} / ${st.name}`}
+          >
+            <StatusDot tone={tone} />
+            <span>{st.name}</span>
+            {st.port != null && <span className="font-mono text-muted">:{st.port}</span>}
+          </button>
+        )
+      })}
+      {rows.length > 6 && <span className="text-muted">+{rows.length - 6}</span>}
+      {bad > 0 && <span className="ml-auto text-error">{bad} 个异常</span>}
     </div>
   )
 }

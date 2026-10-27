@@ -8,6 +8,7 @@ mod descriptor;
 mod detect;
 mod docker;
 mod execenv;
+mod external;
 mod git;
 mod localstate;
 mod logic;
@@ -28,6 +29,7 @@ fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R>
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(supervisor::Supervisor::default())
+        .manage(commands::DockerLogsRegistry::default())
         .invoke_handler(tauri::generate_handler![
             commands::list_projects,
             commands::list_tags,
@@ -68,6 +70,13 @@ fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R>
             commands::docker_up,
             commands::docker_down,
             commands::docker_ps,
+            commands::docker_logs,
+            commands::docker_logs_stop,
+            commands::probe_all,
+            commands::adopt_candidates,
+            commands::run_adhoc,
+            commands::external_scan,
+            commands::reveal_file,
             commands::source_info,
             commands::source_fetch,
             commands::source_pull,

@@ -74,20 +74,20 @@ function Confirm({
 }) {
   return (
     <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/40 p-6">
-      <div className="w-full max-w-sm rounded-xl bg-white p-5 dark:bg-neutral-900">
+      <div className="w-full max-w-sm rounded-xl bg-surface p-5 ">
         <h3 className="font-semibold">{title}</h3>
         <div className="mt-2 text-sm">{children}</div>
         <div className="mt-4 flex justify-end gap-2">
           <button
             onClick={onCancel}
-            className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+            className="rounded-lg border border-border px-3 py-1.5 text-sm "
           >
             取消
           </button>
           <button
             onClick={onConfirm}
-            className={`rounded-lg px-3 py-1.5 text-sm text-white ${
-              danger ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700'
+            className={`rounded-lg px-3 py-1.5 text-sm hover:brightness-110 ${
+              danger ? 'bg-error-solid text-white' : 'bg-primary text-primary-fg'
             }`}
           >
             {confirmText}
@@ -252,25 +252,25 @@ export default function ReadmeSection({
     setConflict(false)
   }
 
-  if (loading) return <div className="text-sm text-neutral-500">README 载入中…</div>
+  if (loading) return <div className="text-sm text-muted">README 载入中…</div>
 
   return (
     <div className="mt-6">
       <div className="flex items-center gap-3">
-        <h3 className="text-sm font-semibold text-neutral-500">README</h3>
+        <h3 className="text-sm font-semibold text-muted">README</h3>
         {editing && (
           <>
-            {dirty && <span className="text-xs text-amber-600">●未保存</span>}
+            {dirty && <span className="text-xs text-warning">●未保存</span>}
             <div className="ml-auto flex gap-2">
               <button
                 onClick={requestExitEdit}
-                className="rounded border border-neutral-300 px-2 py-1 text-xs dark:border-neutral-700"
+                className="rounded border border-border px-2 py-1 text-xs "
               >
                 取消编辑
               </button>
               <button
                 onClick={() => void save()}
-                className="rounded bg-blue-600 px-3 py-1 text-xs text-white hover:bg-blue-700"
+                className="rounded bg-primary px-3 py-1 text-xs text-primary-fg hover:brightness-110"
               >
                 保存
               </button>
@@ -280,7 +280,7 @@ export default function ReadmeSection({
         {!editing && info?.exists && (
           <button
             onClick={startEdit}
-            className="ml-auto rounded border border-neutral-300 px-2 py-1 text-xs dark:border-neutral-700"
+            className="ml-auto rounded border border-border px-2 py-1 text-xs "
           >
             编辑
           </button>
@@ -288,24 +288,24 @@ export default function ReadmeSection({
       </div>
 
       {!info?.exists ? (
-        <div className="mt-3 rounded-lg border border-dashed border-neutral-300 p-6 text-center text-sm text-neutral-500 dark:border-neutral-700">
+        <div className="mt-3 rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted ">
           <p>暂无 README</p>
           <button
             onClick={generate}
-            className="mt-3 rounded bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-700"
+            className="mt-3 rounded bg-primary px-3 py-1.5 text-sm text-primary-fg hover:brightness-110"
           >
             生成
           </button>
         </div>
       ) : editing ? (
         <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
-          <div ref={editorRef} className="min-h-[320px] overflow-auto rounded-lg border border-neutral-300 dark:border-neutral-700" />
-          <div className="max-h-[70vh] overflow-auto rounded-lg border border-neutral-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900">
+          <div ref={editorRef} className="min-h-[320px] overflow-auto rounded-lg border border-border " />
+          <div className="max-h-[70vh] overflow-auto rounded-lg border border-border bg-surface p-4 ">
             <MarkdownView id={projectId} markdown={draft} />
           </div>
         </div>
       ) : (
-        <div className="mt-3 rounded-lg border border-neutral-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900">
+        <div className="mt-3 rounded-lg border border-border bg-surface p-4 ">
           <MarkdownView id={projectId} markdown={savedContent} />
         </div>
       )}
@@ -322,7 +322,7 @@ export default function ReadmeSection({
           <div className="mt-3 flex flex-col gap-2">
             <button
               onClick={() => void reloadFromDisk()}
-              className="rounded border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+              className="rounded border border-border px-3 py-1.5 text-sm "
             >
               放弃我的修改并重新载入
             </button>

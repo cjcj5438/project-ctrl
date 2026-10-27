@@ -149,6 +149,38 @@ export interface DetectResult {
   script_candidates: string[]
 }
 
+export interface ProbeCandidate {
+  kind: 'script' | 'compose' | 'make' | 'script-file'
+  label: string
+  spec: ServiceSpec
+}
+
+export interface ProbeItem {
+  project_id: number
+  project_name: string
+  path: string
+  has_descriptor: boolean
+  has_services: boolean
+  candidates: ProbeCandidate[]
+}
+
+export interface ExternalEntry {
+  source: 'pm2' | 'launchd'
+  name: string
+  cwd: string | null
+  managed_project: string | null
+  declared: boolean
+  note: string
+  config_path: string
+  command: string[] | null
+  changed_at?: number | null
+}
+
+export interface ExternalItem extends ExternalEntry {
+  /** 与本 App 里同名声明的命令不一致时的说明。 */
+  drift: { kind: string; detail: string } | null
+}
+
 export interface ContainerView {
   name: string
   service: string
@@ -239,6 +271,14 @@ export const api = {
   dockerUp: (id: number, name: string) => invoke<string>('docker_up', { id, name }),
   dockerDown: (id: number, name: string) => invoke<string>('docker_down', { id, name }),
   dockerPs: (id: number, name: string) => invoke<ContainerView[]>('docker_ps', { id, name }),
+  dockerLogs: (id: number, name: string) => invoke<number>('docker_logs', { id, name }),
+  dockerLogsStop: (id: number, name: string) => invoke<void>('docker_logs_stop', { id, name }),
+  probeAll: () => invoke<ProbeItem[]>('probe_all'),
+  adoptCandidates: (items: [number, ServiceSpec][]) =>
+    invoke<string[]>('adopt_candidates', { items }),
+  runAdhoc: (id: number, spec: ServiceSpec) => invoke<ServiceStatus>('run_adhoc', { id, spec }),
+  externalScan: () => invoke<ExternalItem[]>('external_scan'),
+  revealFile: (path: string) => invoke<void>('reveal_file', { path }),
 
   sourceInfo: (id: number) => invoke<SourceInfo>('source_info', { id }),
   sourceFetch: (id: number) => invoke<GitResult>('source_fetch', { id }),

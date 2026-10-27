@@ -1,5 +1,120 @@
 @import "tailwindcss";
 
+/* ---------------------------------------------------------------------------
+   设计 token：唯一的颜色/字体/间距来源。
+   组件里只用 var(--…) 或语义类名，不再出现 raw hex。
+   亮/暗双套：`.dark` 由 html 上的 class 控制，默认跟随系统。
+--------------------------------------------------------------------------- */
+
+@theme {
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-border: var(--border);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  /* 主操作：亮暗两套都用蓝，与「运行绿 / 成功绿」彻底分开 */
+  --color-primary: var(--primary);
+  --color-primary-fg: var(--primary-fg);
+  --color-success: var(--success);
+  --color-on-success: var(--on-success);
+  --color-warning: var(--warning);
+  --color-error: var(--error);
+  --color-error-solid: var(--error-solid);
+  --color-info: var(--info);
+  --radius-card: 10px;
+  --font-sans: "IBM Plex Sans", -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+:root {
+  /* 亮色：低对比背景 + 明确边框（不用阴影堆层次） */
+  --surface: #ffffff;
+  --surface-raised: #f7f8fa;
+  --fg: #16181d;
+  --muted: #5c6470;
+  --border: #d7dbe2;
+  --accent: #2563eb;
+  --accent-fg: #ffffff;
+  --primary: #2563eb;
+  --primary-fg: #ffffff;
+  --success: #15803d;
+  --on-success: #ffffff;
+  --warning: #a16207;
+  --error: #b91c1c;
+  --error-solid: #b91c1c;
+  --info: #1d4ed8;
+  --ring: #2563eb;
+  color-scheme: light;
+}
+
+html.dark {
+  /* 暗色：OLED 深底 + 提亮前景 */
+  --surface: #0f172a;
+  --surface-raised: #1b2336;
+  --fg: #f8fafc;
+  --muted: #94a3b8;
+  --border: #334155;
+  /* accent 在暗色下是「运行/选中」绿；主操作仍是蓝，避免与状态同色 */
+  --accent: #22c55e;
+  --accent-fg: #0f172a;
+  --primary: #2563eb;
+  --primary-fg: #ffffff;
+  --success: #22c55e;
+  --on-success: #0f172a;
+  --warning: #f59e0b;
+  /* 拆两个：error 用于文字/边框（亮底上要够亮），error-solid 用于实底按钮（配白字要够深） */
+  --error: #f87171;
+  --error-solid: #dc2626;
+  --info: #60a5fa;
+  --ring: #f8fafc;
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--surface);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 焦点可见：全站统一，键盘导航必须看得见 */
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* 尊重减弱动效 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* 滚动条在深色下不要刺眼 */
+html.dark ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+html.dark ::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 6px;
+}
+html.dark ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+
 /* README 渲染区（无 typography 插件，手写最小样式） */
 .md-body {
   font-size: 0.875rem;
@@ -37,7 +152,7 @@
   margin: 0.5em 0;
 }
 .md-body a {
-  color: #2563eb;
+  color: var(--accent);
   text-decoration: underline;
 }
 .md-body code {
@@ -69,7 +184,7 @@
 .md-body blockquote {
   border-left: 3px solid rgba(127, 127, 127, 0.4);
   padding-left: 0.8em;
-  color: #6b7280;
+  color: var(--muted);
   margin: 0.6em 0;
 }
 .md-body img {
@@ -82,21 +197,19 @@
 }
 
 /* CodeMirror 在深色系统下的最小适配 */
-@media (prefers-color-scheme: dark) {
-  .cm-editor {
-    background: #171717;
-    color: #e5e5e5;
+html.dark .cm-editor {
+    background: var(--surface-raised);
+    color: var(--fg);
   }
-  .cm-gutters {
-    background: #171717;
-    color: #737373;
+  html.dark .cm-gutters {
+    background: var(--surface-raised);
+    color: var(--muted);
     border: none;
   }
-  .cm-activeLine,
-  .cm-activeLineGutter {
-    background: rgba(255, 255, 255, 0.05);
+  html.dark .cm-activeLine,
+  html.dark .cm-activeLineGutter {
+    background: rgba(255, 255, 255, 0.06);
   }
-  .cm-cursor {
-    border-left-color: #e5e5e5;
+  html.dark .cm-cursor {
+    border-left-color: var(--fg);
   }
-}

@@ -801,6 +801,344 @@ pub fn service_override(id: i64, name: String) -> Result<Option<localstate::Over
     Ok(localstate::service_override(&overrides, &project_path, &name))
 }
 
+/// 批量探测：把每个项目的候选启动方式列出来，供一次性采纳。
+///
+/// 只读，不写库、不启动任何东西。用户勾选后才逐条保存（见 `adopt_candidates`）。
+#[derive(Serialize)]
+pub struct ProbeItem {
+    pub project_id: i64,
+    pub project_name: String,
+    pub path: String,
+    pub has_descriptor: bool,
+    pub has_services: bool,
+    /// 候选：`argv` 命令或 compose 栈，二选一。
+    pub candidates: Vec<ProbeCandidate>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ProbeCandidate {
+    /// `script` | `compose` | `make` | `script-file`
+    pub kind: String,
+    /// 人读标签（命令本身或 compose 文件）。
+    pub label: String,
+    pub spec: ServiceSpec,
+}
+
+#[tauri::command]
+pub fn probe_all() -> Result<Vec<ProbeItem>, String> {
+    let conn = db::open_db().map_err(|e| e.to_string())?;
+    let rows = db::all_projects(&conn).map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let base = PathBuf::from(&row.path);
+        if !base.is_dir() {
+            continue;
+        }
+        let names = db::service_names(&conn, row.id).map_err(|e| e.to_string())?;
+        let d = crate::detect::detect(&base);
+        let mut candidates = Vec::new();
+        for argv in &d.start_candidates {
+            candidates.push(ProbeCandidate {
+                kind: "script".into(),
+                label: argv.join(" "),
+                spec: ServiceSpec {
+                    name: simple_name(argv),
+                    cwd: None,
+                    run: Some(argv.clone()),
+                    steps: d.build.clone().map(|b| vec![crate::services::Step {
+                        name: "build".into(),
+                        argv: b,
+                        timeout_s: 1800,
+                    }]).unwrap_or_default(),
+                    env_files: Vec::new(),
+                    env: Default::default(),
+                    ports: crate::services::Ports {
+                        listen: d.dev_port,
+                        requires: d.requires_ports.clone(),
+                    },
+                    health: None,
+                    depends_on: Vec::new(),
+                    restart: crate::services::Restart::OnFailure,
+                    docker: None,
+                },
+            });
+        }
+        for stack in &d.compose_stacks {
+            // 顶层 compose 文件才直接采纳；子目录的留给单个项目里点选
+            if stack.file.contains('/') {
+                continue;
+            }
+            let mut files = vec![stack.file.clone()];
+            files.extend(stack.overrides.iter().cloned());
+            candidates.push(ProbeCandidate {
+                kind: "compose".into(),
+                label: stack.file.clone(),
+                spec: ServiceSpec {
+                    name: "docker".into(),
+                    cwd: None,
+                    run: None,
+                    steps: Vec::new(),
+                    env_files: Vec::new(),
+                    env: Default::default(),
+                    ports: crate::services::Ports { listen: None, requires: stack.ports.clone() },
+                    health: None,
+                    depends_on: Vec::new(),
+                    restart: crate::services::Restart::OnFailure,
+                    docker: Some(crate::services::DockerSpec {
+                        files,
+                        project_name: None,
+                        services: stack.services.clone(),
+                    }),
+                },
+            });
+        }
+        out.push(ProbeItem {
+            project_id: row.id,
+            project_name: crate::logic::project_name_of(&base),
+            path: row.path,
+            has_descriptor: crate::descriptor::exists(&base),
+            has_services: !names.is_empty(),
+            candidates,
+        });
+    }
+    out.sort_by(|a, b| a.project_name.cmp(&b.project_name));
+    Ok(out)
+}
+
+/// 从 argv 里取一个**有信息量**的服务名。
+///
+/// 直接取「第一个非 flag 的第二个词」会把 `pnpm run dev` 命名成 `run`、
+/// `cargo run --bin omp-hub` 命名成 `run`——这些名字对用户没有任何区分度。
+/// 规则：跳过子命令动词（`run` / `exec` / `dlx` …），取真正的脚本名或二进制品名；
+/// 仍然无意义时退化为 `app`。
+fn simple_name(argv: &[String]) -> String {
+    const VERBS: &[&str] = &["run", "exec", "dlx", "x"];
+    const DEGENERATE: &[&str] = &["", "run", "start", "index", "main", "app"];
+    // 所有非 flag 的 token（第一个是程序名本身，单独保留作兜底）
+    let tokens: Vec<&String> = argv.iter().filter(|a| !a.starts_with('-')).collect();
+    let mut rest = tokens.iter().skip(1).copied();
+    // 跳过开头的动词（不论是不是包管理器：`cargo run --bin x` 也一样）
+    let mut candidate = rest.next();
+    while matches!(candidate, Some(c) if VERBS.contains(&c.as_str())) {
+        candidate = rest.next();
+    }
+    // 全是动词（`npm start`）时用最后一个 token，最终会退化成 app
+    let raw = match candidate {
+        Some(c) => c.as_str(),
+        None => tokens.last().map(|s| s.as_str()).unwrap_or("app"),
+    };
+    // 去掉目录与扩展名：`src/index.ts` → `index`，`scripts/serve.sh` → `serve`
+    let stem = std::path::Path::new(raw)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| raw.to_string());
+    let cleaned: String = stem
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == ':')
+        .take(24)
+        .collect();
+    if DEGENERATE.contains(&cleaned.as_str()) {
+        "app".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// 批量采纳到**本机层**（数据库）。绝不写仓库文件——批量操作不该让 N 个仓库同时变脏。
+#[tauri::command]
+pub fn adopt_candidates(items: Vec<(i64, ServiceSpec)>) -> Result<Vec<String>, String> {
+    let conn = db::open_db().map_err(|e| e.to_string())?;
+    let mut saved = Vec::new();
+    let mut problems = Vec::new();
+    for (id, spec) in items {
+        let problems_here = spec.validate();
+        if !problems_here.is_empty() {
+            problems.push(format!("{}：{}", spec.name, problems_here.join("；")));
+            continue;
+        }
+        let base = match db::project_path(&conn, id).map_err(|e| e.to_string())? {
+            Some(p) => PathBuf::from(p),
+            None => {
+                problems.push(format!("{}：项目不存在", spec.name));
+                continue;
+            }
+        };
+        if crate::descriptor::exists(&base) {
+            problems.push(format!("{}：该项目已有描述文件，请编辑它", spec.name));
+            continue;
+        }
+        let mut derived = Derived::manual();
+        derived.toolchain = crate::detect::detect(&base).toolchain;
+        db::insert_service(&conn, id, &spec, &derived).map_err(|e| e.to_string())?;
+        saved.push(spec.name);
+    }
+    if !problems.is_empty() && saved.is_empty() {
+        return Err(problems.join("；"));
+    }
+    Ok(saved)
+}
+
+/// 临时运行：不写数据库、不写仓库，直接按给定声明起一个进程。
+///
+/// 这是「先试试它能不能跑起来」的路径——关掉 App 就消失，不留下你从未确认过的配置。
+#[tauri::command]
+pub fn run_adhoc<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    id: i64,
+    spec: ServiceSpec,
+) -> Result<ServiceStatus, String> {
+    let base = existing_project_path(id)?;
+    let problems = spec.validate();
+    if !problems.is_empty() {
+        return Err(problems.join("；"));
+    }
+    if !spec.is_longrun() {
+        return Err("临时运行需要一个 run 命令".to_string());
+    }
+    let resolved = Resolved {
+        project_id: id,
+        base: base.clone(),
+        spec: spec.clone(),
+        derived: Derived { origin: "adhoc".into(), ..Derived::default() },
+        layer: Layer::Db,
+        keep_alive: false,
+        port_offset: 0,
+        override_env_files: Vec::new(),
+    };
+    let sup = supervisor::state(&app);
+    let key = resolved.key();
+    if sup.is_active(&key) {
+        return Err(format!("{} 已在运行", spec.name));
+    }
+    let project_path = base.to_string_lossy().into_owned();
+    let mut taken: HashSet<u16> = sup.statuses().into_iter().filter_map(|s| s.port).collect();
+    let plan = plan::build_plan(&project_path, &resolved, &taken)?;
+    if let Some(p) = plan.spawn.port {
+        taken.insert(p);
+    }
+    sup.clear_logs(&key);
+    let ctx = std::sync::Arc::new(supervisor::Ctx::<R>::new(app.clone()));
+    sup.spawn(ctx, plan.spawn.clone())?;
+    supervisor::Ctx::<R>::new(app.clone()).emit_state(&key);
+    sup.status_of(&key).ok_or_else(|| "状态丢失".to_string())
+}
+
+/// 跟随 compose 日志：接入与服务相同的日志面板，不需要第二套通道。
+///
+/// 同一服务重复调用会**顶掉**旧流（`epoch` 前进，旧读线程自行退出），
+/// 因此不需要前端自己记「我已经开过一条」。
+#[tauri::command]
+pub fn docker_logs<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    id: i64,
+    name: String,
+) -> Result<u64, String> {
+    use tauri::Manager;
+    let (_, items, _) = resolve_all_or_err(id)?;
+    let r = items.iter().find(|i| i.spec.name == name).ok_or_else(|| format!("没有服务 {name}"))?;
+    let spec = r.spec.docker.clone().ok_or_else(|| format!("{name} 不是 docker 服务"))?;
+    let key = supervisor::key_of(id, &name);
+
+    // 先停掉同 key 的旧流，再开新的：否则两条流会往同一个环形缓冲里交错写
+    if let Some(old) = app
+        .state::<DockerLogsRegistry>()
+        .0
+        .lock()
+        .map_err(|_| "日志登记表不可用".to_string())?
+        .remove(&key)
+    {
+        crate::docker::DockerLogs::stop(old);
+    }
+
+    let sup: supervisor::Supervisor = (*supervisor::state(&app)).clone();
+    let sink = std::sync::Arc::new(supervisor::Ctx::<R>::new(app.clone()));
+    let logs = crate::docker::DockerLogs::follow(&sup, sink, &r.base, &spec, id, &name)?;
+    let epoch = logs.epoch();
+    app.state::<DockerLogsRegistry>()
+        .0
+        .lock()
+        .map_err(|_| "日志登记表不可用".to_string())?
+        .insert(key, logs);
+    Ok(epoch)
+}
+
+/// 停止 compose 日志跟随（不影响容器本身）。
+#[tauri::command]
+pub fn docker_logs_stop<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    id: i64,
+    name: String,
+) -> Result<(), String> {
+    use tauri::Manager;
+    let key = supervisor::key_of(id, &name);
+    if let Some(logs) = app
+        .state::<DockerLogsRegistry>()
+        .0
+        .lock()
+        .map_err(|_| "日志登记表不可用".to_string())?
+        .remove(&key)
+    {
+        crate::docker::DockerLogs::stop(logs);
+    }
+    Ok(())
+}
+
+/// 外部监督者（launchd plist / PM2 ecosystem）的只读视图。
+///
+/// 刻意只读：这两套已经在跑，App 若去写 plist 或调 `pm2 start`，会和它们的保活策略
+/// 抢同一个进程。这里只呈现事实，并标出「这条是否已在本 App 里管理」。
+#[derive(Serialize)]
+pub struct ExternalItem {
+    #[serde(flatten)]
+    pub entry: crate::external::ExternalEntry,
+    /// 与本 App 里同名声明不一致时给出说明；一致或无声明为 None。
+    pub drift: Option<crate::external::Drift>,
+}
+
+/// 每次都重新读文件：PM2 的 ecosystem 与 plist 都可能在你手工改过之后变了，
+/// 缓存结果会让面板长期显示过期信息。
+#[tauri::command]
+pub fn external_scan() -> Result<Vec<ExternalItem>, String> {
+    let home = crate::external::home();
+    let mut entries = crate::external::scan(&home);
+    let conn = db::open_db().map_err(|e| e.to_string())?;
+    let mut projects: Vec<(String, Vec<String>)> = Vec::new();
+    // 项目路径 → 服务名 → 该服务的命令，供漂移比对
+    let mut declared: std::collections::HashMap<(String, String), Vec<String>> = Default::default();
+    for row in db::all_projects(&conn).map_err(|e| e.to_string())? {
+        let names = db::service_names(&conn, row.id).map_err(|e| e.to_string())?;
+        if let Ok((items, _)) = plan::resolve_all(&conn, row.id, std::path::Path::new(&row.path)) {
+            for it in items {
+                declared.insert((row.path.clone(), it.spec.name.clone()), it.spec.run_argv());
+            }
+        }
+        projects.push((row.path, names));
+    }
+    crate::external::annotate(&mut entries, &projects);
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let drift = entry.cwd.as_ref().and_then(|cwd| {
+                let cwd = crate::logic::normalize_path(cwd);
+                declared.get(&(cwd, entry.name.clone())).and_then(|cmd| {
+                    crate::external::drift_of(&entry, Some(cmd))
+                })
+            });
+            ExternalItem { entry, drift }
+        })
+        .collect())
+}
+
+/// 在 Finder 里显示一个外部配置文件（只定位，不打开编辑器）。
+#[tauri::command]
+pub fn reveal_file(path: String) -> Result<(), String> {
+    let p = PathBuf::from(&path);
+    if !p.is_file() {
+        return Err(format!("文件不存在：{path}"));
+    }
+    run_command("open", &["-R", &path])
+}
+
 /// 启动 compose 栈（`docker compose up -d`）。
 #[tauri::command]
 pub fn docker_up(id: i64, name: String) -> Result<String, String> {
@@ -1046,3 +1384,36 @@ pub fn adopt_existing<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         supervisor::Sink::state(sink.as_ref(), &st);
     }
 }
+
+#[cfg(test)]
+mod name_tests {
+    use super::simple_name;
+
+    fn v(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn package_manager_verbs_are_skipped() {
+        assert_eq!(simple_name(&v(&["pnpm", "run", "dev"])), "dev");
+        assert_eq!(simple_name(&v(&["pnpm", "dev"])), "dev");
+        assert_eq!(simple_name(&v(&["npm", "start"])), "app");
+        assert_eq!(simple_name(&v(&["bun", "run", "server"])), "server");
+    }
+
+    #[test]
+    fn paths_are_reduced_to_a_stem() {
+        assert_eq!(simple_name(&v(&["node", "src/index.ts"])), "app");
+        assert_eq!(simple_name(&v(&["node", "dist/server.js"])), "server");
+        assert_eq!(simple_name(&v(&["bash", "scripts/serve.sh"])), "serve");
+    }
+
+    #[test]
+    fn flags_never_become_names() {
+        assert_eq!(simple_name(&v(&["cargo", "run", "--bin", "omp-hub"])), "omp-hub");
+    }
+}
+
+/// 正在跟随的 compose 日志流（按服务 key 登记，供停止与清理）。
+#[derive(Default)]
+pub struct DockerLogsRegistry(pub std::sync::Mutex<std::collections::HashMap<String, crate::docker::DockerLogs>>);

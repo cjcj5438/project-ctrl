@@ -48,25 +48,25 @@ export default function SourceSection({ project }: { project: ProjectInfo }) {
 
   return (
     <details
-      className="mt-4 rounded-lg border border-neutral-300 dark:border-neutral-700"
+      className="mt-4 rounded-lg border border-border "
       onToggle={(e) => {
         if (e.currentTarget.open) setOpened(true)
       }}
     >
       <summary className="cursor-pointer px-3 py-2 text-sm font-semibold">
-        源码 <span className="ml-1 font-normal text-neutral-500">{summary}</span>
+        源码 <span className="ml-1 font-normal text-muted">{summary}</span>
       </summary>
-      <div className="border-t border-neutral-300 p-3 dark:border-neutral-700">
-        {error && <div className="mb-2 text-xs text-red-600 dark:text-red-400">{error}</div>}
+      <div className="border-t border-border p-3 ">
+        {error && <div className="mb-2 text-xs text-error ">{error}</div>}
         {!project.has_git ? (
-          <div className="text-sm text-neutral-500">不是 git 仓库。</div>
+          <div className="text-sm text-muted">不是 git 仓库。</div>
         ) : !info ? (
-          <div className="text-sm text-neutral-500">读取中…</div>
+          <div className="text-sm text-muted">读取中…</div>
         ) : !info.is_repo ? (
-          <div className="text-sm text-neutral-500">不是 git 仓库。</div>
+          <div className="text-sm text-muted">不是 git 仓库。</div>
         ) : (
           <>
-            <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-neutral-600 dark:text-neutral-300">
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted ">
               <span>分支：{info.detached ? '（detached HEAD）' : (info.branch ?? '未知')}</span>
               <span>upstream：{info.upstream ?? '无'}</span>
               <span>改动：{info.dirty}</span>
@@ -77,7 +77,7 @@ export default function SourceSection({ project }: { project: ProjectInfo }) {
               <button
                 onClick={() => void act('fetch')}
                 disabled={busy}
-                className="rounded border border-neutral-300 px-2 py-1 disabled:opacity-40 dark:border-neutral-700"
+                className="rounded border border-border px-2 py-1 disabled:opacity-40 "
               >
                 检查更新（fetch）
               </button>
@@ -85,21 +85,21 @@ export default function SourceSection({ project }: { project: ProjectInfo }) {
                 onClick={() => void act('pull')}
                 disabled={busy || !info.can_pull}
                 title={info.can_pull ? '快进合并' : (info.pull_blocked_by ?? '')}
-                className="rounded border border-neutral-300 px-2 py-1 disabled:opacity-40 dark:border-neutral-700"
+                className="rounded border border-border px-2 py-1 disabled:opacity-40 "
               >
                 拉取（pull --ff-only）
               </button>
               {!info.can_pull && info.pull_blocked_by && (
-                <span className="self-center text-neutral-500">不可拉取：{info.pull_blocked_by}</span>
+                <span className="self-center text-muted">不可拉取：{info.pull_blocked_by}</span>
               )}
             </div>
             {out && (
-              <div className="mt-3 overflow-hidden rounded border border-neutral-300 dark:border-neutral-700">
-                <div className="flex items-center gap-2 border-b border-neutral-300 bg-neutral-100 px-2 py-1 dark:border-neutral-700 dark:bg-neutral-800">
+              <div className="mt-3 overflow-hidden rounded border border-border ">
+                <div className="flex items-center gap-2 border-b border-border bg-surface-raised px-2 py-1 ">
                   <span className="font-mono text-[11px] font-semibold">$ {out.title}</span>
                   <button
                     onClick={() => setOut(null)}
-                    className="ml-auto rounded border border-neutral-300 px-2 py-0.5 text-[11px] dark:border-neutral-600"
+                    className="ml-auto rounded border border-border px-2 py-0.5 text-[11px] "
                   >
                     关闭
                   </button>

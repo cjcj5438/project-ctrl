@@ -4,6 +4,7 @@ import { humanSize } from './format'
 import ReadmeSection from './Readme'
 import ServiceSection from './Service'
 import SourceSection from './Source'
+import { IconChevronLeft, IconX } from './icons'
 import { pickDirectory } from './util'
 
 /** 详情页：项目信息 + tag 编辑 + 打开按钮 + README 区域。 */
@@ -89,17 +90,18 @@ export default function DetailView({
   }
 
   return (
-    <div className="min-h-screen bg-neutral-100 text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100">
+    <div className="min-h-screen bg-surface-raised text-fg ">
       <div className="mx-auto max-w-4xl px-6 py-6">
         <button
           onClick={() => guardUnsaved(onBack)}
-          className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+          className="inline-flex items-center gap-1 rounded-lg border border-border px-3 py-1.5 text-sm"
         >
-          ← 返回
+          <IconChevronLeft />
+          返回
         </button>
 
         {error && (
-          <div className="mt-4 rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-800 dark:bg-red-950 dark:text-red-200">
+          <div className="mt-4 rounded-lg border border-error/50 bg-error/10 px-3 py-2 text-sm text-error ">
             {error}
           </div>
         )}
@@ -107,27 +109,27 @@ export default function DetailView({
         <div className="mt-4 flex items-center gap-2">
           <h1 className="text-xl font-bold">{project.name}</h1>
           {project.missing && (
-            <span className="rounded bg-red-100 px-1.5 py-0.5 text-xs text-red-700 dark:bg-red-900 dark:text-red-200">
+            <span className="rounded border border-error/40 bg-error/10 px-1.5 py-0.5 text-xs text-error">
               路径丢失
             </span>
           )}
         </div>
-        <div className="mt-1 break-all text-xs text-neutral-500">{project.path}</div>
-        <div className="mt-1 text-xs text-neutral-500">创建日期：{project.created_date ?? '未知'}</div>
+        <div className="mt-1 break-all text-xs text-muted">{project.path}</div>
+        <div className="mt-1 text-xs text-muted">创建日期：{project.created_date ?? '未知'}</div>
         {!project.missing && (
-          <div className="mt-1 text-xs text-neutral-500">
+          <div className="mt-1 text-xs text-muted">
             大小：{size === undefined ? '计算中…' : size === null ? '—' : humanSize(size)}
           </div>
         )}
 
         {project.missing ? (
           <div className="mt-6 flex gap-2">
-            <button onClick={relink} className="rounded bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-700">
+            <button onClick={relink} className="rounded bg-primary px-3 py-1.5 text-sm text-primary-fg hover:brightness-110">
               重新关联
             </button>
             <button
               onClick={() => guardUnsaved(remove)}
-              className="rounded border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+              className="rounded border border-border px-3 py-1.5 text-sm "
             >
               移除
             </button>
@@ -135,23 +137,28 @@ export default function DetailView({
         ) : (
           <>
             <div className="mt-4">
-              <div className="text-sm font-semibold text-neutral-500">tag</div>
+              <div className="text-sm font-semibold text-muted">tag</div>
               <div className="mt-2 flex flex-wrap items-center gap-1.5">
                 {project.manual_tags.map((t) => (
                   <span
                     key={t}
-                    className="inline-flex items-center gap-1 rounded-full bg-blue-100 px-2 py-0.5 text-xs text-blue-800 dark:bg-blue-900 dark:text-blue-100"
+                    className="inline-flex items-center gap-1 rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-xs text-fg"
                   >
                     {t}
-                    <button onClick={() => removeTag(t)} title="移除 tag" className="opacity-60 hover:opacity-100">
-                      ×
+                    <button
+                      onClick={() => removeTag(t)}
+                      title="移除 tag"
+                      aria-label={`移除 tag ${t}`}
+                      className="opacity-60 transition-opacity hover:opacity-100"
+                    >
+                      <IconX size={12} />
                     </button>
                   </span>
                 ))}
                 {project.auto_tags.map((t) => (
                   <span
                     key={t}
-                    className="rounded-full border border-dashed border-neutral-400 px-2 py-0.5 text-xs text-neutral-500 dark:border-neutral-600 dark:text-neutral-300"
+                    className="rounded-full border border-dashed border-border px-2 py-0.5 text-xs text-muted "
                     title="自动 tag（只读）"
                   >
                     {t}
@@ -164,26 +171,26 @@ export default function DetailView({
                     if (e.key === 'Enter') void addTag()
                   }}
                   placeholder="添加 tag…"
-                  className="w-32 rounded-full border border-neutral-300 bg-white px-2 py-0.5 text-xs outline-none focus:border-blue-500 dark:border-neutral-700 dark:bg-neutral-800"
+                  className="w-32 rounded-full border border-border bg-surface px-2 py-0.5 text-xs focus:border-accent focus:outline-none"
                 />
-                <button onClick={addTag} className="rounded-full border border-neutral-300 px-2 py-0.5 text-xs dark:border-neutral-700">
+                <button onClick={addTag} className="rounded-full border border-border px-2 py-0.5 text-xs ">
                   添加
                 </button>
               </div>
             </div>
 
             <div className="mt-4 flex flex-wrap gap-2 text-xs">
-              <button onClick={() => run(() => api.openInFinder(project.id))} className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700">
+              <button onClick={() => run(() => api.openInFinder(project.id))} className="rounded border border-border px-2 py-1 ">
                 Finder
               </button>
-              <button onClick={() => run(() => api.openInIterm(project.id))} className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700">
+              <button onClick={() => run(() => api.openInIterm(project.id))} className="rounded border border-border px-2 py-1 ">
                 iTerm
               </button>
-              <button onClick={() => run(() => api.openInVscode(project.id))} className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700">
+              <button onClick={() => run(() => api.openInVscode(project.id))} className="rounded border border-border px-2 py-1 ">
                 VS Code
               </button>
               {project.github_url && (
-                <button onClick={() => run(() => api.openGithub(project.id))} className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700">
+                <button onClick={() => run(() => api.openGithub(project.id))} className="rounded border border-border px-2 py-1 ">
                   GitHub
                 </button>
               )}
@@ -191,13 +198,13 @@ export default function DetailView({
                 <>
                   <button
                     onClick={() => void showGit('status')}
-                    className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+                    className="rounded border border-border px-2 py-1 "
                   >
                     git status
                   </button>
                   <button
                     onClick={() => void showGit('log')}
-                    className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+                    className="rounded border border-border px-2 py-1 "
                   >
                     git log
                   </button>
@@ -205,20 +212,20 @@ export default function DetailView({
               )}
               <button
                 onClick={() => guardUnsaved(() => setRemoveOpen(true))}
-                className="ml-auto rounded border border-red-300 px-2 py-1 text-red-700 dark:border-red-800 dark:text-red-300"
+                className="ml-auto rounded border border-error/50 px-2 py-1 text-error "
               >
                 从管理器移除
               </button>
             </div>
 
             {git && (
-              <div className="mt-4 overflow-hidden rounded-lg border border-neutral-300 dark:border-neutral-700">
-                <div className="flex items-center gap-3 border-b border-neutral-300 bg-neutral-100 px-3 py-2 dark:border-neutral-700 dark:bg-neutral-800">
+              <div className="mt-4 overflow-hidden rounded-lg border border-border ">
+                <div className="flex items-center gap-3 border-b border-border bg-surface-raised px-3 py-2 ">
                   <span className="font-mono text-xs font-semibold">$ git {git.kind}</span>
-                  {git.loading && <span className="text-xs text-neutral-500">执行中…</span>}
+                  {git.loading && <span className="text-xs text-muted">执行中…</span>}
                   <button
                     onClick={() => setGit(null)}
-                    className="ml-auto rounded border border-neutral-300 px-2 py-0.5 text-xs dark:border-neutral-600"
+                    className="ml-auto rounded border border-border px-2 py-0.5 text-xs "
                   >
                     关闭
                   </button>
@@ -238,14 +245,14 @@ export default function DetailView({
 
         {removeOpen && (
           <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/40 p-6">
-            <div className="w-full max-w-sm rounded-xl bg-white p-5 dark:bg-neutral-900">
+            <div className="w-full max-w-sm rounded-xl bg-surface p-5 ">
               <h3 className="font-semibold">移除项目</h3>
               <p className="mt-2 text-sm">从管理器移除「{project.name}」？只删记录，不动文件。</p>
               <div className="mt-4 flex justify-end gap-2">
-                <button onClick={() => setRemoveOpen(false)} className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700">
+                <button onClick={() => setRemoveOpen(false)} className="rounded-lg border border-border px-3 py-1.5 text-sm ">
                   取消
                 </button>
-                <button onClick={remove} className="rounded-lg bg-red-600 px-3 py-1.5 text-sm text-white hover:bg-red-700">
+                <button onClick={remove} className="rounded-lg bg-error-solid px-3 py-1.5 text-sm text-white hover:brightness-110">
                   确认
                 </button>
               </div>
@@ -255,11 +262,11 @@ export default function DetailView({
 
         {guard && (
           <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-6">
-            <div className="w-full max-w-sm rounded-xl bg-white p-5 dark:bg-neutral-900">
+            <div className="w-full max-w-sm rounded-xl bg-surface p-5 ">
               <h3 className="font-semibold">放弃未保存的修改？</h3>
               <p className="mt-2 text-sm">README 有未保存的修改，继续将丢失这些修改。</p>
               <div className="mt-4 flex justify-end gap-2">
-                <button onClick={() => setGuard(null)} className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700">
+                <button onClick={() => setGuard(null)} className="rounded-lg border border-border px-3 py-1.5 text-sm ">
                   取消
                 </button>
                 <button
@@ -268,7 +275,7 @@ export default function DetailView({
                     setGuard(null)
                     p()
                   }}
-                  className="rounded-lg bg-red-600 px-3 py-1.5 text-sm text-white hover:bg-red-700"
+                  className="rounded-lg bg-error-solid px-3 py-1.5 text-sm text-white hover:brightness-110"
                 >
                   放弃修改
                 </button>

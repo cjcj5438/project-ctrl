@@ -54,36 +54,36 @@ export default function UpdateBanner() {
   }
 
   return (
-    <div className="sticky top-0 z-40 border-b border-blue-300 bg-blue-50 px-6 py-3 text-sm text-neutral-900 dark:border-blue-800 dark:bg-blue-950 dark:text-neutral-100">
+    <div className="sticky top-0 z-40 border-b border-accent bg-accent/10 px-6 py-3 text-sm text-fg ">
       <div className="mx-auto flex max-w-6xl items-start gap-4">
         <div className="min-w-0 flex-1">
           <div className="font-semibold">发现新版本 v{update.version}</div>
           {update.body && (
-            <p className="mt-1 line-clamp-4 text-xs whitespace-pre-wrap text-neutral-600 dark:text-neutral-300">
+            <p className="mt-1 line-clamp-4 text-xs whitespace-pre-wrap text-muted ">
               {update.body}
             </p>
           )}
           {installing && (
-            <p className="mt-1 text-xs text-blue-700 dark:text-blue-300">
+            <p className="mt-1 text-xs text-info">
               下载中…{percent === null ? '' : ` ${percent}%`}
             </p>
           )}
           {error && (
-            <p className="mt-1 break-all text-xs text-red-700 dark:text-red-300">更新失败：{error}</p>
+            <p className="mt-1 break-all text-xs text-error ">更新失败：{error}</p>
           )}
         </div>
         <div className="flex shrink-0 gap-2">
           <button
             onClick={install}
             disabled={installing}
-            className="rounded-lg bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-700 disabled:opacity-50"
+            className="rounded-lg bg-primary px-3 py-1.5 text-sm text-primary-fg hover:brightness-110 disabled:opacity-50"
           >
             立即更新
           </button>
           <button
             onClick={() => setUpdate(null)}
             disabled={installing}
-            className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm disabled:opacity-50 dark:border-neutral-700"
+            className="rounded-lg border border-border px-3 py-1.5 text-sm disabled:opacity-50 "
           >
             稍后
           </button>

@@ -455,7 +455,7 @@ fn real_project_detect_plan_start_stop() {
 fn adopt_credentials_are_written_on_spawn_and_cleared_on_stop() {
     let _guard = crate::test_support::exclusive_ports();
     let data = tempfile::tempdir().unwrap();
-    std::env::set_var("PROJECT_CTRL_DATA_DIR", data.path());
+    let _data_dir = crate::test_support::ScopedDataDir::new(data.path());
 
     let dir = scratch("adoptcred");
     std::fs::write(dir.join("a.js"), "setInterval(()=>{},1000)\n").unwrap();
@@ -477,7 +477,6 @@ fn adopt_credentials_are_written_on_spawn_and_cleared_on_stop() {
     sup.stop(&key_of(31, "svc"));
     assert!(crate::localstate::read_adopts().is_empty(), "停止后凭据应清掉");
 
-    std::env::remove_var("PROJECT_CTRL_DATA_DIR");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -485,7 +484,7 @@ fn adopt_credentials_are_written_on_spawn_and_cleared_on_stop() {
 #[test]
 fn orphan_without_keep_alive_is_reclaimed_not_adopted() {
     let data = tempfile::tempdir().unwrap();
-    std::env::set_var("PROJECT_CTRL_DATA_DIR", data.path());
+    let _data_dir = crate::test_support::ScopedDataDir::new(data.path());
     let dir = scratch("orphan");
     std::fs::write(dir.join("a.js"), "setInterval(()=>{},1000)\n").unwrap();
 
@@ -536,6 +535,101 @@ fn orphan_without_keep_alive_is_reclaimed_not_adopted() {
     }
     assert!(dead, "孤儿进程应被回收");
 
-    std::env::remove_var("PROJECT_CTRL_DATA_DIR");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 真实 docker：用本机已在运行的 `canboso-my` compose 栈验证 `ps` 解析。
+/// 只读，不启停容器；docker 不可用时跳过。
+#[test]
+fn real_compose_ps_reports_services() {
+    let base = PathBuf::from(std::env::var("HOME").unwrap()).join("my/canboso-my");
+    let file = base.join("docker-compose.yml");
+    if !file.is_file() {
+        eprintln!("跳过：{file:?} 不存在");
+        return;
+    }
+    if crate::execenv::resolve("docker", &crate::execenv::base_path()).is_none() {
+        eprintln!("跳过：没有 docker");
+        return;
+    }
+    let spec = crate::services::DockerSpec {
+        files: vec!["docker-compose.yml".into()],
+        project_name: None,
+        services: vec!["postgres".into()],
+    };
+    let ps = match crate::docker::ps(&base, &spec) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("跳过：docker 不可用（{e}）");
+            return;
+        }
+    };
+    if ps.is_empty() {
+        eprintln!("跳过：容器未运行");
+        return;
+    }
+    let pg = ps.iter().find(|c| c.service == "postgres").expect("应解析出 postgres");
+    assert_eq!(pg.state, "running", "{:?}", pg);
+    assert!(
+        pg.ports.contains("5432"),
+        "PublishedPort 应被解析进 ports：{:?}",
+        pg
+    );
+
+    // 过滤：只要 postgres 时不应返回别的服务
+    let other = crate::services::DockerSpec {
+        files: vec!["docker-compose.yml".into()],
+        project_name: None,
+        services: vec!["nonexistent-svc".into()],
+    };
+    assert!(crate::docker::ps(&base, &other).unwrap().is_empty(), "服务名过滤必须生效");
+}
+
+/// 真实 docker：`logs -f` 必须把 compose 输出写进与服务共用的日志缓冲与事件通道。
+#[test]
+fn real_compose_logs_stream_into_shared_sink() {
+    let base = PathBuf::from(std::env::var("HOME").unwrap()).join("my/canboso-my");
+    if !base.join("docker-compose.yml").is_file() {
+        eprintln!("跳过：compose 文件不存在");
+        return;
+    }
+    if crate::execenv::resolve("docker", &crate::execenv::base_path()).is_none() {
+        eprintln!("跳过：没有 docker");
+        return;
+    }
+    let spec = crate::services::DockerSpec {
+        files: vec!["docker-compose.yml".into()],
+        project_name: None,
+        services: vec!["postgres".into()],
+    };
+    // 容器没跑时 logs 会立刻失败，先确认 ps 能看到它
+    match crate::docker::ps(&base, &spec) {
+        Ok(v) if v.iter().any(|c| c.service == "postgres" && c.state == "running") => {}
+        _ => {
+            eprintln!("跳过：postgres 未运行");
+            return;
+        }
+    }
+
+    let sup = Supervisor::default();
+    let sink = Arc::new(crate::supervisor::Collector::default());
+    let logs = crate::docker::DockerLogs::follow(&sup, sink.clone(), &base, &spec, 91, "db")
+        .expect("应能开始跟随");
+    let key = key_of(91, "db");
+
+    // postgres 启动期日志量足够大，`--tail LOG_CAP` 保证立刻有内容
+    let got = wait_until(Duration::from_secs(25), || !sup.logs_of(&key).is_empty());
+    let lines = sup.logs_of(&key);
+    logs.stop();
+    assert!(got, "应收到 compose 日志；当前 {} 行", lines.len());
+    let joined = lines.join("\n");
+    assert!(
+        joined.to_lowercase().contains("postgres") || joined.contains("database"),
+        "日志内容应来自 postgres 容器：{}",
+        joined.chars().take(400).collect::<String>()
+    );
+    // 事件通道也要有（前端靠它增量追加，不轮询）
+    let events = sink.logs.lock().unwrap();
+    assert!(!events.is_empty(), "应通过 Sink 推送过日志批次");
+    assert!(events.iter().all(|p| p.key == key), "事件必须带正确的服务 key");
 }

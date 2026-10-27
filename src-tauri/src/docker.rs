@@ -115,6 +115,114 @@ pub fn down(cwd: &Path, spec: &DockerSpec) -> Result<String, String> {
     Ok(text(&out))
 }
 
+/// `docker compose logs -f` 的流式读取器。
+///
+/// 复用 supervisor 的 `Sink`（状态 + 日志事件），所以 compose 的输出和普通服务一样
+/// 出现在同一个日志面板里，前端不需要第二套通道。
+///
+/// 返回的句柄被 drop 时不会自动杀进程——由 [`DockerLogs::stop`] 显式停止，
+/// 与「停止服务」的语义保持一致。
+pub struct DockerLogs {
+    child: std::sync::Arc<std::sync::Mutex<std::process::Child>>,
+    /// 本次流的代号：旧流的残留行不会写进新一次运行的日志。
+    epoch: u64,
+}
+
+impl DockerLogs {
+    /// 开始跟随日志。`svc_key` 用与普通服务相同的 `"{project_id}/{name}"`。
+    pub fn follow(
+        sup: &crate::supervisor::Supervisor,
+        sink: std::sync::Arc<dyn crate::supervisor::Sink>,
+        cwd: &Path,
+        spec: &DockerSpec,
+        project_id: i64,
+        name: &str,
+    ) -> Result<Self, String> {
+        let mut args = base_args(spec);
+        args.push("logs".into());
+        args.push("-f".into());
+        args.push("--tail".into());
+        args.push(crate::supervisor::LOG_CAP.to_string());
+        args.push("--no-color".into());
+        args.extend(spec.services.iter().cloned());
+
+        let mut child = Command::new(docker_bin())
+            .args(&args)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("无法执行 docker logs：{e}"))?;
+
+        let svc_key = crate::supervisor::key_of(project_id, name);
+        let epoch = sup.begin_docker_logs(&svc_key);
+        // 先取走管道，再把 Child 本体交给句柄（stop 时 kill）
+        let out = child.stdout.take();
+        let err = child.stderr.take();
+        if let Some(out) = out {
+            Self::pump(sup.clone(), sink.clone(), svc_key.clone(), project_id, name.to_string(), epoch, Box::new(out));
+        }
+        if let Some(err) = err {
+            Self::pump(sup.clone(), sink.clone(), svc_key.clone(), project_id, name.to_string(), epoch, Box::new(err));
+        }
+        Ok(Self { child: std::sync::Arc::new(std::sync::Mutex::new(child)), epoch })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pump(
+        sup: crate::supervisor::Supervisor,
+        sink: std::sync::Arc<dyn crate::supervisor::Sink>,
+        key: String,
+        project_id: i64,
+        name: String,
+        epoch: u64,
+        stream: Box<dyn std::io::Read + Send>,
+    ) {
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(stream);
+            let mut batch: Vec<String> = Vec::new();
+            for line in reader.split(b'\n') {
+                let Ok(bytes) = line else { break };
+                if sup.docker_epoch(&key) != Some(epoch) {
+                    break;
+                }
+                let text = String::from_utf8_lossy(&bytes).trim_end_matches('\r').to_string();
+                sup.push_docker_line(&key, text.clone());
+                batch.push(text);
+                if batch.len() >= crate::supervisor::LOG_BATCH {
+                    sink.log(&crate::supervisor::LogPayload {
+                        key: key.clone(),
+                        project_id,
+                        name: name.clone(),
+                        lines: std::mem::take(&mut batch),
+                    });
+                }
+            }
+            if !batch.is_empty() {
+                sink.log(&crate::supervisor::LogPayload {
+                    key: key.clone(),
+                    project_id,
+                    name: name.clone(),
+                    lines: batch,
+                });
+            }
+        });
+    }
+
+    pub fn stop(self) {
+        if let Ok(mut c) = self.child.lock() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
 /// `docker compose ps --format json`（compose v2 输出 JSON 行）。
 pub fn ps(cwd: &Path, spec: &DockerSpec) -> Result<Vec<ContainerView>, String> {
     let mut args = base_args(spec);

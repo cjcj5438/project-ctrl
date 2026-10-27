@@ -28,6 +28,7 @@ struct Harness {
     _data: std::path::PathBuf,
     _db_guard: std::sync::MutexGuard<'static, ()>,
     _port_guard: std::sync::MutexGuard<'static, ()>,
+    _data_guard: crate::test_support::ScopedDataDir,
 }
 
 impl Harness {
@@ -35,11 +36,20 @@ impl Harness {
         let port_guard = crate::test_support::exclusive_ports();
         let db_guard = DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let data = temp_data_dir(tag);
+        // 同一把锁保证不与 e2e 里改数据目录的测试并行
+        let data_guard = crate::test_support::ScopedDataDir::new(&data);
         let app = crate::test_app();
         let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .expect("webview 应能创建");
-        Self { app, webview, _data: data, _db_guard: db_guard, _port_guard: port_guard }
+        Self {
+            app,
+            webview,
+            _data: data,
+            _db_guard: db_guard,
+            _port_guard: port_guard,
+            _data_guard: data_guard,
+        }
     }
 
     /// 走真实 IPC 调一个命令。
@@ -624,4 +634,168 @@ fn ipc_adopt_roundtrip_after_restart() {
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 外部监督者视图：只读扫 launchd + PM2，并标注是否已被本 App 管理。
+#[test]
+fn ipc_external_scan_is_read_only_and_annotated() {
+    let h = Harness::new("external");
+    let list = h.invoke("external_scan", json!({})).unwrap();
+    let arr = list.as_array().expect("应是数组");
+    // 本机装了 launchd agent，至少应能解析出几条；若环境没有则为空数组（不是错误）
+    for e in arr {
+        assert!(e["source"] == "pm2" || e["source"] == "launchd", "{e}");
+        assert!(e["config_path"].as_str().unwrap_or_default().len() > 0, "{e}");
+        assert!(e["managed_project"].is_null() || e["managed_project"].is_string(), "{e}");
+    }
+
+    // reveal_file 对不存在的路径必须拒绝（不能变成任意路径 open）
+    let err = h
+        .invoke("reveal_file", json!({ "path": "/definitely/not/here.plist" }))
+        .expect_err("应拒绝");
+    assert!(err.to_string().contains("不存在"), "{err}");
+}
+
+/// 批量探测 + 批量采纳 + 临时运行：三条「快速关联」路径的行为契约。
+#[test]
+fn ipc_probe_adopt_and_adhoc_paths() {
+    let h = Harness::new("probe");
+    let dir = std::env::temp_dir().join(format!("pc-ipc-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    sample_service(&dir);
+    let path = dir.to_string_lossy().into_owned();
+    let id = add_project(&h, &path);
+
+    // 1) 批量探测：只读，不写库
+    let probes = h.invoke("probe_all", json!({})).unwrap();
+    let mine = probes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["project_id"] == id)
+        .cloned()
+        .expect("应包含该项目");
+    assert_eq!(mine["has_services"], false);
+    assert_eq!(mine["candidates"][0]["kind"], "script");
+    assert_eq!(mine["candidates"][0]["spec"]["run"], json!(["npm", "run", "dev"]));
+    let ps = h.invoke("project_services", json!({ "id": id })).unwrap();
+    assert_eq!(ps["services"], json!([]), "探测本身不应写库");
+
+    // 2) 批量采纳到本机层
+    let spec = mine["candidates"][0]["spec"].clone();
+    let saved = h
+        .invoke("adopt_candidates", json!({ "items": [[id, spec]] }))
+        .unwrap();
+    assert_eq!(saved, json!([spec["name"].clone()]));
+    let ps = h.invoke("project_services", json!({ "id": id })).unwrap();
+    assert_eq!(ps["services"].as_array().unwrap().len(), 1);
+    assert_eq!(ps["services"][0]["layer"], "db");
+    assert!(!dir.join(".project-ctrl.json").exists(), "批量采纳不得写仓库文件");
+
+    // 3) 临时运行：不写库，直接起进程
+    let adhoc = json!({
+        "name": "adhoc",
+        "run": ["node", "server.js"],
+        "ports": { "listen": 45411 }
+    });
+    let st = h.invoke("run_adhoc", json!({ "id": id, "spec": adhoc })).expect("run_adhoc");
+    assert_eq!(st["phase"], "Running");
+    assert_eq!(st["name"], "adhoc");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut up = false;
+    while std::time::Instant::now() < deadline {
+        if !crate::ports::is_free(45411) {
+            up = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(up, "临时运行也应真的监听端口");
+    // 数据库里并没有它
+    let ps = h.invoke("project_services", json!({ "id": id })).unwrap();
+    assert!(
+        !ps["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["spec"]["name"] == "adhoc"),
+        "临时运行不得落库"
+    );
+    // 但没有 run 声明的不能临时运行
+    let steps_only = json!({ "name": "x", "steps": [{ "name": "a", "argv": ["true"] }] });
+    assert!(h.invoke("run_adhoc", json!({ "id": id, "spec": steps_only })).is_err());
+
+    h.invoke("service_stop", json!({ "id": id, "name": "adhoc" })).ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 外部视图的「同步」语义：每次调用都重读文件，且能报出与声明的命令漂移。
+///
+/// 直接拿本机真实的 launchd 条目做参照：找一条带 cwd 与命令的，把「同名服务 + 不同命令」
+/// 声明进它指向的目录，然后要求扫描结果报出 drift。
+#[test]
+fn ipc_external_scan_reports_drift_and_reloads() {
+    let h = Harness::new("drift");
+    let first = h.invoke("external_scan", json!({})).unwrap();
+    let items = first.as_array().unwrap().clone();
+
+    let Some(sample) = items
+        .iter()
+        .find(|e| e["cwd"].is_string() && e["command"].is_array())
+        .cloned()
+    else {
+        eprintln!("跳过：本机没有带 cwd 与命令的 launchd 条目");
+        return;
+    };
+    let cwd = sample["cwd"].as_str().unwrap().to_string();
+    let name = sample["name"].as_str().unwrap().to_string();
+    if !std::path::Path::new(&cwd).is_dir() {
+        eprintln!("跳过：{cwd} 不存在");
+        return;
+    }
+
+    // 把该目录收进管理器，并声明一个与外部命令不同的同名服务
+    let id = add_project(&h, &cwd);
+    h.invoke(
+        "save_service",
+        json!({ "id": id, "spec": { "name": name, "run": ["node", "totally-different.js"] } }),
+    )
+    .expect("save");
+
+    let second = h.invoke("external_scan", json!({})).unwrap();
+    let hit = second
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == json!(name) && e["source"] == "launchd")
+        .cloned()
+        .expect("同一 label 应仍在结果里");
+    assert_eq!(hit["declared"], true, "同名且 cwd 匹配应标为已声明：{hit}");
+    assert_eq!(hit["drift"]["kind"], "command-mismatch", "{hit}");
+    assert!(
+        hit["drift"]["detail"].as_str().unwrap_or_default().contains("totally-different.js"),
+        "{hit}"
+    );
+
+    // 不缓存：把声明改成与外部一致后，drift 必须消失
+    let external_cmd: Vec<String> = hit["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    h.invoke(
+        "save_service",
+        json!({ "id": id, "spec": { "name": name, "run": external_cmd } }),
+    )
+    .expect("save");
+    let third = h.invoke("external_scan", json!({})).unwrap();
+    let hit2 = third
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == json!(name) && e["source"] == "launchd")
+        .cloned()
+        .unwrap();
+    assert_eq!(hit2["drift"], Value::Null, "一致后不该再报漂移：{hit2}");
 }

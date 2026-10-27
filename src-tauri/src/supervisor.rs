@@ -188,6 +188,8 @@ struct Inner {
     logs: Mutex<HashMap<String, VecDeque<String>>>,
     gen: AtomicU64,
     shutting_down: AtomicBool,
+    /// docker 日志流的代号：新流开始即 +1，旧流的残留行据此丢弃。
+    docker_epochs: Mutex<HashMap<String, u64>>,
 }
 
 /// 进程表 + 日志缓冲 + 代号计数器。`Clone` 共享同一份内部状态，便于交给读线程。
@@ -263,6 +265,25 @@ impl Supervisor {
                 r.note = note;
             }
         }
+    }
+
+    /// 开一个新的 docker 日志流代号（旧流的读线程随后会自行退出）。
+    pub fn begin_docker_logs(&self, key: &str) -> u64 {
+        let mut g = self.inner.docker_epochs.lock().unwrap_or_else(|e| e.into_inner());
+        let next = g.get(key).copied().unwrap_or(0) + 1;
+        g.insert(key.to_string(), next);
+        self.clear_logs(key);
+        next
+    }
+
+    pub fn docker_epoch(&self, key: &str) -> Option<u64> {
+        let g = self.inner.docker_epochs.lock().unwrap_or_else(|e| e.into_inner());
+        g.get(key).copied()
+    }
+
+    /// docker 日志直接进同一个环形缓冲（前端不需要第二套通道）。
+    pub fn push_docker_line(&self, key: &str, line: String) {
+        self.push_line(key, line);
     }
 
     pub fn clear_logs(&self, key: &str) {

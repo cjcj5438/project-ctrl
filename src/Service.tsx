@@ -25,12 +25,12 @@ const PHASE_LABEL: Record<Phase, string> = {
 }
 
 const DOT: Record<Phase, string> = {
-  Idle: 'bg-neutral-400',
-  Step: 'bg-amber-500',
-  Running: 'bg-emerald-500',
-  Stopped: 'bg-neutral-400',
-  Crashed: 'bg-red-500',
-  Failed: 'bg-red-500',
+  Idle: 'bg-muted/50',
+  Step: 'bg-warning',
+  Running: 'bg-success',
+  Stopped: 'bg-muted/50',
+  Crashed: 'bg-error-solid',
+  Failed: 'bg-error-solid',
 }
 
 /** argv 输入框 <-> 数组：空格分隔（含空格的参数请直接编辑描述文件）。 */
@@ -132,7 +132,7 @@ export default function ServiceSection({
 
   return (
     <details
-      className="mt-4 rounded-lg border border-neutral-300 dark:border-neutral-700"
+      className="mt-4 rounded-lg border border-border "
       onToggle={(e) => {
         if (e.currentTarget.open) setOpened(true)
       }}
@@ -147,12 +147,12 @@ export default function ServiceSection({
             aria-hidden
           />
         )}
-        <span className="ml-1 font-normal text-neutral-500">{summary}</span>
+        <span className="ml-1 font-normal text-muted">{summary}</span>
       </summary>
 
-      <div className="border-t border-neutral-300 p-3 dark:border-neutral-700">
+      <div className="border-t border-border p-3 ">
         {data?.descriptor_error && (
-          <div className="mb-3 rounded border border-red-300 bg-red-50 px-2 py-1.5 text-xs text-red-700 dark:border-red-800 dark:bg-red-950 dark:text-red-300">
+          <div className="mb-3 rounded border border-error/50 bg-error/10 px-2 py-1.5 text-xs text-error ">
             <div className="font-semibold">.project-ctrl.json 无法解析，服务不可用</div>
             <div className="mt-0.5 font-mono text-[11px] break-all">{data.descriptor_error}</div>
             <div className="mt-1 text-[11px] opacity-80">
@@ -191,24 +191,24 @@ export default function ServiceSection({
           <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
             <button
               onClick={() => setCreating(true)}
-              className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+              className="rounded border border-border px-2 py-1 "
             >
               添加服务…
             </button>
             <button
               onClick={() => void act('stop-all', async () => void (await api.serviceStopAll(project.id)))}
               disabled={busy !== null || running === 0}
-              className="rounded border border-neutral-300 px-2 py-1 disabled:opacity-40 dark:border-neutral-700"
+              className="rounded border border-border px-2 py-1 disabled:opacity-40 "
             >
               全部停止
             </button>
             <button
               onClick={() => void act('refresh', load)}
-              className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+              className="rounded border border-border px-2 py-1 "
             >
               刷新
             </button>
-            <span className="ml-auto text-[11px] text-neutral-500">
+            <span className="ml-auto text-[11px] text-muted">
               来源：{data.descriptor_exists ? '.project-ctrl.json' : '本机数据库'}
             </span>
           </div>
@@ -311,37 +311,58 @@ function ServiceCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, name])
 
+  // compose 日志：展开且有 docker 时跟随，收起时停止（容器本身不受影响）。
+  // 输出走与服务相同的 svc:log 通道。
+  useEffect(() => {
+    if (!open || !spec.docker) return
+    let alive = true
+    void (async () => {
+      try {
+        const l = await api.serviceLogs(project.id, name)
+        if (alive) setLines(l)
+        await api.dockerLogs(project.id, name)
+      } catch {
+        /* docker 不可用时不打断面板 */
+      }
+    })()
+    return () => {
+      alive = false
+      void api.dockerLogsStop(project.id, name).catch(() => {})
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, spec.docker, project.id, name])
+
   const stepLabel = (s: { name: string }) => s.name
 
   return (
-    <div className="mb-2 rounded border border-neutral-300 last:mb-0 dark:border-neutral-700">
+    <div className="mb-2 rounded border border-border last:mb-0 ">
       <button
         onClick={onToggle}
         aria-expanded={open}
-        className="flex w-full items-center gap-2 px-2 py-1.5 text-left text-xs hover:bg-neutral-50 dark:hover:bg-neutral-800"
+        className="flex w-full items-center gap-2 px-2 py-1.5 text-left text-xs hover:bg-surface-raised "
       >
         <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${line.dot}`} aria-hidden />
         <span className="font-semibold">{name}</span>
-        <span className="text-neutral-500">{line.label}</span>
-        {line.detail && <span className="font-mono text-[11px] text-neutral-500">{line.detail}</span>}
-        {spec.docker && <span className="rounded bg-blue-100 px-1 text-[10px] text-blue-800 dark:bg-blue-900 dark:text-blue-100">docker</span>}
-        <span className="ml-auto font-mono text-[10px] text-neutral-400">{view.layer === 'descriptor' ? '.json' : 'db'}</span>
+        <span className="text-muted">{line.label}</span>
+        {line.detail && <span className="font-mono text-[11px] text-muted">{line.detail}</span>}
+        {spec.docker && <span className="rounded bg-blue-100 px-1 text-[10px] text-fg ">docker</span>}
+        <span className="ml-auto font-mono text-[10px] text-muted">{view.layer === 'descriptor' ? '.json' : 'db'}</span>
       </button>
 
       {open && (
-        <div className="border-t border-neutral-300 p-2 dark:border-neutral-700">
+        <div className="border-t border-border p-2 ">
           {status?.note && (
-            <div className="mb-1 text-[11px] text-amber-700 dark:text-amber-400">{status.note}</div>
+            <div className="mb-1 text-[11px] text-warning ">{status.note}</div>
           )}
           {view.warnings.length > 0 && (
-            <ul className="mb-1 list-inside list-disc text-[11px] text-amber-700 dark:text-amber-400">
+            <ul className="mb-1 list-inside list-disc text-[11px] text-warning ">
               {view.warnings.map((w) => (
                 <li key={w}>{w}</li>
               ))}
             </ul>
           )}
           {problems.length > 0 && (
-            <ul className="mb-1 list-inside list-disc text-[11px] text-red-600 dark:text-red-400">
+            <ul className="mb-1 list-inside list-disc text-[11px] text-error ">
               {problems.map((p) => (
                 <li key={p}>{p}</li>
               ))}
@@ -353,14 +374,14 @@ function ServiceCard({
               onClick={() => void act(`start-${name}`, async () => void (await api.serviceStart(project.id, name)))}
               disabled={busy !== null || isRunning || isStep || problems.length > 0 || !spec.run}
               title={problems[0] ?? (!spec.run ? '该服务没有 run 命令' : '')}
-              className="rounded bg-emerald-600 px-2 py-0.5 text-white disabled:opacity-40"
+              className="rounded bg-success px-2 py-0.5 text-white disabled:opacity-40"
             >
               启动
             </button>
             <button
               onClick={() => void act(`stop-${name}`, async () => void (await api.serviceStop(project.id, name)))}
               disabled={busy !== null || (!isRunning && !isStep)}
-              className="rounded border border-neutral-300 px-2 py-0.5 disabled:opacity-40 dark:border-neutral-700"
+              className="rounded border border-border px-2 py-0.5 disabled:opacity-40 "
             >
               停止
             </button>
@@ -372,14 +393,14 @@ function ServiceCard({
                 })
               }
               disabled={busy !== null || isStep || !spec.run}
-              className="rounded border border-neutral-300 px-2 py-0.5 disabled:opacity-40 dark:border-neutral-700"
+              className="rounded border border-border px-2 py-0.5 disabled:opacity-40 "
             >
               重启
             </button>
             <button
               onClick={() => void act(`url-${name}`, async () => void (await api.openServiceUrl(project.id, name)))}
               disabled={status?.port == null}
-              className="rounded border border-neutral-300 px-2 py-0.5 disabled:opacity-40 dark:border-neutral-700"
+              className="rounded border border-border px-2 py-0.5 disabled:opacity-40 "
             >
               打开
             </button>
@@ -390,7 +411,7 @@ function ServiceCard({
                   void act(`step-${name}-${s.name}`, async () => void (await api.serviceStep(project.id, name, s.name)))
                 }
                 disabled={busy !== null || isRunning || isStep}
-                className="rounded border border-neutral-300 px-2 py-0.5 disabled:opacity-40 dark:border-neutral-700"
+                className="rounded border border-border px-2 py-0.5 disabled:opacity-40 "
               >
                 {stepLabel(s)}
               </button>
@@ -405,7 +426,7 @@ function ServiceCard({
                     })
                   }
                   disabled={busy !== null}
-                  className="rounded bg-blue-600 px-2 py-0.5 text-white disabled:opacity-40"
+                  className="rounded bg-primary px-2 py-0.5 text-white disabled:opacity-40"
                 >
                   compose up
                 </button>
@@ -417,7 +438,7 @@ function ServiceCard({
                     })
                   }
                   disabled={busy !== null}
-                  className="rounded border border-neutral-300 px-2 py-0.5 disabled:opacity-40 dark:border-neutral-700"
+                  className="rounded border border-border px-2 py-0.5 disabled:opacity-40 "
                 >
                   compose down
                 </button>
@@ -425,34 +446,34 @@ function ServiceCard({
             )}
             <button
               onClick={onEdit}
-              className="ml-auto rounded border border-neutral-300 px-2 py-0.5 dark:border-neutral-700"
+              className="ml-auto rounded border border-border px-2 py-0.5 "
             >
               编辑
             </button>
             <button
               onClick={() => void act(`refresh-${name}`, onRefresh)}
-              className="rounded border border-neutral-300 px-2 py-0.5 dark:border-neutral-700"
+              className="rounded border border-border px-2 py-0.5 "
             >
               刷新
             </button>
           </div>
 
           {spec.docker && containers && (
-            <div className="mt-2 overflow-hidden rounded border border-neutral-300 dark:border-neutral-700">
-              <div className="border-b border-neutral-300 bg-neutral-100 px-2 py-1 text-[11px] font-semibold dark:border-neutral-700 dark:bg-neutral-800">
+            <div className="mt-2 overflow-hidden rounded border border-border ">
+              <div className="border-b border-border bg-surface-raised px-2 py-1 text-[11px] font-semibold ">
                 容器 · {spec.docker.files.join(' + ')}
               </div>
               {containers.length === 0 ? (
-                <div className="p-2 text-[11px] text-neutral-500">（没有运行中的容器）</div>
+                <div className="p-2 text-[11px] text-muted">（没有运行中的容器）</div>
               ) : (
                 <table className="w-full text-left text-[11px]">
                   <tbody>
                     {containers.map((c) => (
-                      <tr key={c.name} className="border-b border-neutral-200 last:border-0 dark:border-neutral-800">
+                      <tr key={c.name} className="border-b border-border last:border-0 ">
                         <td className="px-2 py-1 font-mono">{c.service}</td>
                         <td className="px-2 py-1">{c.state}</td>
-                        <td className="px-2 py-1 text-neutral-500">{c.status}</td>
-                        <td className="px-2 py-1 font-mono text-neutral-500">{c.ports}</td>
+                        <td className="px-2 py-1 text-muted">{c.status}</td>
+                        <td className="px-2 py-1 font-mono text-muted">{c.ports}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -463,12 +484,12 @@ function ServiceCard({
 
           <MeOverride project={project} name={name} view={view} onSaved={onRefresh} act={act} />
 
-          <div className="mt-2 overflow-hidden rounded border border-neutral-300 dark:border-neutral-700">
-            <div className="flex items-center gap-2 border-b border-neutral-300 bg-neutral-100 px-2 py-1 dark:border-neutral-700 dark:bg-neutral-800">
+          <div className="mt-2 overflow-hidden rounded border border-border ">
+            <div className="flex items-center gap-2 border-b border-border bg-surface-raised px-2 py-1 ">
               <span className="font-mono text-[11px] font-semibold">日志 · {lines.length} 行</span>
               <button
                 onClick={() => setLines([])}
-                className="ml-auto rounded border border-neutral-300 px-2 py-0.5 text-[11px] dark:border-neutral-600"
+                className="ml-auto rounded border border-border px-2 py-0.5 text-[11px] "
               >
                 清空
               </button>
@@ -522,15 +543,15 @@ function MeOverride({
     })
 
   return (
-    <div className="mt-2 flex flex-wrap items-center gap-2 rounded border border-dashed border-neutral-300 px-2 py-1.5 text-[11px] dark:border-neutral-700">
-      <span className="text-neutral-500">本机</span>
+    <div className="mt-2 flex flex-wrap items-center gap-2 rounded border border-dashed border-border px-2 py-1.5 text-[11px] ">
+      <span className="text-muted">本机</span>
       <label className="inline-flex items-center gap-1">
         端口偏移
         <input
           value={offset}
           onChange={(e) => setOffset(e.target.value.replace(/[^\d]/g, ''))}
           placeholder="0"
-          className="w-14 rounded border border-neutral-300 px-1 py-0.5 font-mono dark:border-neutral-700 dark:bg-neutral-800"
+          className="w-14 rounded border border-border px-1 py-0.5 font-mono "
         />
       </label>
       <label className="inline-flex items-center gap-1">
@@ -540,7 +561,7 @@ function MeOverride({
       <button
         onClick={save}
         disabled={!dirty}
-        className="rounded border border-neutral-300 px-2 py-0.5 disabled:opacity-40 dark:border-neutral-700"
+        className="rounded border border-border px-2 py-0.5 disabled:opacity-40 "
       >
         保存
       </button>
@@ -595,12 +616,12 @@ function DetectPanel({
 
   return (
     <div>
-      <div className="text-sm text-neutral-500">
+      <div className="text-sm text-muted">
         该项目还没有服务声明。下面是从文件里探测到的候选——点「保存」只写本机数据库，不会动你的仓库。
       </div>
 
       {detected.problems.length > 0 && (
-        <ul className="mt-2 list-inside list-disc text-xs text-neutral-500">
+        <ul className="mt-2 list-inside list-disc text-xs text-muted">
           {detected.problems.map((p) => (
             <li key={p}>{p}</li>
           ))}
@@ -609,16 +630,16 @@ function DetectPanel({
 
       {detected.start_candidates.length > 0 && (
         <div className="mt-2 space-y-1.5">
-          <div className="text-[11px] font-semibold text-neutral-500">package.json 脚本</div>
+          <div className="text-[11px] font-semibold text-muted">package.json 脚本</div>
           {detected.start_candidates.map((c) => (
             <div key={c.join(' ')} className="flex items-center gap-2">
-              <code className="rounded bg-neutral-100 px-1.5 py-0.5 font-mono text-[11px] dark:bg-neutral-800">
+              <code className="rounded bg-surface-raised px-1.5 py-0.5 font-mono text-[11px] ">
                 {c.join(' ')}
               </code>
               <button
                 onClick={() => void saveCandidate(c)}
                 disabled={busy !== null}
-                className="rounded border border-neutral-300 px-2 py-0.5 text-xs disabled:opacity-40 dark:border-neutral-700"
+                className="rounded border border-border px-2 py-0.5 text-xs disabled:opacity-40 "
               >
                 保存
               </button>
@@ -629,17 +650,17 @@ function DetectPanel({
 
       {compose.length > 0 && (
         <div className="mt-2 space-y-1.5">
-          <div className="text-[11px] font-semibold text-neutral-500">docker compose</div>
+          <div className="text-[11px] font-semibold text-muted">docker compose</div>
           {compose.map((s) => (
             <div key={s.file} className="flex flex-wrap items-center gap-2">
-              <code className="rounded bg-neutral-100 px-1.5 py-0.5 font-mono text-[11px] dark:bg-neutral-800">
+              <code className="rounded bg-surface-raised px-1.5 py-0.5 font-mono text-[11px] ">
                 {s.file}
               </code>
-              <span className="text-[11px] text-neutral-500">{s.services.join(', ')}</span>
+              <span className="text-[11px] text-muted">{s.services.join(', ')}</span>
               <button
                 onClick={() => void saveCompose(s)}
                 disabled={busy !== null}
-                className="rounded border border-neutral-300 px-2 py-0.5 text-xs disabled:opacity-40 dark:border-neutral-700"
+                className="rounded border border-border px-2 py-0.5 text-xs disabled:opacity-40 "
               >
                 保存
               </button>
@@ -649,12 +670,12 @@ function DetectPanel({
       )}
 
       {detected.make_targets.length > 0 && (
-        <div className="mt-2 text-[11px] text-neutral-500">
+        <div className="mt-2 text-[11px] text-muted">
           Makefile 目标：<span className="font-mono">{detected.make_targets.join(' ')}</span>
         </div>
       )}
       {detected.script_candidates.length > 0 && (
-        <div className="mt-1 text-[11px] text-neutral-500">
+        <div className="mt-1 text-[11px] text-muted">
           脚本：<span className="font-mono">{detected.script_candidates.join(' ')}</span>
         </div>
       )}
@@ -664,7 +685,7 @@ function DetectPanel({
           value={input}
           onChange={(e) => setInput(e.target.value)}
           placeholder="手工输入启动命令，例如 pnpm dev"
-          className="w-64 rounded border border-neutral-300 px-2 py-1 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-800"
+          className="w-64 rounded border border-border px-2 py-1 font-mono text-xs "
         />
         <button
           onClick={() =>
@@ -674,7 +695,7 @@ function DetectPanel({
             })
           }
           disabled={busy !== null || splitArgv(input).length === 0}
-          className="rounded bg-blue-600 px-2 py-1 text-xs text-white disabled:opacity-40"
+          className="rounded bg-primary px-2 py-1 text-xs text-white disabled:opacity-40"
         >
           保存
         </button>
@@ -685,7 +706,7 @@ function DetectPanel({
             void text
           })}
           title="把已有服务写进仓库内的 .project-ctrl.json"
-          className="ml-auto rounded border border-neutral-300 px-2 py-1 text-xs dark:border-neutral-700"
+          className="ml-auto rounded border border-border px-2 py-1 text-xs "
         >
           固化为仓库声明…
         </button>
@@ -739,7 +760,7 @@ function EditForm({
   const canSave = name.trim() !== '' && !dup && (splitArgv(run).length > 0 || splitArgv(steps).length > 0 || dockerFiles.trim() !== '')
 
   const input =
-    'w-full rounded border border-neutral-300 bg-white px-2 py-1 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-800'
+    'w-full rounded border border-border bg-surface px-2 py-1 font-mono text-xs  '
 
   const save = () => {
     const parsedSteps = steps
@@ -786,10 +807,10 @@ function EditForm({
     onSave(spec)
   }
 
-  const label = 'block text-[11px] text-neutral-500'
+  const label = 'block text-[11px] text-muted'
 
   return (
-    <div className="mt-3 rounded border border-neutral-300 p-3 dark:border-neutral-700">
+    <div className="mt-3 rounded border border-border p-3 ">
       <div className="text-xs font-semibold">{isEdit ? `编辑 ${initial?.name}` : '添加服务'}</div>
       <div className="mt-2 space-y-2">
         <div className="flex gap-2">
@@ -807,7 +828,7 @@ function EditForm({
             <input value={cwd} onChange={(e) => setCwd(e.target.value)} placeholder="frontend" className={input} />
           </label>
         </div>
-        {dup && <div className="text-[11px] text-red-600">已存在同名服务：{name}</div>}
+        {dup && <div className="text-[11px] text-error">已存在同名服务：{name}</div>}
 
         <label className="block">
           <span className={label}>启动命令（空格分隔参数）</span>
@@ -881,13 +902,13 @@ function EditForm({
       </div>
 
       <div className="mt-3 flex justify-end gap-2 text-xs">
-        <button onClick={onCancel} className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700">
+        <button onClick={onCancel} className="rounded border border-border px-2 py-1 ">
           取消
         </button>
         <button
           onClick={save}
           disabled={!canSave}
-          className="rounded bg-blue-600 px-2 py-1 text-white disabled:opacity-40"
+          className="rounded bg-primary px-2 py-1 text-white disabled:opacity-40"
         >
           保存
         </button>
