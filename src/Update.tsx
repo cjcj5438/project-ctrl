@@ -54,12 +54,12 @@ export default function UpdateBanner() {
   }
 
   return (
-    <div className="sticky top-0 z-40 border-b border-accent bg-accent/10 px-6 py-3 text-sm text-fg ">
+    <div className="sticky top-0 z-40 border-b border-primary bg-primary/10 px-6 py-3 text-sm text-fg ">
       <div className="mx-auto flex max-w-6xl items-start gap-4">
         <div className="min-w-0 flex-1">
           <div className="font-semibold">发现新版本 v{update.version}</div>
           {update.body && (
-            <p className="mt-1 line-clamp-4 text-xs whitespace-pre-wrap text-muted ">
+            <p className="mt-1 line-clamp-4 text-xs break-words whitespace-pre-wrap text-muted ">
               {update.body}
             </p>
           )}
@@ -74,13 +74,15 @@ export default function UpdateBanner() {
         </div>
         <div className="flex shrink-0 gap-2">
           <button
+            type="button"
             onClick={install}
             disabled={installing}
-            className="rounded-lg bg-primary px-3 py-1.5 text-sm text-primary-fg hover:brightness-110 disabled:opacity-50"
+            className="rounded-lg bg-primary px-3 py-1.5 text-sm text-primary-fg hover:brightness-95 disabled:opacity-50"
           >
             立即更新
           </button>
           <button
+            type="button"
             onClick={() => setUpdate(null)}
             disabled={installing}
             className="rounded-lg border border-border px-3 py-1.5 text-sm disabled:opacity-50 "

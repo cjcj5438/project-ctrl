@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, errorText, type ProjectInfo } from './api'
 import { humanSize } from './format'
 import ReadmeSection from './Readme'
@@ -28,6 +28,15 @@ export default function DetailView({
   const [tagInput, setTagInput] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [git, setGit] = useState<{ kind: 'status' | 'log'; loading: boolean; text: string } | null>(null)
+  const aliveRef = useRef(true)
+  const gitReq = useRef(0)
+
+  useEffect(() => {
+    aliveRef.current = true
+    return () => {
+      aliveRef.current = false
+    }
+  }, [])
 
   const onDirtyChange = useCallback((d: boolean) => setReadmeDirty(d), [])
   const onError = useCallback((m: string | null) => setError(m), [])
@@ -76,17 +85,20 @@ export default function DetailView({
   const remove = async () => {
     await run(async () => {
       await api.removeProject(project.id)
-      onRemoved()
+      // removeProject 成功后父组件会卸载本页：守卫住后续 setState
+      if (aliveRef.current) onRemoved()
     })
   }
 
   const showGit = async (kind: 'status' | 'log') => {
+    const req = ++gitReq.current
     setGit({ kind, loading: true, text: '' })
     try {
       const r = await api.runGit(project.id, kind)
-      setGit({ kind, loading: false, text: r.text })
+      // 后发先至：旧请求的结果丢弃，不覆盖新 kind 的面板
+      if (aliveRef.current && req === gitReq.current) setGit({ kind, loading: false, text: r.text })
     } catch (e) {
-      setGit({ kind, loading: false, text: errorText(e) })
+      if (aliveRef.current && req === gitReq.current) setGit({ kind, loading: false, text: errorText(e) })
     }
   }
 
@@ -94,6 +106,7 @@ export default function DetailView({
     <div className="min-h-screen bg-surface-raised text-fg ">
       <div className="mx-auto max-w-4xl px-6 py-6">
         <button
+          type="button"
           onClick={() => guardUnsaved(onBack)}
           className="inline-flex items-center gap-1 rounded-lg border border-border px-3 py-1.5 text-sm"
         >
@@ -121,10 +134,11 @@ export default function DetailView({
 
         {project.missing ? (
           <div className="mt-6 flex gap-2">
-            <button onClick={relink} className="rounded bg-primary px-3 py-1.5 text-sm text-primary-fg hover:brightness-110">
+            <button type="button" onClick={relink} className="rounded bg-primary px-3 py-1.5 text-sm text-primary-fg hover:brightness-95">
               重新关联
             </button>
             <button
+              type="button"
               onClick={() => guardUnsaved(remove)}
               className="rounded border border-border px-3 py-1.5 text-sm "
             >
@@ -139,10 +153,11 @@ export default function DetailView({
                 {project.manual_tags.map((t) => (
                   <span
                     key={t}
-                    className="inline-flex items-center gap-1 rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-xs text-fg"
+                    className="inline-flex items-center gap-1 rounded-full border border-success/40 bg-success/10 px-2 py-0.5 text-xs text-fg"
                   >
                     {t}
                     <button
+                      type="button"
                       onClick={() => removeTag(t)}
                       title="移除 tag"
                       aria-label={`移除 tag ${t}`}
@@ -170,38 +185,40 @@ export default function DetailView({
                     if (e.key === 'Enter') void addTag()
                   }}
                   placeholder="添加 tag…"
-                  className="w-32 rounded-full border border-border bg-surface px-2 py-0.5 text-xs focus:border-accent"
+                  className="w-32 rounded-full border border-border bg-surface px-2 py-0.5 text-xs focus:border-primary"
                 />
-                <button onClick={addTag} className="rounded-full border border-border px-2 py-0.5 text-xs ">
+                <button type="button" onClick={addTag} className="rounded-full border border-border px-2 py-0.5 text-xs ">
                   添加
                 </button>
               </div>
             </div>
 
             <div className="mt-4 flex flex-wrap gap-2 text-xs">
-              <button onClick={() => run(() => api.openInFinder(project.id))} className="rounded border border-border px-2 py-1 ">
+              <button type="button" onClick={() => run(() => api.openInFinder(project.id))} className="rounded border border-border px-2 py-1 ">
                 Finder
               </button>
-              <button onClick={() => run(() => api.openInIterm(project.id))} className="rounded border border-border px-2 py-1 ">
+              <button type="button" onClick={() => run(() => api.openInIterm(project.id))} className="rounded border border-border px-2 py-1 ">
                 iTerm
               </button>
-              <button onClick={() => run(() => api.openInVscode(project.id))} className="rounded border border-border px-2 py-1 ">
+              <button type="button" onClick={() => run(() => api.openInVscode(project.id))} className="rounded border border-border px-2 py-1 ">
                 VS Code
               </button>
               {project.github_url && (
-                <button onClick={() => run(() => api.openGithub(project.id))} className="rounded border border-border px-2 py-1 ">
+                <button type="button" onClick={() => run(() => api.openGithub(project.id))} className="rounded border border-border px-2 py-1 ">
                   GitHub
                 </button>
               )}
               {project.has_git && (
                 <>
                   <button
+                    type="button"
                     onClick={() => void showGit('status')}
                     className="rounded border border-border px-2 py-1 "
                   >
                     git status
                   </button>
                   <button
+                    type="button"
                     onClick={() => void showGit('log')}
                     className="rounded border border-border px-2 py-1 "
                   >
@@ -210,6 +227,7 @@ export default function DetailView({
                 </>
               )}
               <button
+                type="button"
                 onClick={() => guardUnsaved(() => setRemoveOpen(true))}
                 className="ml-auto rounded border border-error/50 px-2 py-1 text-error "
               >
@@ -223,6 +241,7 @@ export default function DetailView({
                   <span className="font-mono text-xs font-semibold">$ git {git.kind}</span>
                   {git.loading && <span className="text-xs text-muted">执行中…</span>}
                   <button
+                    type="button"
                     onClick={() => setGit(null)}
                     className="ml-auto rounded border border-border px-2 py-0.5 text-xs "
                   >
@@ -243,15 +262,15 @@ export default function DetailView({
         )}
 
         {removeOpen && (
-          <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/40 p-6">
+          <div className="fixed inset-0 z-30 flex items-center justify-center bg-scrim p-6">
             <div className="w-full max-w-sm rounded-xl bg-surface p-5 ">
               <h3 className="font-semibold">移除项目</h3>
               <p className="mt-2 text-sm">从管理器移除「{project.name}」？只删记录，不动文件。</p>
               <div className="mt-4 flex justify-end gap-2">
-                <button onClick={() => setRemoveOpen(false)} className="rounded-lg border border-border px-3 py-1.5 text-sm ">
+                <button type="button" onClick={() => setRemoveOpen(false)} className="rounded-lg border border-border px-3 py-1.5 text-sm ">
                   取消
                 </button>
-                <button onClick={remove} className="rounded-lg bg-error-solid px-3 py-1.5 text-sm text-white hover:brightness-110">
+                <button type="button" onClick={remove} className="rounded-lg bg-error-solid px-3 py-1.5 text-sm text-on-solid hover:brightness-95">
                   确认
                 </button>
               </div>
@@ -260,21 +279,22 @@ export default function DetailView({
         )}
 
         {guard && (
-          <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-6">
+          <div className="fixed inset-0 z-40 flex items-center justify-center bg-scrim p-6">
             <div className="w-full max-w-sm rounded-xl bg-surface p-5 ">
               <h3 className="font-semibold">放弃未保存的修改？</h3>
               <p className="mt-2 text-sm">README 有未保存的修改，继续将丢失这些修改。</p>
               <div className="mt-4 flex justify-end gap-2">
-                <button onClick={() => setGuard(null)} className="rounded-lg border border-border px-3 py-1.5 text-sm ">
+                <button type="button" onClick={() => setGuard(null)} className="rounded-lg border border-border px-3 py-1.5 text-sm ">
                   取消
                 </button>
                 <button
+                  type="button"
                   onClick={() => {
                     const p = guard
                     setGuard(null)
                     p()
                   }}
-                  className="rounded-lg bg-error-solid px-3 py-1.5 text-sm text-white hover:brightness-110"
+                  className="rounded-lg bg-error-solid px-3 py-1.5 text-sm text-on-solid hover:brightness-95"
                 >
                   放弃修改
                 </button>

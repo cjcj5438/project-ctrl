@@ -50,7 +50,8 @@ function MarkdownView({ id, markdown: md }: { id: number; markdown: string }) {
     if (!anchor) return
     e.preventDefault()
     const href = anchor.getAttribute('href') ?? ''
-    if (EXTERNAL_LINK.test(href)) api.openExternal(href).catch(() => {})
+    // 外链打开失败必须可见：用户点了却没反应是最糟的体验
+    if (EXTERNAL_LINK.test(href)) api.openExternal(href).catch((err) => console.warn('打开外链失败', href, errorText(err)))
   }
 
   return <div ref={ref} className="md-body" onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />
@@ -73,21 +74,23 @@ function Confirm({
   onCancel: () => void
 }) {
   return (
-    <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/40 p-6">
+    <div className="fixed inset-0 z-30 flex items-center justify-center bg-scrim p-6">
       <div className="w-full max-w-sm rounded-xl bg-surface p-5 ">
         <h3 className="font-semibold">{title}</h3>
         <div className="mt-2 text-sm">{children}</div>
         <div className="mt-4 flex justify-end gap-2">
           <button
+            type="button"
             onClick={onCancel}
             className="rounded-lg border border-border px-3 py-1.5 text-sm "
           >
             取消
           </button>
           <button
+            type="button"
             onClick={onConfirm}
-            className={`rounded-lg px-3 py-1.5 text-sm hover:brightness-110 ${
-              danger ? 'bg-error-solid text-white' : 'bg-primary text-primary-fg'
+            className={`rounded-lg px-3 py-1.5 text-sm hover:brightness-95 ${
+              danger ? 'bg-error-solid text-on-solid' : 'bg-primary text-primary-fg'
             }`}
           >
             {confirmText}
@@ -140,7 +143,9 @@ export default function ReadmeSection({
       .then((r) => {
         if (alive) apply(r)
       })
-      .catch((e) => onError(errorText(e)))
+      .catch((e) => {
+        if (alive) onError(errorText(e))
+      })
       .finally(() => {
         if (alive) setLoading(false)
       })
@@ -263,14 +268,16 @@ export default function ReadmeSection({
             {dirty && <span className="text-xs text-warning">●未保存</span>}
             <div className="ml-auto flex gap-2">
               <button
+                type="button"
                 onClick={requestExitEdit}
                 className="rounded border border-border px-2 py-1 text-xs "
               >
                 取消编辑
               </button>
               <button
+                type="button"
                 onClick={() => void save()}
-                className="rounded bg-primary px-3 py-1 text-xs text-primary-fg hover:brightness-110"
+                className="rounded bg-primary px-3 py-1 text-xs text-primary-fg hover:brightness-95"
               >
                 保存
               </button>
@@ -279,6 +286,7 @@ export default function ReadmeSection({
         )}
         {!editing && info?.exists && (
           <button
+            type="button"
             onClick={startEdit}
             className="ml-auto rounded border border-border px-2 py-1 text-xs "
           >
@@ -291,8 +299,9 @@ export default function ReadmeSection({
         <div className="mt-3 rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted ">
           <p>暂无 README</p>
           <button
+            type="button"
             onClick={generate}
-            className="mt-3 rounded bg-primary px-3 py-1.5 text-sm text-primary-fg hover:brightness-110"
+            className="mt-3 rounded bg-primary px-3 py-1.5 text-sm text-primary-fg hover:brightness-95"
           >
             生成
           </button>
@@ -321,6 +330,7 @@ export default function ReadmeSection({
           <p>文件在你编辑期间被外部修改了。请选择处理方式（不会静默覆盖）。</p>
           <div className="mt-3 flex flex-col gap-2">
             <button
+              type="button"
               onClick={() => void reloadFromDisk()}
               className="rounded border border-border px-3 py-1.5 text-sm "
             >

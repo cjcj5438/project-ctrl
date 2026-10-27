@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, errorText, type GitResult, type ProjectInfo, type SourceInfo } from './api'
 
 /** 源码更新面板：分支 / 落后 / 改动 + fetch / pull。折叠时只显示一行摘要。 */
@@ -8,13 +8,23 @@ export default function SourceSection({ project }: { project: ProjectInfo }) {
   const [out, setOut] = useState<{ title: string; result: GitResult } | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const aliveRef = useRef(true)
+
+  useEffect(() => {
+    aliveRef.current = true
+    return () => {
+      aliveRef.current = false
+    }
+  }, [])
 
   const reload = useCallback(async () => {
     try {
-      setInfo(await api.sourceInfo(project.id))
+      const next = await api.sourceInfo(project.id)
+      if (!aliveRef.current) return
+      setInfo(next)
       setError(null)
     } catch (e) {
-      setError(errorText(e))
+      if (aliveRef.current) setError(errorText(e))
     }
   }, [project.id])
 
@@ -27,12 +37,13 @@ export default function SourceSection({ project }: { project: ProjectInfo }) {
     setBusy(true)
     try {
       const result = kind === 'fetch' ? await api.sourceFetch(project.id) : await api.sourcePull(project.id)
+      if (!aliveRef.current) return
       setOut({ title: `git ${kind}${kind === 'pull' ? ' --ff-only' : ''}`, result })
       await reload()
     } catch (e) {
-      setError(errorText(e))
+      if (aliveRef.current) setError(errorText(e))
     } finally {
-      setBusy(false)
+      if (aliveRef.current) setBusy(false)
     }
   }
 
@@ -75,6 +86,7 @@ export default function SourceSection({ project }: { project: ProjectInfo }) {
             </div>
             <div className="mt-3 flex flex-wrap gap-2 text-xs">
               <button
+                type="button"
                 onClick={() => void act('fetch')}
                 disabled={busy}
                 className="rounded border border-border px-2 py-1 disabled:opacity-40 "
@@ -82,6 +94,7 @@ export default function SourceSection({ project }: { project: ProjectInfo }) {
                 检查更新（fetch）
               </button>
               <button
+                type="button"
                 onClick={() => void act('pull')}
                 disabled={busy || !info.can_pull}
                 title={info.can_pull ? '快进合并' : (info.pull_blocked_by ?? '')}
@@ -98,6 +111,7 @@ export default function SourceSection({ project }: { project: ProjectInfo }) {
                 <div className="flex items-center gap-2 border-b border-border bg-surface-raised px-2 py-1 ">
                   <span className="font-mono text-[11px] font-semibold">$ {out.title}</span>
                   <button
+                    type="button"
                     onClick={() => setOut(null)}
                     className="ml-auto rounded border border-border px-2 py-0.5 text-[11px] "
                   >
