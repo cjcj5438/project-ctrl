@@ -461,6 +461,7 @@ URL 才不会每次顺延都变一次。
 - 运行状态本身只在内存里；只有勾了「退出后保留进程」（`keep_alive`）的服务会在重启后被接管（见第 8 节）
 - 有 `services` 的 compose 服务按 `stop <services>` 停止（容器保留，可 `up` 恢复）；无 `services` 的整栈 `down`
 - 容器不提升为独立服务：compose 里的子容器只能随栈启停，或在面板里只读查看（含已停止容器）
+- docker-only 服务不进进程表：详情页可显示 Running，但列表页运维条/徽章/服务视图只认 `svc:state` 事件，docker-only 永不出现——这是有意的（轮询所有项目 `docker ps` 成本不可接受）；它的「停止」只停日志跟随不停容器，要停容器请用 `compose down`
 - 创建日期读目录 birthtime（`YYYY-MM-DD`，本机时区），目录被拷贝 / 备份恢复后会变；读不到时显示"未知"
 - `.git` 为文件时（linked worktree / submodule）只标 `git`，不做 GitHub 识别；`status`/`log` 照常可用
 - UDP 端口不在占用判定范围内；`listen: 0` 会直接启动失败（不会分配随机端口）
