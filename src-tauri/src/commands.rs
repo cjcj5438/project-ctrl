@@ -1634,6 +1634,7 @@ mod name_tests {
                 started_at: 1,
                 port: None,
                 keep_alive: keep,
+                spawn_cmd: None,
             }
         }
         let live = vec![rec("1/a", 1, "a", true), rec("1/b", 1, "b", false)];
@@ -1740,6 +1741,7 @@ mod name_tests {
             started_at: 1,
             port: None,
             keep_alive: false,
+            spawn_cmd: None,
         };
         let keep: HashSet<String> = ["1/a".to_string()].into_iter().collect();
         let empty: HashSet<String> = HashSet::new();

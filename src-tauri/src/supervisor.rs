@@ -162,6 +162,11 @@ struct Run {
     note: Option<String>,
     restarts: u32,
     started_at: i64,
+    /// spawn/收养后对该 pid 的实际命令行快照（exec 解析后形态）。
+    /// 比对收养时优先用它：`sh run.sh` 这类经 shell exec 优化变成 python 的，
+    /// 计划 argv 永远对不上 ps 看到的实际命令（E2E 第二轮实锤）。
+    /// 收养重验（watch_adopted）同样用它，否则收养成功 30s 后会被重验判死。
+    spawn_cmd: Option<Vec<String>>,
 }
 
 impl Run {
@@ -336,6 +341,9 @@ impl Supervisor {
         let pid = child.id();
         // #17：一次采样共用——Run.started_at 与凭据必须一致，否则记录与状态对不上。
         let started_at = now_secs();
+        // 实际命令行快照（exec 解析后形态）：exec 型服务收养比对的真相来源。
+        // 稳定即返（通常 ~40ms），失败回退 None（verify 走旧比对）。
+        let spawn_cmd = snapshot_stable_cmd(pid);
         let gen = {
             let mut g = self.lock_runs();
             let gen = self.next_gen();
@@ -353,17 +361,25 @@ impl Supervisor {
                     restarts: 0,
                     started_at,
                     spec: spec.clone(),
+                    spawn_cmd: spawn_cmd.clone(),
                 },
             );
             gen
         };
         self.attach(sink, spec.clone(), gen, child);
         // 立刻登记凭据：App 被强杀/崩溃时没有任何退出钩子，只能靠这份记录在下次启动清理孤儿。
-        self.register(&spec, pid, pid as i32, started_at);
+        self.register(&spec, pid, pid as i32, started_at, spawn_cmd);
         Ok(pid)
     }
 
-    fn register(&self, spec: &SpawnSpec, pid: u32, pgid: i32, started_at: i64) {
+    fn register(
+        &self,
+        spec: &SpawnSpec,
+        pid: u32,
+        pgid: i32,
+        started_at: i64,
+        spawn_cmd: Option<Vec<String>>,
+    ) {
         let rec = AdoptRecord {
             key: spec.key.clone(),
             project_id: spec.project_id,
@@ -375,6 +391,7 @@ impl Supervisor {
             started_at,
             port: spec.port,
             keep_alive: spec.keep_alive,
+            spawn_cmd,
         };
         if let Err(e) = crate::localstate::write_adopt(&rec) {
             eprintln!("supervisor: 写入收养凭据 {} 失败：{e}", spec.key);
@@ -422,6 +439,8 @@ impl Supervisor {
             eprintln!("supervisor: 收养时取 pgid 失败，回退为 pid={pid}：{e}");
             pid as i32
         });
+        // 收养时同样快照实际命令行：旧凭据可能没有 spawn_cmd，补上后下次收养用快照比对。
+        let spawn_cmd = snapshot_stable_cmd(pid);
         let gen = {
             let mut g = self.lock_runs();
             let gen = self.next_gen();
@@ -439,13 +458,14 @@ impl Supervisor {
                     restarts: 0,
                     started_at,
                     spec: spec.clone(),
+                    spawn_cmd: spawn_cmd.clone(),
                 },
             );
             gen
         };
-        self.register(&spec, pid, pgid, started_at);
+        self.register(&spec, pid, pgid, started_at, spawn_cmd.clone());
         // 收养的进程看不到它的 stdout（管道已随上个进程退出而失效），只能盯退出。
-        Self::watch_adopted(self.clone(), sink, spec.clone(), gen, pid, started_at);
+        Self::watch_adopted(self.clone(), sink, spec.clone(), gen, pid, started_at, spawn_cmd);
         Ok(self.status_of(&spec.key).expect("刚插入的状态必须存在"))
     }
 
@@ -573,6 +593,7 @@ impl Supervisor {
             let pid = child.id();
             // #17 同构：一次采样共用。
             let started_at = now_secs();
+            let spawn_cmd = snapshot_stable_cmd(pid);
             let new_gen = {
                 let mut g = sup.lock_runs();
                 let Some(r) = g.get_mut(&spec.key) else { return };
@@ -589,10 +610,11 @@ impl Supervisor {
                 r.step = None;
                 r.exit_code = None;
                 r.started_at = started_at;
+                r.spawn_cmd = spawn_cmd.clone();
                 r.gen = sup.inner.gen.fetch_add(1, Ordering::SeqCst) + 1;
                 r.gen
             };
-            sup.register(&spec, pid, pid as i32, started_at);
+            sup.register(&spec, pid, pid as i32, started_at, spawn_cmd);
             if let Some(st) = sup.status_of(&spec.key) {
                 sink.state(&st);
             }
@@ -610,6 +632,7 @@ impl Supervisor {
         gen: u64,
         pid: u32,
         started_at: i64,
+        spawn_cmd: Option<Vec<String>>,
     ) {
         std::thread::spawn(move || {
             let mut rounds: u32 = 0;
@@ -628,7 +651,7 @@ impl Supervisor {
                 rounds += 1;
                 if rounds.is_multiple_of(15) {
                     let snap = ps_snapshot(pid);
-                    if !adopt_still_valid(&spec.argv, started_at, snap.as_ref().ok()) {
+                    if !adopt_still_valid(&spec.argv, started_at, spawn_cmd.as_deref(), snap.as_ref().ok()) {
                         eprintln!(
                             "supervisor: 收养进程 {} 的重验失败（pid 可能被复用），按退出处理",
                             spec.key
@@ -827,6 +850,7 @@ impl Supervisor {
                 started_at: r.started_at,
                 port: r.port,
                 keep_alive: r.spec.keep_alive,
+                spawn_cmd: r.spawn_cmd.clone(),
             })
             .collect()
     }
@@ -847,6 +871,10 @@ pub struct AdoptRecord {
     /// 该进程是否打算在 App 退出后继续跑（崩溃留下的孤儿则不是）。
     #[serde(default)]
     pub keep_alive: bool,
+    /// spawn/收养时对 pid 的实际命令行快照（按空白切词，exec 解析后形态）。
+    /// 旧凭据没有它（None）→ 回退 argv+shebang 展开比对。
+    #[serde(default)]
+    pub spawn_cmd: Option<Vec<String>>,
 }
 
 /// 三重校验：pid 存活 + 启动时间相符 + 命令行按词相符。
@@ -881,7 +909,7 @@ fn verify_and_snapshot(rec: &AdoptRecord) -> Result<PsSnapshot, String> {
             snap.lstart.trim()
         ));
     }
-    if !adopt_cmd_match(&rec.argv, &snap.command) {
+    if !adopt_cmd_match(&rec.argv, &snap.command, rec.spawn_cmd.as_deref()) {
         return Err(format!(
             "命令行不符（记录 {}，实际 {}）",
             rec.argv.join(" "),
@@ -925,15 +953,62 @@ fn ps_snapshot(pid: u32) -> Result<PsSnapshot, String> {
     Ok(PsSnapshot { pgid, lstart, command: rest.join(" ") })
 }
 
+/// 对 pid 的实际命令行做“稳定快照”（E2E 第二轮实锤的 exec 型收养失败的根治）。
+///
+/// `sh run.sh` / `zsh -lc '…'` 这类经 shell exec 优化后，leader pid 的命令行会变成
+/// 最终程序（如 python），计划 argv 永远对不上。spawn/收养成功后立即对 pid 采样 ps，
+/// 存 exec 解析后的真实形态，收养时拿它比对。
+///
+/// 轮询到连续两次相同才返回：跳过 fork-未exec 瞬间（看到父进程 project-ctrl 自身）
+/// 与 shell 优化中的中间态。超时/失败返回 None（调用方回退旧比对，不破坏现有行为）。
+fn snapshot_stable_cmd(pid: u32) -> Option<Vec<String>> {
+    let parent_base = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()));
+    let mut prev: Option<String> = None;
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        let cmd = ps_snapshot(pid).map(|s| s.command).unwrap_or_default();
+        let trimmed = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+        // 未 exec 瞬间看到的是父进程自身：跳过继续等。
+        let is_parent = parent_base.as_ref().is_some_and(|b| {
+            trimmed.split_whitespace().next().is_some_and(|w| {
+                w.rsplit('/').next().unwrap_or(w) == b.rsplit('/').next().unwrap_or(b)
+            })
+        });
+        if !trimmed.is_empty() && !is_parent {
+            if prev.as_deref() == Some(trimmed.as_str()) {
+                return Some(trimmed.split_whitespace().map(str::to_string).collect());
+            }
+            prev = Some(trimmed);
+        }
+        if std::time::Instant::now() >= deadline {
+            // 超时：有采样就用最后一次（好过没有），全空则 None。
+            return prev.map(|p| p.split_whitespace().map(str::to_string).collect());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// 命令行是否按词相符：逐词相等、且实际词数 ≥ 期望词数。
 ///
 /// 无词边界的 `starts_with` 会把 `sleep 3` 误判成 `sleep 30` 的前缀；
 /// 允许实际更长（ps 可能带上我们没记录的尾部参数），但期望的每个词都必须对上。
-fn adopt_cmd_match(argv: &[String], command: &str) -> bool {
+///
+/// `spawn_cmd`（spawn/收养时的实际命令行快照）优先：exec 型服务（`sh run.sh`→python）
+/// 的计划 argv 永远对不上 ps，快照才是真相。None/空时回退 shebang 展开比对（旧凭据）。
+fn adopt_cmd_match(argv: &[String], command: &str, spawn_cmd: Option<&[String]>) -> bool {
     if argv.is_empty() {
         return false;
     }
-    let expected = expand_shebang(argv);
+    let expanded;
+    let expected: &[String] = match spawn_cmd {
+        Some(words) if !words.is_empty() => words,
+        _ => {
+            expanded = expand_shebang(argv);
+            &expanded
+        }
+    };
     let actual: Vec<&str> = command.split_whitespace().collect();
     if actual.len() < expected.len() {
         return false;
@@ -1077,13 +1152,18 @@ fn parse_lstart(lstart: &str) -> Option<i64> {
 }
 
 /// watch_adopted 的重验判据（纯函数）：快照取不到 / 时间不符 / 命令不符都算失效。
-fn adopt_still_valid(argv: &[String], started_at: i64, snap: Option<&PsSnapshot>) -> bool {
+fn adopt_still_valid(
+    argv: &[String],
+    started_at: i64,
+    spawn_cmd: Option<&[String]>,
+    snap: Option<&PsSnapshot>,
+) -> bool {
     let Some(snap) = snap else { return false };
     if snap.command.trim().is_empty() || snap.lstart.trim().is_empty() {
         return false;
     }
     let Some(actual_secs) = parse_lstart(&snap.lstart) else { return false };
-    adopt_time_match(started_at, actual_secs) && adopt_cmd_match(argv, &snap.command)
+    adopt_time_match(started_at, actual_secs) && adopt_cmd_match(argv, &snap.command, spawn_cmd)
 }
 
 /// 单个 pid 是否存活（`kill -0 <pid>`，不是进程组：收养的进程未必是组长）。
@@ -1356,6 +1436,7 @@ mod tests {
             started_at: 0,
             port: None,
             keep_alive: false,
+            spawn_cmd: None,
         };
         assert!(verify_adopt(&rec).is_err());
     }
@@ -1375,6 +1456,7 @@ mod tests {
             started_at: now_secs(),
             port: None,
             keep_alive: false,
+            spawn_cmd: None,
         };
         let err = verify_adopt(&rec).unwrap_err();
         assert!(err.contains("命令行不符"), "{err}");
@@ -1397,6 +1479,7 @@ mod tests {
             started_at: now_secs(),
             port: None,
             keep_alive: false,
+            spawn_cmd: None,
         };
         verify_adopt(&rec).expect("自身启动的进程应当通过三重校验");
         let _ = child.kill();
@@ -1422,6 +1505,46 @@ mod tests {
     }
 
     #[test]
+    fn spawn_cmd_snapshot_prefers_actual_command() {
+        // spawn_cmd 快照优先：期望用快照词，不再用 argv+shebang 展开。
+        let snap = vec!["python3".to_string(), "-u".to_string(), "-m".to_string()];
+        assert!(adopt_cmd_match(
+            &argv(&["sh", "run.sh"]),
+            "python3 -u -m http.server",
+            Some(&snap)
+        ));
+        // 快照与实际不符 → 拒绝（强度不降低）。
+        assert!(!adopt_cmd_match(&argv(&["sh", "run.sh"]), "sleep 30", Some(&snap)));
+        // None/空回退旧逻辑。
+        assert!(adopt_cmd_match(&argv(&["sleep", "30"]), "sleep 30", None));
+        assert!(adopt_cmd_match(&argv(&["sleep", "30"]), "sleep 30", Some(&[])));
+    }
+
+    #[test]
+    fn exec_type_service_adopt_roundtrip() {
+        // E2E 第二轮实锤：`sh run.sh`（末命令被 shell exec 优化成 python）
+        // 经 spawn 纳管后，凭据里的 spawn_cmd 快照必须让 verify 通过。
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        let sup = Supervisor::default();
+        let sink = Arc::new(Collector::default());
+        let path = script.to_string_lossy().into_owned();
+        let pid = sup.spawn(sink.clone(), spec("1/ex", vec!["sh", &path], Restart::Never)).unwrap();
+        let rec = sup.adoptable().into_iter().find(|r| r.key == "1/ex").expect("应有凭据");
+        assert_eq!(rec.pid, pid);
+        assert!(
+            rec.spawn_cmd.as_ref().is_some_and(|w| !w.is_empty()),
+            "spawn 后必须有命令行快照"
+        );
+        verify_adopt(&rec).expect("exec 型服务应当通过命令行校验");
+        // 对照：同一进程若不用快照（旧行为）→ 计划 argv 对不上 exec 后的实际命令 → 拒绝。
+        let legacy = AdoptRecord { spawn_cmd: None, ..rec.clone() };
+        assert!(verify_adopt(&legacy).is_err(), "旧逻辑应对 exec 型失败（对照组）");
+        sup.stop("1/ex");
+    }
+
+    #[test]
     fn word_boundary_rejects_prefix_collision() {
         // `sleep 3` 的记录不能匹配 `sleep 30` 的进程。
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
@@ -1437,6 +1560,7 @@ mod tests {
             started_at: now_secs(),
             port: None,
             keep_alive: false,
+            spawn_cmd: None,
         };
         let err = verify_adopt(&rec).unwrap_err();
         assert!(err.contains("命令行不符"), "{err}");
@@ -1471,6 +1595,7 @@ mod tests {
             started_at: now_secs(),
             port: None,
             keep_alive: false,
+            spawn_cmd: None,
         };
         verify_adopt(&rec).expect("脚本服务应当通过命令行校验");
         // 换一个 Supervisor 模拟 App 重启后的收养
@@ -1553,6 +1678,7 @@ mod tests {
             started_at: now_secs(),
             port: None,
             keep_alive: false,
+            spawn_cmd: None,
         };
         reclaim_group_verified(&rec).expect("相符的记录应当被回收");
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1574,6 +1700,7 @@ mod tests {
             started_at: now_secs(),
             port: None,
             keep_alive: false,
+            spawn_cmd: None,
         };
         assert!(reclaim_group_verified(&bad).is_err());
         assert!(child2.try_wait().unwrap().is_none(), "不符时进程必须存活");
@@ -1617,6 +1744,7 @@ mod tests {
             started_at: now_secs(),
             port: None,
             keep_alive: false,
+            spawn_cmd: None,
         };
         reclaim_group_verified(&rec).expect("漂移时应只杀 pid 并成功");
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1655,6 +1783,7 @@ mod tests {
             started_at: now_secs(),
             port: None,
             keep_alive: false,
+            spawn_cmd: None,
         };
         let err = reclaim_group_verified(&rec).unwrap_err();
         assert!(err.contains("进程组已变"), "{err}");
@@ -1687,19 +1816,19 @@ mod tests {
 
     #[test]
     fn adopt_cmd_match_enforces_word_boundaries() {
-        assert!(adopt_cmd_match(&argv(&["sleep", "30"]), "sleep 30"));
-        assert!(adopt_cmd_match(&argv(&["sleep", "30"]), "sleep 30 --extra"), "实际更长应当允许");
-        assert!(!adopt_cmd_match(&argv(&["sleep", "3"]), "sleep 30"), "无词边界会误判前缀");
-        assert!(!adopt_cmd_match(&argv(&["sleep", "30"]), "sleep 3"));
-        assert!(!adopt_cmd_match(&argv(&[]), "sleep 30"), "空 argv 直接拒绝");
-        assert!(!adopt_cmd_match(&argv(&["node", "a.js"]), "sleep 30"));
+        assert!(adopt_cmd_match(&argv(&["sleep", "30"]), "sleep 30", None));
+        assert!(adopt_cmd_match(&argv(&["sleep", "30"]), "sleep 30 --extra", None), "实际更长应当允许");
+        assert!(!adopt_cmd_match(&argv(&["sleep", "3"]), "sleep 30", None), "无词边界会误判前缀");
+        assert!(!adopt_cmd_match(&argv(&["sleep", "30"]), "sleep 3", None));
+        assert!(!adopt_cmd_match(&argv(&[]), "sleep 30", None), "空 argv 直接拒绝");
+        assert!(!adopt_cmd_match(&argv(&["node", "a.js"]), "sleep 30", None));
     }
 
     #[test]
     fn adopt_cmd_match_accepts_interpreter_basename() {
         // argv 写 `sh`、ps 显示 `/bin/sh`（或反过来）应当相容。
-        assert!(adopt_cmd_match(&argv(&["sh", "-c", "x"]), "/bin/sh -c x"));
-        assert!(adopt_cmd_match(&argv(&["/bin/sh", "-c", "x"]), "sh -c x"));
+        assert!(adopt_cmd_match(&argv(&["sh", "-c", "x"]), "/bin/sh -c x", None));
+        assert!(adopt_cmd_match(&argv(&["/bin/sh", "-c", "x"]), "sh -c x", None));
     }
 
     #[test]
@@ -1764,11 +1893,11 @@ mod tests {
         let link_s = link.to_string_lossy().into_owned();
         let real_s = real.to_string_lossy().into_owned();
         // 经链接 exec：无论 ps 显示链接还是目标，都认。
-        assert!(adopt_cmd_match(&argv(&[&link_s]), &format!("/bin/sh {link_s}")));
-        assert!(adopt_cmd_match(&argv(&[&link_s]), &format!("/bin/sh {real_s}")));
+        assert!(adopt_cmd_match(&argv(&[&link_s]), &format!("/bin/sh {link_s}"), None));
+        assert!(adopt_cmd_match(&argv(&[&link_s]), &format!("/bin/sh {real_s}"), None));
         // 经目标 exec：同理两向。
-        assert!(adopt_cmd_match(&argv(&[&real_s]), &format!("/bin/sh {real_s}")));
-        assert!(adopt_cmd_match(&argv(&[&real_s]), &format!("/bin/sh {link_s}")));
+        assert!(adopt_cmd_match(&argv(&[&real_s]), &format!("/bin/sh {real_s}"), None));
+        assert!(adopt_cmd_match(&argv(&[&real_s]), &format!("/bin/sh {link_s}"), None));
         // 真 pnpm：两种拼写都认（前置不满足则跳过）。
         let pnpm = crate::execenv::resolve("pnpm", &crate::execenv::base_path());
         if let Some(pnpm) = pnpm {
@@ -1777,11 +1906,11 @@ mod tests {
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|_| pnpm.to_string_lossy().into_owned());
                 assert!(
-                    adopt_cmd_match(&argv(&["pnpm", "dev"]), &format!("node {} dev", pnpm.display())),
+                    adopt_cmd_match(&argv(&["pnpm", "dev"]), &format!("node {} dev", pnpm.display()), None),
                     "链接拼写必须认"
                 );
                 assert!(
-                    adopt_cmd_match(&argv(&["pnpm", "dev"]), &format!("node {canon} dev")),
+                    adopt_cmd_match(&argv(&["pnpm", "dev"]), &format!("node {canon} dev"), None),
                     "canonical 拼写必须认"
                 );
             }
@@ -1839,19 +1968,19 @@ mod tests {
         let dt = chrono::Local.timestamp_opt(now, 0).single().unwrap();
         let lstart = dt.format("%a %b %e %H:%M:%S %Y").to_string();
         let good = PsSnapshot { pgid: 123, lstart: lstart.clone(), command: "sleep 30".into() };
-        assert!(adopt_still_valid(&argv(&["sleep", "30"]), now, Some(&good)));
-        assert!(!adopt_still_valid(&argv(&["sleep", "30"]), now, None), "快照取不到算失效");
+        assert!(adopt_still_valid(&argv(&["sleep", "30"]), now, None, Some(&good)));
+        assert!(!adopt_still_valid(&argv(&["sleep", "30"]), now, None, None), "快照取不到算失效");
         let empty = PsSnapshot { pgid: 123, lstart: String::new(), command: String::new() };
-        assert!(!adopt_still_valid(&argv(&["sleep", "30"]), now, Some(&empty)), "空快照算失效");
+        assert!(!adopt_still_valid(&argv(&["sleep", "30"]), now, None, Some(&empty)), "空快照算失效");
         let wrong_cmd = PsSnapshot { pgid: 123, lstart, command: "node x.js".into() };
-        assert!(!adopt_still_valid(&argv(&["sleep", "30"]), now, Some(&wrong_cmd)));
+        assert!(!adopt_still_valid(&argv(&["sleep", "30"]), now, None, Some(&wrong_cmd)));
         let old_dt = chrono::Local.timestamp_opt(now - 3600, 0).single().unwrap();
         let old = PsSnapshot {
             pgid: 123,
             lstart: old_dt.format("%a %b %e %H:%M:%S %Y").to_string(),
             command: "sleep 30".into(),
         };
-        assert!(!adopt_still_valid(&argv(&["sleep", "30"]), now, Some(&old)), "pid 复用后 lstart 不符");
+        assert!(!adopt_still_valid(&argv(&["sleep", "30"]), now, None, Some(&old)), "pid 复用后 lstart 不符");
     }
 
     #[test]
@@ -1867,6 +1996,7 @@ mod tests {
             started_at: now_secs(),
             port: None,
             keep_alive: false,
+            spawn_cmd: None,
         };
         let err = reclaim_group_verified(&rec).unwrap_err();
         assert!(err.contains("自己"), "{err}");

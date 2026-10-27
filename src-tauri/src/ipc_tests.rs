@@ -609,6 +609,7 @@ fn ipc_adopt_roundtrip_after_restart() {
             .as_secs() as i64,
         port: None,
         keep_alive: true,
+        spawn_cmd: None,
     };
     localstate::write_adopt(&rec).expect("写凭据");
     assert_eq!(localstate::read_adopts().len(), 1);
@@ -715,6 +716,7 @@ fn ipc_adopt_existing_takes_over_live_process() {
         started_at,
         port: None,
         keep_alive: true,
+        spawn_cmd: None,
     };
     localstate::write_adopt(&rec).expect("写凭据");
 

@@ -643,7 +643,7 @@ mod tests {
         remember_port("/x/a", "api", 5000);
         let rec = crate::supervisor::AdoptRecord {
             key: "1/api".into(), project_id: 1, name: "api".into(), pid: 1, pgid: 1,
-            argv: vec!["x".into()], cwd: "/tmp".into(), started_at: 1, port: None, keep_alive: false,
+            argv: vec!["x".into()], cwd: "/tmp".into(), started_at: 1, port: None, keep_alive: false, spawn_cmd: None,
         };
         write_adopt(&rec).unwrap();
         for p in [overrides_path(), ports_path(), adopt_path(&rec.key)] {
@@ -672,7 +672,7 @@ mod tests {
         let new_rec = crate::supervisor::AdoptRecord {
             key: "1/keep".into(), project_id: 1, name: "keep".into(), pid: 37881, pgid: 37881,
             argv: vec!["sleep".into(), "30".into()], cwd: "/tmp".into(), started_at: 1793129285,
-            port: None, keep_alive: true,
+            port: None, keep_alive: true, spawn_cmd: None,
         };
         let mut old_rec = new_rec.clone();
         old_rec.pid = 27881;

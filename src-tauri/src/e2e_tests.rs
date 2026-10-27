@@ -562,6 +562,7 @@ fn orphan_without_keep_alive_is_reclaimed_not_adopted() {
         started_at,
         port: None,
         keep_alive: false,
+        spawn_cmd: None,
     };
     crate::supervisor::verify_adopt(&rec).expect("活进程应通过校验");
     crate::localstate::write_adopt(&rec).unwrap();
