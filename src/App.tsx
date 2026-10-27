@@ -43,6 +43,8 @@ export default function App() {
 
   // 有服务处于运行中/过渡态的项目 id（来自 svc:state 事件，不轮询）
   const [running, setRunning] = useState<Set<number>>(new Set())
+  const [statuses, setStatuses] = useState<Record<string, ServiceStatus>>({})
+  const statusesRef = useRef<Record<string, ServiceStatus>>({})
 
   // 克隆 / PM2 导入的独立浮层状态（不塞进既有 Modal 联合类型）
   const [cloneOpen, setCloneOpen] = useState(false)
@@ -102,19 +104,21 @@ export default function App() {
     refresh()
   }, [])
 
-  // 运行状态：初始化一次 + 订阅 svc:state（不轮询）
+  // 运行状态：初始化一次 + 订阅 svc:state（不轮询）。
+  // 以 key 为粒度维护，项目徽章由「该项目有任一活跃服务」推出。
   useEffect(() => {
     let alive = true
     let un: UnlistenFn | null = null
+    const ACTIVE: ServiceStatus['phase'][] = ['Running', 'Step']
     const apply = (list: ServiceStatus[]) => {
       if (!alive) return
-      setRunning(
-        new Set(
-          list
-            .filter((s) => s.phase === 'Running' || s.phase === 'Building' || s.phase === 'Installing')
-            .map((s) => s.project_id),
-        ),
-      )
+      const byKey: Record<string, ServiceStatus> = {}
+      list.forEach((st) => {
+        byKey[st.key] = st
+      })
+      statusesRef.current = byKey
+      setStatuses(byKey)
+      setRunning(new Set(list.filter((st) => ACTIVE.includes(st.phase)).map((st) => st.project_id)))
     }
     void (async () => {
       try {
@@ -124,17 +128,17 @@ export default function App() {
       }
       un = await listen<ServiceStatus>('svc:state', (e) => {
         if (!alive) return
-        const id = e.payload.project_id
-        const active =
-          e.payload.phase === 'Running' ||
-          e.payload.phase === 'Building' ||
-          e.payload.phase === 'Installing'
-        setRunning((prev) => {
-          const next = new Set(prev)
-          if (active) next.add(id)
-          else next.delete(id)
-          return next
-        })
+        const st = e.payload
+        const merged = { ...statusesRef.current, [st.key]: st }
+        statusesRef.current = merged
+        setStatuses(merged)
+        setRunning(
+          new Set(
+            Object.values(merged)
+              .filter((s) => ACTIVE.includes(s.phase))
+              .map((s) => s.project_id),
+          ),
+        )
       })
     })()
     return () => {

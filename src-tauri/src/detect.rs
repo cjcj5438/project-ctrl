@@ -6,6 +6,19 @@
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
+/// 一个 compose 文件里能作为「一键采用」的服务条目。
+#[derive(Debug, Serialize, Clone, Default, PartialEq)]
+pub struct ComposeCandidate {
+    /// 相对项目根的 compose 文件路径。
+    pub file: String,
+    /// 该文件里声明的服务名（`services:` 下的键）。
+    pub services: Vec<String>,
+    /// 该文件里出现的宿主侧端口。
+    pub ports: Vec<u16>,
+    /// 已存在的 override 兄弟文件（如 `docker-compose.gpu.yml`），供多 `-f` 叠加。
+    pub overrides: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Clone, Default, PartialEq)]
 pub struct DetectResult {
     pub package_manager: Option<String>,
@@ -17,6 +30,12 @@ pub struct DetectResult {
     pub node_pin: Option<String>,
     pub toolchain: Vec<String>,
     pub problems: Vec<String>,
+    /// 发现的 compose 栈（含子服务名），供「临时运行 / 一键采用」直接用。
+    pub compose_stacks: Vec<ComposeCandidate>,
+    /// `Makefile` 里的可执行目标名。
+    pub make_targets: Vec<String>,
+    /// 根目录下看起来能直接跑的脚本（`bin/*.sh`、`start*.sh`、`scripts/*.sh`）。
+    pub script_candidates: Vec<String>,
 }
 
 fn read(base: &Path, name: &str) -> Option<String> {
@@ -118,6 +137,188 @@ fn port_in_env_files(base: &Path) -> Option<u16> {
         }
     }
     None
+}
+
+/// 常见 compose 文件名（顶层与 `infra/`、`deploy/` 一层子目录）。
+const COMPOSE_NAMES: &[&str] = &[
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.dev.yml",
+    "docker-compose.prod.yml",
+];
+
+/// 扫描 compose 文件：顶层 + 一层子目录（monorepo 常见 `infra/docker-compose.yml`）。
+fn compose_candidates(base: &Path) -> Vec<ComposeCandidate> {
+    let mut dirs: Vec<PathBuf> = vec![base.to_path_buf()];
+    if let Ok(rd) = std::fs::read_dir(base) {
+        let mut subs: Vec<PathBuf> = rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_dir()
+                    && !p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().starts_with('.'))
+                        .unwrap_or(false)
+            })
+            .collect();
+        subs.sort();
+        dirs.extend(subs);
+    }
+    let mut found: Vec<(String, PathBuf, String)> = Vec::new();
+    for dir in &dirs {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.filter_map(|e| e.ok()) {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let is_compose = COMPOSE_NAMES.contains(&name.as_str())
+                    || (name.starts_with("docker-compose.") && (name.ends_with(".yml") || name.ends_with(".yaml")));
+                if !is_compose {
+                    continue;
+                }
+                let rel = match dir.strip_prefix(base) {
+                    Ok(p) if p.as_os_str().is_empty() => name.clone(),
+                    Ok(p) => format!("{}/{}", p.display(), name),
+                    Err(_) => name.clone(),
+                };
+                found.push((rel, e.path(), name));
+            }
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out: Vec<ComposeCandidate> = Vec::new();
+    for (rel, path, name) in &found {
+        let Some(text) = std::fs::read_to_string(path).ok() else { continue };
+        let services = compose_service_names(&text);
+        let ports = compose_ports_in(&text);
+        // 兄弟 override（base = docker-compose.yml，override = docker-compose.gpu.yml）
+        let dir_rel = Path::new(rel).parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let overrides = found
+            .iter()
+            .filter(|(r2, _, n2)| {
+                n2 != name
+                    && Path::new(r2).parent().map(|p| p.to_path_buf()).unwrap_or_default() == dir_rel
+                    && !COMPOSE_NAMES.contains(&n2.as_str())
+            })
+            .map(|(r2, _, _)| r2.clone())
+            .collect();
+        out.push(ComposeCandidate { file: rel.clone(), services, ports, overrides });
+    }
+    out
+}
+
+/// 取 `services:` 下的第一层键。
+fn compose_service_names(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_services = false;
+    let mut service_indent: Option<usize> = None;
+    for line in text.lines() {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim_start();
+        if !in_services {
+            if trimmed.starts_with("services:") {
+                in_services = true;
+                service_indent = None;
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        // 回到顶层（新的顶级键）就结束
+        if indent == 0 {
+            break;
+        }
+        match service_indent {
+            None => {
+                // 第一个服务名的缩进就是基准
+                service_indent = Some(indent);
+                if let Some(name) = trimmed.strip_suffix(':') {
+                    out.push(name.trim().to_string());
+                }
+            }
+            Some(base_indent) if indent == base_indent => {
+                if let Some(name) = trimmed.strip_suffix(':') {
+                    out.push(name.trim().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn compose_ports_in(text: &str) -> Vec<u16> {
+    let mut out = Vec::new();
+    let mut in_ports = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("ports:") {
+            in_ports = true;
+            continue;
+        }
+        if in_ports {
+            if !(trimmed.starts_with('-') || trimmed.starts_with('"') || trimmed.starts_with('\'') || trimmed.is_empty()) {
+                in_ports = false;
+                continue;
+            }
+            if let Some(p) = first_host_port(trimmed) {
+                out.push(p);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// `Makefile` 里的目标名（行首非空、以 `:` 结尾、非变量赋值）。
+fn make_targets(base: &Path) -> Vec<String> {
+    let Some(text) = read(base, "Makefile") else { return Vec::new() };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.starts_with('\t') || line.starts_with('#') || line.starts_with('.') {
+            continue;
+        }
+        let Some((name, _)) = line.split_once(':') else { continue };
+        let name = name.trim();
+        if name.is_empty() || name.contains('=') || name.contains(' ') {
+            continue;
+        }
+        if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            out.push(name.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// 根目录/一层子目录里能直接跑起来的脚本。
+fn script_candidates(base: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for sub in ["", "bin", "scripts"] {
+        let dir = if sub.is_empty() { base.to_path_buf() } else { base.join(sub) };
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.filter_map(|e| e.ok()) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !(name.ends_with(".sh") || name == "start-all.sh") {
+                continue;
+            }
+            if sub.is_empty() && !(name.starts_with("start") || name.starts_with("serve")) {
+                continue;
+            }
+            let rel = if sub.is_empty() { name } else { format!("{sub}/{name}") };
+            out.push(rel);
+        }
+    }
+    out.sort();
+    out
 }
 
 /// 收集 compose 文件里 `ports:` 段的宿主侧端口。
@@ -335,7 +536,11 @@ pub fn detect(base: &Path) -> DetectResult {
     tools.dedup();
     r.toolchain = tools;
 
-    if pm.is_none() && r.start_candidates.is_empty() {
+    r.compose_stacks = compose_candidates(base);
+    r.make_targets = make_targets(base);
+    r.script_candidates = script_candidates(base);
+
+    if pm.is_none() && r.start_candidates.is_empty() && r.compose_stacks.is_empty() {
         r.problems.push("未识别的技术栈：请手工填写启动命令".into());
     }
     r
@@ -461,6 +666,48 @@ mod tests {
     fn missing_dir_reports_problem() {
         let r = detect(Path::new("/definitely/not/here/xyz"));
         assert!(r.problems.iter().any(|p| p.contains("路径不存在")));
+    }
+
+    #[test]
+    fn compose_services_and_overrides_are_detected() {
+        let d = tmp();
+        std::fs::create_dir_all(d.path().join("infra")).unwrap();
+        std::fs::write(
+            d.path().join("infra/docker-compose.yml"),
+            "services:\n  postgres:\n    image: pg\n    ports:\n      - 127.0.0.1:55432:5432\n  minio:\n    image: minio\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("infra/docker-compose.gpu.yml"),
+            "services:\n  postgres:\n    deploy:\n      resources: {}\n",
+        )
+        .unwrap();
+        let r = detect(d.path());
+        let base = r
+            .compose_stacks
+            .iter()
+            .find(|c| c.file == "infra/docker-compose.yml")
+            .expect("应识别 infra 下的 compose");
+        assert_eq!(base.services, vec!["postgres".to_string(), "minio".to_string()]);
+        assert_eq!(base.ports, vec![55432]);
+        assert_eq!(base.overrides, vec!["infra/docker-compose.gpu.yml".to_string()]);
+    }
+
+    #[test]
+    fn make_targets_and_scripts_are_listed() {
+        let d = tmp();
+        std::fs::write(
+            d.path().join("Makefile"),
+            "build:\n\tgo build\n.deploy:\n\t@echo\nVAR=1\ntest-unit:\n\techo\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(d.path().join("bin")).unwrap();
+        std::fs::write(d.path().join("bin/serve.sh"), "").unwrap();
+        std::fs::write(d.path().join("start-all.sh"), "").unwrap();
+        std::fs::write(d.path().join("unrelated.sh"), "").unwrap();
+        let r = detect(d.path());
+        assert_eq!(r.make_targets, vec!["build".to_string(), "test-unit".to_string()]);
+        assert_eq!(r.script_candidates, vec!["bin/serve.sh".to_string(), "start-all.sh".to_string()]);
     }
 
     #[test]

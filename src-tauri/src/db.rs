@@ -1,5 +1,12 @@
-//! SQLite 持久化：projects / tags / project_tags。
+//! SQLite 持久化：projects / tags / project_tags / services。
+//!
+//! schema 版本记在 `PRAGMA user_version`，迁移按顺序一次跑完。改 schema 只加一条新迁移，
+//! 绝不删库——库里有用户的 tag 与服务声明。
+//!
+//! 注意：`services` 一个项目可以有任意多行（`UNIQUE(project_id, name)`）。v0.2.0 的旧表是
+//! `project_id` 单主键，v1 迁移会整表重建并把旧配方转成新模型（`install`/`build` → `steps`）。
 
+use crate::services::{self, Derived, ServiceSpec};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::PathBuf;
 
@@ -11,13 +18,39 @@ pub fn data_dir() -> PathBuf {
     home.join(".project-ctrl")
 }
 
+/// 有序迁移列表。索引 i 表示「升到版本 i+1」。
+const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[migrate_to_v1];
+
+/// 打开（必要时迁移）数据库。
 pub fn open_db() -> rusqlite::Result<Connection> {
     let dir = data_dir();
     std::fs::create_dir_all(&dir).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-    let conn = Connection::open(dir.join("data.db"))?;
+    let mut conn = Connection::open(dir.join("data.db"))?;
+    migrate(&mut conn)?;
+    Ok(conn)
+}
+
+/// 把连接升到最新 schema 版本（幂等，测试也用这个建库）。
+pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    for (idx, step) in MIGRATIONS.iter().enumerate() {
+        let version = idx as i64 + 1;
+        if current >= version {
+            continue;
+        }
+        let tx = conn.transaction()?;
+        step(&tx)?;
+        tx.pragma_update(None, "user_version", version)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+/// v1：建基线表；若检测到 v0.2.0 的单配方 `services` 表则整表重建并转换。
+fn migrate_to_v1(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
-        "PRAGMA foreign_keys = ON;
-         CREATE TABLE IF NOT EXISTS projects (
+        "CREATE TABLE IF NOT EXISTS projects (
            id INTEGER PRIMARY KEY AUTOINCREMENT,
            path TEXT NOT NULL UNIQUE,
            added_at INTEGER NOT NULL
@@ -30,14 +63,67 @@ pub fn open_db() -> rusqlite::Result<Connection> {
            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
            tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
            PRIMARY KEY (project_id, tag_id)
-         );
-         CREATE TABLE IF NOT EXISTS services (
-           project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-           config TEXT NOT NULL,
-           managed_at INTEGER NOT NULL
          );",
     )?;
-    Ok(conn)
+
+    if table_exists(conn, "services")? && is_legacy_services(conn)? {
+        let rows: Vec<(i64, String)> = {
+            let mut st = conn.prepare("SELECT project_id, config FROM services")?;
+            let it = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            it.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        conn.execute_batch("DROP TABLE services;")?;
+        create_services(conn)?;
+        for (project_id, json) in rows {
+            let legacy: services::LegacyServiceConfig = serde_json::from_str(&json).unwrap_or_default();
+            let (spec, derived) = services::from_legacy(&legacy);
+            insert_service(conn, project_id, &spec, &derived)?;
+        }
+    } else {
+        create_services(conn)?;
+    }
+    Ok(())
+}
+
+fn create_services(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS services (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+           name TEXT NOT NULL,
+           config TEXT NOT NULL,
+           derived TEXT NOT NULL DEFAULT '{}',
+           managed_at INTEGER NOT NULL,
+           UNIQUE (project_id, name)
+         );",
+    )
+}
+
+fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        params![name],
+        |r| r.get(0),
+    )?;
+    Ok(n == 1)
+}
+
+/// 旧表特征：有 `project_id` 列但没有 `name` 列（新表两者都有）。
+fn is_legacy_services(conn: &Connection) -> rusqlite::Result<bool> {
+    let mut has_project_id = false;
+    let mut has_name = false;
+    let mut st = conn.prepare("PRAGMA table_info(services)")?;
+    let mut rows = st.query([])?;
+    while let Some(r) = rows.next()? {
+        let col: String = r.get(1)?;
+        if col == "project_id" {
+            has_project_id = true;
+        }
+        if col == "name" {
+            has_name = true;
+        }
+    }
+    Ok(has_project_id && !has_name)
 }
 
 fn now_secs() -> i64 {
@@ -159,26 +245,55 @@ pub fn delete_tag(conn: &Connection, name: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// 取项目的服务配方（JSON 字符串）。无记录为 None。
-pub fn service_config(conn: &Connection, project_id: i64) -> rusqlite::Result<Option<String>> {
-    conn.query_row("SELECT config FROM services WHERE project_id = ?1", params![project_id], |r| r.get(0))
-        .optional()
+// ---------------------------------------------------------------------------
+// 服务声明（每项目多行）
+// ---------------------------------------------------------------------------
+
+pub struct ServiceRow {
+    pub config: String,
+    pub derived: String,
 }
 
-/// 写入 / 覆盖服务配方。
-pub fn set_service_config(conn: &Connection, project_id: i64, json: &str) -> rusqlite::Result<()> {
+fn row_service(r: &rusqlite::Row) -> rusqlite::Result<ServiceRow> {
+    Ok(ServiceRow { config: r.get(0)?, derived: r.get(1)? })
+}
+
+pub fn services_of(conn: &Connection, project_id: i64) -> rusqlite::Result<Vec<ServiceRow>> {
+    let mut st = conn
+        .prepare("SELECT config, derived FROM services WHERE project_id = ?1 ORDER BY id ASC")?;
+    let it = st.query_map(params![project_id], row_service)?;
+    it.collect()
+}
+
+pub fn insert_service(conn: &Connection, project_id: i64, spec: &ServiceSpec, derived: &Derived) -> rusqlite::Result<i64> {
+    let json = spec.to_json().unwrap_or_default();
     conn.execute(
-        "INSERT INTO services (project_id, config, managed_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(project_id) DO UPDATE SET config = excluded.config, managed_at = excluded.managed_at",
-        params![project_id, json, now_secs()],
+        "INSERT INTO services (project_id, name, config, derived, managed_at) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(project_id, name) DO UPDATE SET
+           config = excluded.config, derived = excluded.derived, managed_at = excluded.managed_at",
+        params![project_id, spec.name, json, derived.to_json(), now_secs()],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM services WHERE project_id = ?1 AND name = ?2",
+        params![project_id, spec.name],
+        |r| r.get(0),
+    )?;
+    Ok(id)
+}
+
+pub fn delete_service(conn: &Connection, project_id: i64, name: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM services WHERE project_id = ?1 AND name = ?2",
+        params![project_id, name],
     )?;
     Ok(())
 }
 
-/// 删除服务配方（项目本身保留）。
-pub fn delete_service_config(conn: &Connection, project_id: i64) -> rusqlite::Result<()> {
-    conn.execute("DELETE FROM services WHERE project_id = ?1", params![project_id])?;
-    Ok(())
+/// 项目下所有服务的名字（用于重名检查与 depends_on 校验）。
+pub fn service_names(conn: &Connection, project_id: i64) -> rusqlite::Result<Vec<String>> {
+    let mut st = conn.prepare("SELECT name FROM services WHERE project_id = ?1 ORDER BY id ASC")?;
+    let it = st.query_map(params![project_id], |r| r.get(0))?;
+    it.collect()
 }
 
 #[cfg(test)]
@@ -186,15 +301,8 @@ mod tests {
     use super::*;
 
     fn mem() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, added_at INTEGER NOT NULL);
-             CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
-             CREATE TABLE project_tags (project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE, PRIMARY KEY (project_id, tag_id));
-             CREATE TABLE services (project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, config TEXT NOT NULL, managed_at INTEGER NOT NULL);",
-        )
-        .unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
         conn
     }
 
@@ -214,7 +322,6 @@ mod tests {
         let p2 = add_project(&conn, "/x/b").unwrap();
         set_project_tags(&conn, p1, &["t1".into(), "t2".into()]).unwrap();
         set_project_tags(&conn, p2, &["t2".into()]).unwrap();
-        // t2 改名为 t1：合并，p1 去重后只有 t1
         rename_tag(&conn, "t2", "t1").unwrap();
         assert_eq!(tags_of(&conn, p1).unwrap(), vec!["t1".to_string()]);
         assert_eq!(tags_of(&conn, p2).unwrap(), vec!["t1".to_string()]);
@@ -254,5 +361,152 @@ mod tests {
         add_project(&conn, "/x/a").unwrap();
         let p2 = add_project(&conn, "/x/b").unwrap();
         assert!(update_project_path(&conn, p2, "/x/a").is_err());
+    }
+
+    fn spec(name: &str) -> ServiceSpec {
+        services::ServiceSpec::from_json(&format!(r#"{{"name":"{name}","run":["echo","hi"]}}"#)).unwrap()
+    }
+
+    #[test]
+    fn multiple_services_per_project() {
+        let conn = mem();
+        let p = add_project(&conn, "/x/a").unwrap();
+        insert_service(&conn, p, &spec("api"), &Derived::manual()).unwrap();
+        insert_service(&conn, p, &spec("worker"), &Derived::manual()).unwrap();
+        assert_eq!(service_names(&conn, p).unwrap(), vec!["api", "worker"]);
+    }
+
+    #[test]
+    fn same_name_upserts_instead_of_duplicating() {
+        let conn = mem();
+        let p = add_project(&conn, "/x/a").unwrap();
+        let first = insert_service(&conn, p, &spec("api"), &Derived::manual()).unwrap();
+        let mut changed = spec("api");
+        changed.run = Some(vec!["echo".into(), "changed".into()]);
+        let second = insert_service(&conn, p, &changed, &Derived::manual()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(services_of(&conn, p).unwrap().len(), 1);
+        let rows = services_of(&conn, p).unwrap();
+        let spec = ServiceSpec::from_json(&rows[0].config).unwrap();
+        assert_eq!(spec.run.unwrap()[1], "changed");
+    }
+
+    #[test]
+    fn derived_survives_roundtrip() {
+        let conn = mem();
+        let p = add_project(&conn, "/x/a").unwrap();
+        let d = Derived { origin: "auto".into(), node_pin: Some("24.16.0".into()), toolchain: vec!["pnpm".into()] };
+        insert_service(&conn, p, &spec("api"), &d).unwrap();
+        let rows = services_of(&conn, p).unwrap();
+        assert_eq!(Derived::from_json(&rows[0].derived), d);
+    }
+
+    #[test]
+    fn removing_project_cascades_services() {
+        let conn = mem();
+        let p = add_project(&conn, "/x/a").unwrap();
+        insert_service(&conn, p, &spec("api"), &Derived::manual()).unwrap();
+        remove_project(&conn, p).unwrap();
+        assert!(services_of(&conn, p).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migration_converts_legacy_single_recipe() {
+        // 手工建 v0.2.0 的库形态，再跑迁移，断言零丢失
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, added_at INTEGER NOT NULL);
+             CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+             CREATE TABLE project_tags (project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE, PRIMARY KEY (project_id, tag_id));
+             CREATE TABLE services (project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, config TEXT NOT NULL, managed_at INTEGER NOT NULL);
+             INSERT INTO projects (id, path, added_at) VALUES (7, '/x/legacy', 1);
+             INSERT INTO services (project_id, config, managed_at) VALUES (7, '{\"install\":[\"pnpm\",\"install\"],\"build\":[\"pnpm\",\"run\",\"build\"],\"start\":[\"pnpm\",\"dev\"],\"dev_port\":5190,\"requires_ports\":[5432],\"env\":{\"A\":\"1\"},\"node_pin\":null,\"toolchain\":[\"pnpm\"],\"origin\":\"pm2\"}', 2);",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        let rows = services_of(&conn, 7).unwrap();
+        assert_eq!(rows.len(), 1);
+        let spec = ServiceSpec::from_json(&rows[0].config).unwrap();
+        assert_eq!(spec.name, "default");
+        assert_eq!(spec.steps.len(), 2, "install 与 build 都保留成步骤");
+        assert_eq!(spec.run.unwrap(), vec!["pnpm", "dev"]);
+        assert_eq!(spec.ports.listen, Some(5190));
+        assert_eq!(Derived::from_json(&rows[0].derived).origin, "pm2");
+        // 幂等：再跑一次不应重复转换
+        migrate(&mut conn).unwrap();
+        assert_eq!(services_of(&conn, 7).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migrate_is_idempotent_on_fresh_db() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(v, MIGRATIONS.len() as i64);
+    }
+}
+
+#[cfg(test)]
+mod real_db_smoke {
+    //! 用**真实库的副本**验证迁移不丢东西（只在副本上跑，绝不碰 ~/.project-ctrl）。
+    use super::*;
+
+    #[test]
+    fn migrates_a_copy_of_the_real_database() {
+        let real = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".project-ctrl/data.db");
+        if !real.is_file() {
+            eprintln!("跳过：没有真实库");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let copy = tmp.path().join("data.db");
+        std::fs::copy(&real, &copy).unwrap();
+
+        // 副本如果还是旧 schema，先确认它确实是旧的
+        let mut conn = Connection::open(&copy).unwrap();
+        let before: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        let projects_before: i64 =
+            conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0)).unwrap();
+        let legacy_rows: Vec<(i64, String)> = {
+            let mut st = conn.prepare("SELECT project_id, config FROM services").unwrap();
+            let it = st.query_map([], |r| Ok((r.get(0).unwrap(), r.get(1).unwrap()))).unwrap();
+            it.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+
+        migrate(&mut conn).unwrap();
+
+        let after: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert!(after >= 1, "应升到 v1（之前是 {before}）");
+        let projects_after: i64 =
+            conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0)).unwrap();
+        assert_eq!(projects_before, projects_after, "项目数量不能变");
+
+        for (project_id, old_json) in legacy_rows {
+            let rows = services_of(&conn, project_id).unwrap();
+            assert_eq!(rows.len(), 1, "旧配方应转成恰好一条服务");
+            let spec = ServiceSpec::from_json(&rows[0].config).unwrap();
+            // 零丢失：旧 JSON 里出现的每一段命令都还在
+            let legacy: services::LegacyServiceConfig = serde_json::from_str(&old_json).unwrap();
+            if let Some(install) = legacy.install {
+                assert!(
+                    spec.steps.iter().any(|s| s.argv == install),
+                    "install 命令丢失：{install:?}"
+                );
+            }
+            if let Some(build) = legacy.build {
+                assert!(
+                    spec.steps.iter().any(|s| s.argv == build),
+                    "build 命令丢失：{build:?}"
+                );
+            }
+            if !legacy.start.is_empty() {
+                assert_eq!(spec.run_argv(), legacy.start, "start 命令丢失");
+            }
+            assert_eq!(spec.ports.listen, legacy.dev_port);
+            assert_eq!(spec.ports.requires, legacy.requires_ports);
+            assert_eq!(spec.env, legacy.env);
+        }
     }
 }

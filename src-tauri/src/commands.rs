@@ -1,6 +1,12 @@
 //! Tauri commands：组合 db + logic + 文件系统读取。
+//!
+//! 所有写/执行类命令只接受 `project_id` 与服务名，绝不接受前端传入的任意路径。
 
-use crate::{db, git, logic, readme, size};
+use crate::db;
+use crate::git;
+use crate::logic;
+use crate::readme;
+use crate::size;
 use crate::readme::ReadmeError;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -200,6 +206,15 @@ fn project_path(id: i64) -> Result<PathBuf, String> {
     }
 }
 
+/// 取项目路径并要求目录存在（供所有新增的写/执行类命令使用）。
+fn existing_project_path(id: i64) -> Result<PathBuf, String> {
+    let base = project_path(id)?;
+    if !base.is_dir() {
+        return Err("项目路径不存在".to_string());
+    }
+    Ok(base)
+}
+
 /// 以参数数组调用外部程序（绝不拼 shell 字符串）。失败时返回 stderr。
 fn run_command(program: &str, args: &[&str]) -> Result<(), String> {
     let output = std::process::Command::new(program)
@@ -313,11 +328,13 @@ pub fn run_git(id: i64, kind: String) -> Result<git::GitResult, String> {
 }
 
 // ---------------------------------------------------------------------------
-// 服务运行器
+// 服务运行器（多服务）
 // ---------------------------------------------------------------------------
 
-use crate::services::ServiceConfig;
-use crate::supervisor::{self, Phase};
+use crate::localstate;
+use crate::plan::{self, Layer, Resolved};
+use crate::services::{Derived, Descriptor, ServiceSpec};
+use crate::supervisor::{self, Phase, ServiceStatus};
 
 #[derive(Serialize)]
 pub struct ImportReport {
@@ -328,271 +345,486 @@ pub struct ImportReport {
     pub errors: Vec<String>,
 }
 
-/// 取项目路径并要求目录存在（供所有新增的写/执行类命令使用）。
-fn existing_project_path(id: i64) -> Result<PathBuf, String> {
-    let base = project_path(id)?;
-    if !base.is_dir() {
-        return Err("项目路径不存在".to_string());
-    }
-    Ok(base)
+/// 一个服务的完整视图（声明 + 来源 + 运行态）。
+#[derive(Serialize)]
+pub struct ServiceView {
+    pub spec: ServiceSpec,
+    /// `descriptor` | `db`
+    pub layer: String,
+    pub origin: String,
+    pub keep_alive: bool,
+    pub port_offset: u16,
+    pub status: Option<ServiceStatus>,
+    /// 声明与探测结果的一致性提示（命令可能已失效 / 有未声明的候选）。
+    pub warnings: Vec<String>,
 }
 
-fn load_config(conn: &rusqlite::Connection, id: i64) -> Result<ServiceConfig, String> {
-    match db::service_config(conn, id).map_err(|e| e.to_string())? {
-        Some(json) => ServiceConfig::from_json(&json),
-        None => Ok(ServiceConfig::default()),
+#[derive(Serialize)]
+pub struct ProjectServices {
+    pub services: Vec<ServiceView>,
+    /// 仓库内有描述文件时的解析/校验错误（文件坏了也要能看见）。
+    pub descriptor_error: Option<String>,
+    pub descriptor_exists: bool,
+    pub detected: crate::detect::DetectResult,
+}
+
+fn layer_name(l: Layer) -> &'static str {
+    match l {
+        Layer::Descriptor => "descriptor",
+        Layer::Db => "db",
     }
 }
 
-#[tauri::command]
-pub fn service_config(id: i64) -> Result<Option<ServiceConfig>, String> {
-    let conn = db::open_db().map_err(|e| e.to_string())?;
-    match db::service_config(&conn, id).map_err(|e| e.to_string())? {
-        Some(json) => ServiceConfig::from_json(&json).map(Some),
-        None => Ok(None),
+/// 把 `Resolved` 转成给前端的视图，并附上状态与警告。
+fn view_of(sup: &supervisor::Supervisor, r: &Resolved) -> ServiceView {
+    let key = r.key();
+    let status = sup.status_of(&key);
+    let mut warnings = Vec::new();
+    if let Some(docker) = &r.spec.docker {
+        for f in &docker.files {
+            if !r.base.join(f).is_file() {
+                warnings.push(format!("compose 文件不存在：{}", f));
+            }
+        }
+    }
+    if let Some(run) = r.spec.run.as_ref() {
+        if let Some(program) = run.first() {
+            let path = crate::execenv::path_for(r.derived.node_pin.as_deref());
+            if crate::execenv::resolve(program, &path).is_none() {
+                warnings.push(format!("缺少可执行文件：{program}"));
+            }
+        }
+    }
+    ServiceView {
+        layer: layer_name(r.layer).to_string(),
+        origin: r.derived.origin.clone(),
+        keep_alive: r.keep_alive,
+        port_offset: r.port_offset,
+        spec: r.spec.clone(),
+        status,
+        warnings,
     }
 }
 
-#[tauri::command]
-pub fn save_service_config(id: i64, config: ServiceConfig) -> Result<(), String> {
+fn resolve_all_or_err(id: i64) -> Result<(PathBuf, Vec<Resolved>, localstate::Overrides), String> {
     let base = existing_project_path(id)?;
-    let mut config = config;
-    // 保存时刷新 toolchain，供 preflight 直接读取而不用重扫目录
+    let conn = db::open_db().map_err(|e| e.to_string())?;
+    let (items, overrides) = plan::resolve_all(&conn, id, &base)?;
+    Ok((base, items, overrides))
+}
+
+/// 项目下所有服务 + 探测结果。每次调用都重扫（纯读文件，毫秒级），保证不会显示过期信息。
+#[tauri::command]
+pub fn project_services<R: tauri::Runtime>(app: tauri::AppHandle<R>, id: i64) -> Result<ProjectServices, String> {
+    let base = existing_project_path(id)?;
+    let sup = supervisor::state(&app);
+    let descriptor = crate::descriptor::read(&base);
+    let descriptor_error = descriptor.as_ref().err().cloned();
+    let descriptor_exists = crate::descriptor::exists(&base);
+    let conn = db::open_db().map_err(|e| e.to_string())?;
+    // 描述文件坏了：报错给 UI，但不假装数据库里的旧配方仍然有效（文件才是真相源）
+    let items = if descriptor_error.is_some() {
+        Vec::new()
+    } else {
+        plan::resolve_all(&conn, id, &base)?.0
+    };
+    let services: Vec<ServiceView> = items.iter().map(|r| view_of(&sup, r)).collect();
     let detected = crate::detect::detect(&base);
-    config.toolchain = detected.toolchain;
-    let json = config.to_json()?;
-    let conn = db::open_db().map_err(|e| e.to_string())?;
-    db::set_service_config(&conn, id, &json).map_err(|e| e.to_string())
+    Ok(ProjectServices { services, descriptor_error, descriptor_exists, detected })
 }
 
+/// 已声明服务的状态（全局，前端按 project_id 过滤）。
 #[tauri::command]
-pub fn delete_service_config(id: i64) -> Result<(), String> {
-    let conn = db::open_db().map_err(|e| e.to_string())?;
-    db::delete_service_config(&conn, id).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn detect_service(id: i64) -> Result<crate::detect::DetectResult, String> {
-    let base = existing_project_path(id)?;
-    Ok(crate::detect::detect(&base))
-}
-
-#[tauri::command]
-pub fn service_status<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Vec<supervisor::ServiceStatus> {
+pub fn service_status<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Vec<ServiceStatus> {
     supervisor::state(&app).statuses()
 }
 
 #[tauri::command]
-pub fn service_logs<R: tauri::Runtime>(app: tauri::AppHandle<R>, id: i64) -> Vec<String> {
-    supervisor::state(&app).logs_of(id)
+pub fn service_logs<R: tauri::Runtime>(app: tauri::AppHandle<R>, project_id: i64, name: String) -> Vec<String> {
+    supervisor::state(&app).logs_of(&supervisor::key_of(project_id, &name))
 }
 
 /// 空数组 = 可执行；否则每条是「为什么不能点」。
 #[tauri::command]
-pub fn service_preflight(id: i64, step: String) -> Result<Vec<String>, String> {
-    let base = existing_project_path(id)?;
-    let conn = db::open_db().map_err(|e| e.to_string())?;
-    let cfg = load_config(&conn, id)?;
-    let argv = match step.as_str() {
-        "install" => cfg.install.clone(),
-        "build" => cfg.build.clone(),
-        "start" => {
-            if cfg.start.is_empty() {
-                None
-            } else {
-                Some(cfg.start.clone())
+pub fn service_preflight(id: i64, name: String, step: Option<String>) -> Result<Vec<String>, String> {
+    let (_, items, _) = resolve_all_or_err(id)?;
+    let r = items
+        .iter()
+        .find(|i| i.spec.name == name)
+        .ok_or_else(|| format!("该项目没有名为 {name} 的服务"))?;
+    let argv = match step.as_deref() {
+        Some(s) => r
+            .spec
+            .step(s)
+            .ok_or_else(|| format!("{} 没有名为 {s} 的步骤", name))?
+            .argv
+            .clone(),
+        None => {
+            if !r.spec.is_longrun() {
+                return Ok(vec![format!("{name} 没有 run 命令")]);
             }
+            r.spec.run_argv()
         }
-        other => return Err(format!("未知步骤：{other}")),
     };
-    let Some(argv) = argv else {
-        return Ok(vec![match step.as_str() {
-            "install" => "该项目没有安装命令".to_string(),
-            "build" => "该项目没有构建命令".to_string(),
-            _ => "该项目没有启动命令".to_string(),
-        }]);
-    };
-    let _ = base;
-    Ok(preflight_problems(&cfg, &argv))
+    Ok(preflight_problems(r, &argv))
 }
 
-fn preflight_problems(cfg: &ServiceConfig, argv: &[String]) -> Vec<String> {
-    let path = crate::execenv::path_for(cfg);
+fn preflight_problems(r: &Resolved, argv: &[String]) -> Vec<String> {
+    let path = crate::execenv::path_for(r.derived.node_pin.as_deref());
     let mut out = Vec::new();
     if let Some(program) = argv.first() {
         if crate::execenv::resolve(program, &path).is_none() {
             out.push(format!("缺少可执行文件：{program}"));
         }
     }
-    for tool in &cfg.toolchain {
+    for tool in &r.derived.toolchain {
         if crate::execenv::resolve(tool, &path).is_none() {
             out.push(format!("缺少可执行文件：{tool}（项目需要它才能构建/运行）"));
         }
     }
-    if let Some(pin) = cfg.node_pin.as_deref() {
+    if let Some(pin) = r.derived.node_pin.as_deref() {
         if crate::execenv::node_bin_dir(pin).is_none() {
             out.push(format!("缺少 node {pin}（nvm install {pin}）"));
         }
+    }
+    if let Err(e) = r.cwd() {
+        out.push(e);
     }
     out.dedup();
     out
 }
 
+/// 启动一个服务（含 depends_on 拓扑顺序，先起依赖）。
 #[tauri::command]
-pub fn service_start<R: tauri::Runtime>(app: tauri::AppHandle<R>, id: i64) -> Result<supervisor::ServiceStatus, String> {
-    let base = existing_project_path(id)?;
-    let conn = db::open_db().map_err(|e| e.to_string())?;
-    let cfg = load_config(&conn, id)?;
-    if cfg.start.is_empty() {
-        return Err("该项目没有启动命令".to_string());
+pub fn service_start<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    id: i64,
+    name: String,
+) -> Result<ServiceStatus, String> {
+    let (base, items, _) = resolve_all_or_err(id)?;
+    let target = items
+        .iter()
+        .find(|i| i.spec.name == name)
+        .ok_or_else(|| format!("该项目没有名为 {name} 的服务"))?
+        .clone();
+
+    // 依赖先按拓扑顺序启动（已在运行的跳过）
+    let order = plan::order_by_deps(&items)?;
+    let sup = supervisor::state(&app);
+    let project_path = base.to_string_lossy().into_owned();
+    let mut taken: HashSet<u16> = sup
+        .statuses()
+        .into_iter()
+        .filter(|s| s.project_id == id)
+        .filter_map(|s| s.port)
+        .collect();
+
+    let mut chain: Vec<&Resolved> = Vec::new();
+    if !target.spec.depends_on.is_empty() {
+        for idx in order.iter().copied() {
+            let cand = &items[idx];
+            if cand.spec.name == target.spec.name {
+                break;
+            }
+            if target.spec.depends_on.contains(&cand.spec.name) {
+                chain.push(cand);
+            }
+        }
+        // 依赖的依赖也要起：用闭包反复求并集
+        let mut wanted: HashSet<String> = target.spec.depends_on.iter().cloned().collect();
+        loop {
+            let extra: Vec<String> = items
+                .iter()
+                .filter(|i| wanted.contains(&i.spec.name))
+                .flat_map(|i| i.spec.depends_on.iter().cloned())
+                .filter(|d| !wanted.contains(d.as_str()))
+                .collect();
+            if extra.is_empty() {
+                break;
+            }
+            wanted.extend(extra);
+        }
+        chain = order
+            .iter()
+            .map(|i| &items[*i])
+            .filter(|r| wanted.contains(&r.spec.name) && r.spec.name != target.spec.name)
+            .collect();
     }
-    if let Some(first) = preflight_problems(&cfg, &cfg.start).into_iter().next() {
+
+    for dep in chain {
+        if sup.is_active(&dep.key()) {
+            continue;
+        }
+        start_one(&app, &sup, &project_path, dep, &mut taken, true)?;
+    }
+
+    start_one(&app, &sup, &project_path, &target, &mut taken, false)
+}
+
+fn start_one<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    sup: &supervisor::Supervisor,
+    project_path: &str,
+    r: &Resolved,
+    taken: &mut HashSet<u16>,
+    as_dependency: bool,
+) -> Result<ServiceStatus, String> {
+    let key = r.key();
+    if sup.is_active(&key) {
+        if as_dependency {
+            return sup.status_of(&key).ok_or_else(|| "状态丢失".to_string());
+        }
+        return Err(format!("{} 已在运行", r.spec.name));
+    }
+    let argv = r.spec.run_argv();
+    if let Some(first) = preflight_problems(r, &argv).into_iter().next() {
         return Err(first);
     }
-    let sup = supervisor::state(&app);
-    if sup.is_active(id) {
-        return Err("该服务已在运行".to_string());
+    let mut plan = plan::build_plan(project_path, r, taken)?;
+    if let Some(p) = plan.spawn.port {
+        taken.insert(p);
     }
 
-    let mut notes: Vec<String> = Vec::new();
-    for p in crate::ports::missing_requires(&cfg.requires_ports) {
-        notes.push(format!("端口 {p} 无人监听：先起依赖容器（docker compose up -d）"));
-    }
-
-    let mut argv = cfg.start.clone();
-    let mut extra_env: Vec<(String, String)> = Vec::new();
-    let mut assign_port = None;
-    let mut observe = None;
-    if let Some(wanted) = cfg.dev_port {
-        let pick = crate::ports::pick(wanted).ok_or_else(|| {
-            format!(
-                "端口 {wanted}–{} 全被占用",
-                wanted.saturating_add(crate::ports::PICK_ATTEMPTS - 1)
-            )
-        })?;
-        assign_port = Some(pick.port);
-        if pick.shifted {
-            let who = crate::ports::holder(wanted).unwrap_or_else(|| "其它进程".to_string());
-            notes.push(format!(
-                "已改用 {}（{wanted} 被 {who} 占用；项目内硬编码的 {wanted} 未改）",
-                pick.port
-            ));
-        }
-        let (planned, env) = crate::ports::plan_argv(wanted, pick.port, &argv, &base);
-        argv = planned;
-        if env.iter().any(|(k, _)| k == "PORT") {
-            notes.push(format!("（已注入 PORT={}，若项目忽略该变量则仍监听原端口）", pick.port));
-        }
-        extra_env = env;
-        observe = Some((
-            crate::ports::listening_in(wanted..=wanted.saturating_add(crate::ports::OBSERVE_SPAN)),
-            wanted..=wanted.saturating_add(crate::ports::OBSERVE_SPAN),
-        ));
-    }
-
-    let note = if notes.is_empty() { None } else { Some(notes.join("；")) };
-    sup.clear_logs(id);
-    let ctx = std::sync::Arc::new(supervisor::Ctx::<R>::new(app.clone()));
-    sup.spawn(
-        ctx.clone(),
-        supervisor::Launch {
-            project_id: id,
-            base: &base,
-            argv: &argv,
-            cfg: &cfg,
-            extra_env: &extra_env,
-            phase: Phase::Running,
-            port: assign_port,
-            note,
-        },
-    )?;
-    supervisor::Ctx::<R>::new(app.clone()).emit_state(id);
-
-    // 实测校准：等某个端口真正开始监听，再把真相写回状态（顺延是否生效只有实测能证明）
-    if let (Some((before, range)), Some(assigned)) = (observe, assign_port) {
-        let sup2: supervisor::Supervisor = (*sup).clone();
-        let ctx2 = supervisor::Ctx::<R>::new(app.clone());
-        std::thread::spawn(move || {
-            match crate::ports::wait_listening(&before, range, std::time::Duration::from_secs(15)) {
-                Some(actual) => {
-                    let note = if actual == assigned {
-                        None
-                    } else {
-                        Some(format!("实际监听 {actual}"))
-                    };
-                    sup2.set_port(id, Some(actual), note);
+    // depends_on 里声明了健康等待的：先等依赖端口就绪（最多 30s），失败只提示不阻塞
+    if !plan.depends_on.is_empty() {
+        let mut notes: Vec<String> = plan.spawn.note.iter().cloned().collect();
+        for dep in &plan.depends_on {
+            let dep_key = supervisor::key_of(r.project_id, dep);
+            let dep_port = sup.port_of(&dep_key);
+            if let Some(p) = dep_port {
+                if !plan::wait_ready(Some(p), None, std::time::Duration::from_secs(30)) {
+                    notes.push(format!("依赖 {dep} 的端口 {p} 未在 30s 内就绪"));
                 }
-                None => sup2.set_port(id, None, Some("未检测到监听端口".to_string())),
             }
-            ctx2.emit_state(id);
+        }
+        if !notes.is_empty() {
+            plan.spawn.note = Some(notes.join("；"));
+        }
+    }
+
+    sup.clear_logs(&key);
+    let ctx = std::sync::Arc::new(supervisor::Ctx::<R>::new(app.clone()));
+    sup.spawn(ctx.clone(), plan.spawn.clone())?;
+    supervisor::Ctx::<R>::new(app.clone()).emit_state(&key);
+
+    // 记住实际端口，下次启动沿用（URL 才稳定）
+    if let Some(p) = plan.remember_port {
+        localstate::remember_port(project_path, &r.spec.name, p);
+    }
+
+    // 实测校准 + 健康检查：等真正开始监听，把真相写回
+    if plan.spawn.port.is_some() {
+        let sup2 = (*sup).clone();
+        let ctx2 = supervisor::Ctx::<R>::new(app.clone());
+        let key2 = key.clone();
+        let assigned = plan.spawn.port;
+        let health = plan.health.clone();
+        let timeout = health
+            .as_ref()
+            .and_then(|h| h.timeout_ms)
+            .map(std::time::Duration::from_millis)
+            .unwrap_or_else(|| std::time::Duration::from_secs(30));
+        let project_path = project_path.to_string();
+        let svc_name = r.spec.name.clone();
+        std::thread::spawn(move || {
+            let ok = plan::wait_ready(assigned, health.as_ref(), timeout);
+            if ok {
+                if let Some(p) = assigned {
+                    sup2.set_port(&key2, Some(p), None);
+                }
+                localstate::remember_port(&project_path, &svc_name, assigned.unwrap_or(0));
+            } else {
+                sup2.set_port(&key2, assigned, Some("健康检查超时：进程在跑但未就绪".to_string()));
+            }
+            ctx2.emit_state(&key2);
         });
     }
-    sup.status_of(id).ok_or_else(|| "状态丢失".to_string())
+    sup.status_of(&key).ok_or_else(|| "状态丢失".to_string())
 }
 
 #[tauri::command]
-pub fn service_stop<R: tauri::Runtime>(app: tauri::AppHandle<R>, id: i64) -> Result<(), String> {
-    supervisor::state(&app).stop(id);
-    supervisor::Ctx::<R>::new(app.clone()).emit_state(id);
+pub fn service_stop<R: tauri::Runtime>(app: tauri::AppHandle<R>, id: i64, name: String) -> Result<(), String> {
+    let key = supervisor::key_of(id, &name);
+    supervisor::state(&app).stop(&key);
+    localstate::clear_adopt(&key);
+    supervisor::Ctx::<R>::new(app.clone()).emit_state(&key);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn service_stop_all<R: tauri::Runtime>(app: tauri::AppHandle<R>, id: i64) -> Result<(), String> {
+    let sup = supervisor::state(&app);
+    for key in sup.active_keys_of_project(id) {
+        sup.stop(&key);
+        localstate::clear_adopt(&key);
+        supervisor::Ctx::<R>::new(app.clone()).emit_state(&key);
+    }
     Ok(())
 }
 
 /// 立即返回；进度靠 `svc:state` / `svc:log` 事件。
 #[tauri::command]
-pub fn service_step<R: tauri::Runtime>(app: tauri::AppHandle<R>, id: i64, step: String) -> Result<(), String> {
-    let base = existing_project_path(id)?;
-    let conn = db::open_db().map_err(|e| e.to_string())?;
-    let cfg = load_config(&conn, id)?;
-    let (argv, phase) = match step.as_str() {
-        "install" => (cfg.install.clone(), Phase::Installing),
-        "build" => (cfg.build.clone(), Phase::Building),
-        other => return Err(format!("未知步骤：{other}")),
-    };
-    let argv = argv.ok_or_else(|| {
-        format!("该项目没有{}命令", if step == "install" { "安装" } else { "构建" })
-    })?;
-    if let Some(first) = preflight_problems(&cfg, &argv).into_iter().next() {
+pub fn service_step<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    id: i64,
+    name: String,
+    step: String,
+) -> Result<(), String> {
+    let (_, items, _) = resolve_all_or_err(id)?;
+    let r = items
+        .iter()
+        .find(|i| i.spec.name == name)
+        .ok_or_else(|| format!("该项目没有名为 {name} 的服务"))?;
+    let spec = r.spec.step(&step).ok_or_else(|| format!("{name} 没有名为 {step} 的步骤"))?;
+    let timeout_s = spec.timeout_s;
+    let spawn = plan::build_step_plan(r, spec)?;
+    if let Some(first) = preflight_problems(r, &spawn.argv).into_iter().next() {
         return Err(first);
     }
     let sup = supervisor::state(&app);
-    if sup.is_active(id) {
-        return Err("已有运行中的进程".to_string());
+    let key = r.key();
+    if sup.is_active(&key) {
+        return Err(format!("{name} 已有运行中的进程"));
     }
+    sup.clear_logs(&key);
     let ctx = std::sync::Arc::new(supervisor::Ctx::<R>::new(app.clone()));
-    sup.clear_logs(id);
-    sup.spawn(
-        ctx.clone(),
-        supervisor::Launch {
-            project_id: id,
-            base: &base,
-            argv: &argv,
-            cfg: &cfg,
-            extra_env: &[],
-            phase,
-            port: None,
-            note: None,
-        },
-    )?;
-    ctx.emit_state(id);
+    sup.spawn(ctx.clone(), spawn)?;
+    supervisor::Ctx::<R>::new(app.clone()).emit_state(&key);
 
-    // 超时看护：到点时只有「这一代运行仍在跑」才杀，避免误伤 30 分钟后同项目的新进程
-    let started = sup.gen_of(id);
+    // 超时看护：到点时只有「这一代运行仍在跑」才杀
+    let started = sup.gen_of(&key);
     let app2 = app.clone();
-    let sup2: supervisor::Supervisor = (*sup).clone();
+    let sup2 = (*sup).clone();
     std::thread::spawn(move || {
-        std::thread::sleep(crate::execenv::STEP_TIMEOUT);
-        if sup2.gen_of(id) == started && sup2.is_active(id) {
-            sup2.stop(id);
-            supervisor::Ctx::new(app2.clone()).emit_state(id);
+        std::thread::sleep(std::time::Duration::from_secs(timeout_s));
+        if sup2.gen_of(&key) == started && sup2.is_active(&key) {
+            sup2.stop(&key);
+            supervisor::Ctx::new(app2.clone()).emit_state(&key);
         }
     });
     Ok(())
 }
 
 #[tauri::command]
-pub fn open_service_url<R: tauri::Runtime>(id: i64, app: tauri::AppHandle<R>) -> Result<(), String> {
-    let port = supervisor::state(&app).port_of(id).ok_or_else(|| "该服务没有监听端口".to_string())?;
+pub fn open_service_url<R: tauri::Runtime>(app: tauri::AppHandle<R>, id: i64, name: String) -> Result<(), String> {
+    let key = supervisor::key_of(id, &name);
+    let port = supervisor::state(&app).port_of(&key).ok_or_else(|| "该服务没有监听端口".to_string())?;
     run_command("open", &[&format!("http://127.0.0.1:{port}")])
+}
+
+/// 保存单个服务到数据库（「一键采用」/手工填写）。不写仓库文件。
+#[tauri::command]
+pub fn save_service(id: i64, spec: ServiceSpec) -> Result<(), String> {
+    let base = existing_project_path(id)?;
+    let problems = spec.validate();
+    if !problems.is_empty() {
+        return Err(problems.join("；"));
+    }
+    let mut derived = Derived::manual();
+    let detected = crate::detect::detect(&base);
+    derived.toolchain = detected.toolchain;
+    derived.node_pin = detected.node_pin;
+    let conn = db::open_db().map_err(|e| e.to_string())?;
+    db::insert_service(&conn, id, &spec, &derived).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_service(id: i64, name: String) -> Result<(), String> {
+    let base = existing_project_path(id)?;
+    if crate::descriptor::exists(&base) {
+        return Err(format!(
+            "该项目有 {}，请在该文件里删除服务（数据库不会覆盖已有声明）",
+            crate::descriptor::FILE_NAME
+        ));
+    }
+    let conn = db::open_db().map_err(|e| e.to_string())?;
+    db::delete_service(&conn, id, &name).map_err(|e| e.to_string())
+}
+
+/// 固化为仓库内声明：把当前数据库里的服务写进 `.project-ctrl.json`。
+/// 已存在时默认拒绝（`overwrite=false`），绝不静默覆盖团队文件。
+#[tauri::command]
+pub fn solidify_descriptor(id: i64, names: Vec<String>, overwrite: bool) -> Result<String, String> {
+    let base = existing_project_path(id)?;
+    let conn = db::open_db().map_err(|e| e.to_string())?;
+    let rows = db::services_of(&conn, id).map_err(|e| e.to_string())?;
+    let mut specs = Vec::new();
+    for row in rows {
+        let spec = ServiceSpec::from_json(&row.config)?;
+        if names.is_empty() || names.contains(&spec.name) {
+            specs.push(spec);
+        }
+    }
+    if specs.is_empty() {
+        return Err("没有可固化的服务".to_string());
+    }
+    let desc = Descriptor::new(specs);
+    crate::descriptor::write(&base, &desc, overwrite)?;
+    let json = crate::services::to_descriptor_json(&desc)?;
+    Ok(json)
+}
+
+/// 描述文件的当前文本（供 UI 预览 diff / 手工编辑）。
+#[tauri::command]
+pub fn read_descriptor(id: i64) -> Result<Option<String>, String> {
+    let base = existing_project_path(id)?;
+    match std::fs::read_to_string(crate::descriptor::path_of(&base)) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("读取描述文件失败：{e}")),
+    }
+}
+
+/// 服务在本机层的覆盖（端口偏移 / keep_alive / restart / env）。
+///
+/// 与描述文件方向相反：这里**不**校验未知键，用户手写的内容原样保留。
+#[tauri::command]
+pub fn set_service_override(
+    id: i64,
+    name: String,
+    patch: Option<localstate::Override>,
+) -> Result<(), String> {
+    let base = existing_project_path(id)?;
+    let project_path = base.to_string_lossy().into_owned();
+    let mut overrides = localstate::load_overrides()?;
+    localstate::set_override(&mut overrides, &project_path, &name, patch.as_ref())?;
+    localstate::save_overrides(&overrides)
+}
+
+/// 读一个服务在本机层的覆盖（UI 打开开关时用）。
+#[tauri::command]
+pub fn service_override(id: i64, name: String) -> Result<Option<localstate::Override>, String> {
+    let base = existing_project_path(id)?;
+    let project_path = base.to_string_lossy().into_owned();
+    let overrides = localstate::load_overrides()?;
+    Ok(localstate::service_override(&overrides, &project_path, &name))
+}
+
+/// 启动 compose 栈（`docker compose up -d`）。
+#[tauri::command]
+pub fn docker_up(id: i64, name: String) -> Result<String, String> {
+    let (base, items, _) = resolve_all_or_err(id)?;
+    let r = items.iter().find(|i| i.spec.name == name).ok_or_else(|| format!("没有服务 {name}"))?;
+    let spec = r.spec.docker.clone().ok_or_else(|| format!("{name} 不是 docker 服务"))?;
+    let _ = base;
+    crate::docker::up(&r.base, &spec)
+}
+
+#[tauri::command]
+pub fn docker_down(id: i64, name: String) -> Result<String, String> {
+    let (_, items, _) = resolve_all_or_err(id)?;
+    let r = items.iter().find(|i| i.spec.name == name).ok_or_else(|| format!("没有服务 {name}"))?;
+    let spec = r.spec.docker.clone().ok_or_else(|| format!("{name} 不是 docker 服务"))?;
+    crate::docker::down(&r.base, &spec)
+}
+
+#[tauri::command]
+pub fn docker_ps(id: i64, name: String) -> Result<Vec<crate::docker::ContainerView>, String> {
+    let (_, items, _) = resolve_all_or_err(id)?;
+    let r = items.iter().find(|i| i.spec.name == name).ok_or_else(|| format!("没有服务 {name}"))?;
+    let spec = r.spec.docker.clone().ok_or_else(|| format!("{name} 不是 docker 服务"))?;
+    crate::docker::ps(&r.base, &spec)
 }
 
 #[tauri::command]
@@ -673,19 +905,19 @@ pub fn import_pm2() -> Result<ImportReport, String> {
             continue;
         }
         let pid = db::add_project(&conn, &a.cwd).map_err(|e| e.to_string())?;
-        if db::service_config(&conn, pid).map_err(|e| e.to_string())?.is_some() {
-            report.skipped.push(format!("{}：已有配方", a.name));
+        if !db::service_names(&conn, pid).map_err(|e| e.to_string())?.is_empty() {
+            report.skipped.push(format!("{}：已有服务声明", a.name));
             continue;
         }
-        let mut start = vec![a.script.clone()];
+        let mut run = vec![a.script.clone()];
         if let Some(args) = &a.args {
-            start.extend(args.split_whitespace().map(|s| s.to_string()));
+            run.extend(args.split_whitespace().map(|s| s.to_string()));
         }
         let mut env = std::collections::BTreeMap::new();
-        let mut dev_port = None;
+        let mut listen = None;
         for (k, v) in &a.env {
             if k == "PORT" {
-                dev_port = v.as_u64().and_then(|n| u16::try_from(n).ok());
+                listen = v.as_u64().and_then(|n| u16::try_from(n).ok());
                 continue;
             }
             if k == "NODE_ENV" {
@@ -695,16 +927,122 @@ pub fn import_pm2() -> Result<ImportReport, String> {
                 env.insert(k.clone(), s.to_string());
             }
         }
-        let cfg = ServiceConfig {
-            start,
+        let spec = ServiceSpec {
+            name: "default".into(),
+            cwd: None,
+            run: Some(run),
+            steps: Vec::new(),
+            env_files: Vec::new(),
             env,
-            dev_port,
-            origin: "pm2".to_string(),
-            toolchain: crate::detect::detect(Path::new(&a.cwd)).toolchain,
-            ..Default::default()
+            ports: crate::services::Ports { listen, requires: Vec::new() },
+            health: None,
+            depends_on: Vec::new(),
+            restart: crate::services::Restart::OnFailure,
+            docker: None,
         };
-        db::set_service_config(&conn, pid, &cfg.to_json()?).map_err(|e| e.to_string())?;
+        let mut derived = Derived::manual();
+        derived.origin = "pm2".into();
+        derived.toolchain = crate::detect::detect(Path::new(&a.cwd)).toolchain;
+        db::insert_service(&conn, pid, &spec, &derived).map_err(|e| e.to_string())?;
         report.imported.push(pid);
     }
     Ok(report)
+}
+
+/// App 退出前的收尾：
+/// - 声明了 `keep_alive` 的服务保留进程，并把凭据标记为「可收养」；
+/// - 其余服务杀掉，并清掉凭据（避免下次启动对死 pid 做收养尝试）。
+pub fn register_adoptable(sup: &supervisor::Supervisor) {
+    // 保留决定在**退出这一刻**重新判定：用户可能在服务启动之后才勾上开关。
+    let records = sup.adoptable();
+    let overrides = localstate::load_overrides().unwrap_or_default();
+    let paths: std::collections::HashMap<i64, String> = db::open_db()
+        .map(|conn| {
+            db::all_projects(&conn)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| (p.id, p.path))
+                .collect()
+        })
+        .unwrap_or_default();
+    let keep: HashSet<String> = records
+        .iter()
+        .filter(|rec| {
+            let Some(base) = paths.get(&rec.project_id) else { return false };
+            localstate::service_override(&overrides, base, &rec.name)
+                .and_then(|o| o.keep_alive)
+                .unwrap_or(false)
+        })
+        .map(|rec| rec.key.clone())
+        .collect();
+    for rec in records {
+        if keep.contains(&rec.key) {
+            let _ = localstate::write_adopt(&supervisor::AdoptRecord { keep_alive: true, ..rec });
+        } else {
+            localstate::clear_adopt(&rec.key);
+        }
+    }
+    sup.shutdown_all(&keep);
+}
+
+/// 启动时收养上次留下的进程（三重校验，任一不过就清理记录）。
+pub fn adopt_existing<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let records = localstate::read_adopts();
+    if records.is_empty() {
+        return;
+    }
+    let sup: supervisor::Supervisor = (*supervisor::state(app)).clone();
+    let sink = std::sync::Arc::new(supervisor::Ctx::<R>::new(app.clone()));
+    let conn = match db::open_db() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for rec in records {
+        let key = rec.key.clone();
+        if let Err(_e) = supervisor::verify_adopt(&rec) {
+            localstate::clear_adopt(&key);
+            continue;
+        }
+        // 上次不是「要保留」的进程，说明 App 是被强杀/崩溃的：回收孤儿。
+        // 这一步不依赖项目是否还在库中——凭据本身已经证明它是我们起的进程。
+        if !rec.keep_alive {
+            supervisor::reclaim_group(rec.pgid);
+            localstate::clear_adopt(&key);
+            continue;
+        }
+        let base = match db::project_path(&conn, rec.project_id).ok().flatten() {
+            Some(p) => PathBuf::from(p),
+            None => {
+                localstate::clear_adopt(&key);
+                continue;
+            }
+        };
+        // 必须走 `resolve_all`：它负责「仓库声明优先、没有才用数据库」的回落。
+        // 直接用 `load_db_specs`（空列表也是 Ok）会让描述文件里的服务永远找不到。
+        let Ok((items, _)) = plan::resolve_all(&conn, rec.project_id, &base) else {
+            localstate::clear_adopt(&key);
+            continue;
+        };
+        let Some(r) = items.into_iter().find(|i| i.spec.name == rec.name) else {
+            localstate::clear_adopt(&key);
+            continue;
+        };
+        let spec = supervisor::SpawnSpec {
+            key: key.clone(),
+            project_id: rec.project_id,
+            name: rec.name.clone(),
+            base: PathBuf::from(&rec.cwd),
+            argv: rec.argv.clone(),
+            env: Vec::new(),
+            phase: Phase::Running,
+            step: None,
+            port: rec.port,
+            note: Some("已接管上次运行的服务".to_string()),
+            restart: r.spec.restart,
+            keep_alive: true,
+        };
+        sup.adopt(sink.clone(), spec, rec.pid, rec.started_at);
+        let st = sup.status_of(&key).expect("收养后状态必须存在");
+        supervisor::Sink::state(sink.as_ref(), &st);
+    }
 }

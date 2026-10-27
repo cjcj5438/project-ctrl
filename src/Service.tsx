@@ -1,19 +1,23 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   api,
   errorText,
+  type ComposeCandidate,
+  type ContainerView,
   type DetectResult,
   type Phase,
   type ProjectInfo,
-  type ServiceConfig,
+  type ProjectServices,
+  type ServiceOverride,
+  type ServiceSpec,
   type ServiceStatus,
+  type ServiceView,
 } from './api'
 
 const PHASE_LABEL: Record<Phase, string> = {
   Idle: '未运行',
-  Installing: '安装中',
-  Building: '构建中',
+  Step: '执行中',
   Running: '运行中',
   Stopped: '已停止',
   Crashed: '已崩溃',
@@ -22,18 +26,31 @@ const PHASE_LABEL: Record<Phase, string> = {
 
 const DOT: Record<Phase, string> = {
   Idle: 'bg-neutral-400',
-  Installing: 'bg-amber-500',
-  Building: 'bg-amber-500',
+  Step: 'bg-amber-500',
   Running: 'bg-emerald-500',
   Stopped: 'bg-neutral-400',
   Crashed: 'bg-red-500',
   Failed: 'bg-red-500',
 }
 
-/** argv 输入框 <-> 数组：空格分隔（不支持引号，含空格的参数请用「编辑」以外的场景）。 */
-const joinArgv = (a: string[] | null): string => (a ?? []).join(' ')
+/** argv 输入框 <-> 数组：空格分隔（含空格的参数请直接编辑描述文件）。 */
+const joinArgv = (a: string[] | null | undefined): string => (a ?? []).join(' ')
+const splitArgv = (s: string): string[] => s.split(/\s+/).filter(Boolean)
 
-/** 服务面板：配方、状态、启停、日志。折叠时只显示一行摘要。 */
+/** 运行态的索引键：与后端 `ServiceStatus::key` 一致（`"{project_id}/{name}"`）。 */
+const statusKey = (projectId: number, name: string) => `${projectId}/${name}`
+
+/** 每个服务独立一行状态，不依赖项目维度。 */
+function statusLine(st: ServiceStatus | null) {
+  if (!st) return { label: PHASE_LABEL.Idle, dot: DOT.Idle, detail: '' }
+  const bits: string[] = []
+  if (st.step) bits.push(st.step)
+  if (st.port != null) bits.push(`:${st.port}`)
+  if (st.restarts > 0) bits.push(`重启 ${st.restarts} 次`)
+  return { label: PHASE_LABEL[st.phase], dot: DOT[st.phase], detail: bits.join(' · ') }
+}
+
+/** 服务面板：多服务的状态、启停、步骤、日志、docker 子容器。折叠时只显示汇总。 */
 export default function ServiceSection({
   project,
   onError,
@@ -42,28 +59,22 @@ export default function ServiceSection({
   onError: (m: string | null) => void
 }) {
   const [opened, setOpened] = useState(false)
-  const [loaded, setLoaded] = useState(false)
-  const [cfg, setCfg] = useState<ServiceConfig | null>(null)
-  const [detected, setDetected] = useState<DetectResult | null>(null)
-  const [status, setStatus] = useState<ServiceStatus | null>(null)
-  const [lines, setLines] = useState<string[]>([])
-  const [problems, setProblems] = useState<string[]>([])
-  const [busy, setBusy] = useState(false)
-  const [editing, setEditing] = useState(false)
-  const logRef = useRef<HTMLPreElement | null>(null)
+  const [data, setData] = useState<ProjectServices | null>(null)
+  const [statuses, setStatuses] = useState<Record<string, ServiceStatus>>({})
+  const [busy, setBusy] = useState<string | null>(null)
+  const [active, setActive] = useState<string | null>(null)
+  const [editing, setEditing] = useState<string | null>(null)
+  const [creating, setCreating] = useState(false)
 
   const load = useCallback(async () => {
     try {
-      const [c, st] = await Promise.all([
-        api.serviceConfig(project.id),
-        api.serviceStatus(),
-      ])
-      setCfg(c)
-      setLoaded(true)
-      setStatus(st.find((s) => s.project_id === project.id) ?? null)
-      setLines(await api.serviceLogs(project.id))
-      if (!c) setDetected(await api.detectService(project.id))
-      if (c) setProblems(await api.servicePreflight(project.id, 'start'))
+      const ps = await api.projectServices(project.id)
+      setData(ps)
+      const next: Record<string, ServiceStatus> = {}
+      ps.services.forEach((v) => {
+        if (v.status) next[statusKey(project.id, v.spec.name)] = v.status
+      })
+      setStatuses(next)
       onError(null)
     } catch (e) {
       onError(errorText(e))
@@ -72,90 +83,52 @@ export default function ServiceSection({
   }, [project.id])
 
   useEffect(() => {
-    if (!opened) return
-    void load()
+    if (opened) void load()
   }, [opened, load])
 
-  // 状态与日志订阅：只在展开时挂，避免列表页/详情页常驻监听
+  // 只在展开时订阅，避免列表页常驻监听
   useEffect(() => {
     if (!opened) return
     let alive = true
-    const unlisteners: UnlistenFn[] = []
+    const un: UnlistenFn[] = []
     void (async () => {
       const u1 = await listen<ServiceStatus>('svc:state', (e) => {
         if (!alive || e.payload.project_id !== project.id) return
-        setStatus(e.payload)
-        void refreshPreflight()
+        setStatuses((prev) => ({ ...prev, [e.payload.key]: e.payload }))
       })
-      const u2 = await listen<{ project_id: number; lines: string[] }>('svc:log', (e) => {
-        if (!alive || e.payload.project_id !== project.id) return
-        setLines((prev) => [...prev, ...e.payload.lines].slice(-2000))
-      })
-      unlisteners.push(u1, u2)
+      un.push(u1)
     })()
     return () => {
       alive = false
-      unlisteners.forEach((u) => u())
+      un.forEach((f) => f())
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [opened, project.id])
 
-  // 日志自动滚到底
-  useEffect(() => {
-    const el = logRef.current
-    if (el) el.scrollTop = el.scrollHeight
-  }, [lines])
-
-  const refreshPreflight = async () => {
-    try {
-      setProblems(await api.servicePreflight(project.id, 'start'))
-    } catch {
-      /* 预检失败不覆盖已有提示 */
-    }
-  }
-
-  const act = async (fn: () => Promise<void>) => {
-    setBusy(true)
+  const act = async (tag: string, fn: () => Promise<void>) => {
+    setBusy(tag)
     try {
       await fn()
       onError(null)
     } catch (e) {
       onError(errorText(e))
     } finally {
-      setBusy(false)
+      setBusy(null)
     }
   }
 
-  const adopt = (candidate: string[]) =>
-    act(async () => {
-      const d = detected
-      const next: ServiceConfig = {
-        install: d?.install ?? null,
-        build: d?.build ?? null,
-        start: candidate,
-        dev_port: d?.dev_port ?? null,
-        requires_ports: d?.requires_ports ?? [],
-        env: {},
-        node_pin: d?.node_pin ?? null,
-        toolchain: d?.toolchain ?? [],
-        origin: 'auto',
-      }
-      await api.saveServiceConfig(project.id, next)
-      setCfg(next)
-      setProblems(await api.servicePreflight(project.id, 'start'))
-    })
+  const services = data?.services ?? []
+  const running = services.filter((v) => {
+    const st = statuses[statusKey(project.id, v.spec.name)]
+    return st?.phase === 'Running' || st?.phase === 'Step'
+  }).length
 
-  const running = status?.phase === 'Running'
-  const transitional = status?.phase === 'Installing' || status?.phase === 'Building'
-
-  // cfg 为 null 有两种含义：还没读过（未展开）与确实没有配方，用 loaded 区分
-  const summary = !loaded
+  const summary = !data
     ? '展开查看'
-    : !cfg
-      ? '未配置'
-      : status
-        ? `${PHASE_LABEL[status.phase]}${status.port ? ` :${status.port}` : ''}`
-        : '已配置'
+    : data.descriptor_error
+      ? '描述文件有误'
+      : services.length === 0
+        ? '未配置'
+        : `${services.length} 个服务${running > 0 ? ` · ${running} 个运行中` : ''}`
 
   return (
     <details
@@ -166,9 +139,11 @@ export default function ServiceSection({
     >
       <summary className="cursor-pointer px-3 py-2 text-sm font-semibold">
         服务
-        {status && (
+        {services.length > 0 && (
           <span
-            className={`ml-2 inline-block h-2 w-2 rounded-full align-middle ${DOT[status.phase]}`}
+            className={`ml-2 inline-block h-2 w-2 rounded-full align-middle ${
+              running > 0 ? DOT.Running : DOT.Stopped
+            }`}
             aria-hidden
           />
         )}
@@ -176,148 +151,83 @@ export default function ServiceSection({
       </summary>
 
       <div className="border-t border-neutral-300 p-3 dark:border-neutral-700">
-        {!cfg ? (
-          <div>
-            <div className="text-sm text-neutral-500">
-              该项目还没有配方。下面是自动探测到的启动命令，选一个即可（也可以稍后手工编辑）。
+        {data?.descriptor_error && (
+          <div className="mb-3 rounded border border-red-300 bg-red-50 px-2 py-1.5 text-xs text-red-700 dark:border-red-800 dark:bg-red-950 dark:text-red-300">
+            <div className="font-semibold">.project-ctrl.json 无法解析，服务不可用</div>
+            <div className="mt-0.5 font-mono text-[11px] break-all">{data.descriptor_error}</div>
+            <div className="mt-1 text-[11px] opacity-80">
+              用编辑器修好该文件后点「刷新」；在修好之前，数据库里的旧配方不会顶替它。
             </div>
-            <DetectProblems detect={detected} />
-            <div className="mt-2 space-y-1.5">
-              {(detected?.start_candidates ?? []).map((c) => (
-                <div key={c.join(' ')} className="flex items-center gap-2">
-                  <code className="rounded bg-neutral-100 px-1.5 py-0.5 font-mono text-[11px] dark:bg-neutral-800">
-                    {c.join(' ')}
-                  </code>
-                  <button
-                    onClick={() => void adopt(c)}
-                    disabled={busy}
-                    className="rounded border border-neutral-300 px-2 py-0.5 text-xs disabled:opacity-40 dark:border-neutral-700"
-                  >
-                    使用此命令
-                  </button>
-                </div>
-              ))}
-              {(detected?.start_candidates ?? []).length === 0 && (
-                <div className="text-xs text-neutral-500">没有探测到可启动脚本，请手工填写。</div>
-              )}
-            </div>
-            <button
-              onClick={() => setEditing(true)}
-              className="mt-3 rounded border border-neutral-300 px-2 py-1 text-xs dark:border-neutral-700"
-            >
-              手工填写命令…
-            </button>
           </div>
-        ) : (
-          <>
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-neutral-600 dark:text-neutral-300">
-              <span className="inline-flex items-center gap-1.5">
-                <span className={`inline-block h-2 w-2 rounded-full ${DOT[status?.phase ?? 'Idle']}`} />
-                {PHASE_LABEL[status?.phase ?? 'Idle']}
-              </span>
-              {status?.port != null && <span>端口 {status.port}</span>}
-              {status?.pid != null && <span>PID {status.pid}</span>}
-              {status?.exit_code != null && <span>退出码 {status.exit_code}</span>}
-              <span>来源 {cfg.origin}</span>
-            </div>
-            {status?.note && (
-              <div className="mt-1 text-xs text-amber-700 dark:text-amber-400">{status.note}</div>
-            )}
-            {problems.length > 0 && (
-              <ul className="mt-1 list-inside list-disc text-xs text-red-600 dark:text-red-400">
-                {problems.map((p) => (
-                  <li key={p}>{p}</li>
-                ))}
-              </ul>
-            )}
-
-            <div className="mt-3 flex flex-wrap gap-2 text-xs">
-              <button
-                onClick={() => void act(async () => void (await api.serviceStart(project.id)))}
-                disabled={busy || running || transitional || problems.length > 0}
-                title={problems[0] ?? ''}
-                className="rounded bg-emerald-600 px-2 py-1 text-white disabled:opacity-40"
-              >
-                启动
-              </button>
-              <button
-                onClick={() => void act(async () => void (await api.serviceStop(project.id)))}
-                disabled={busy || !status || status.phase === 'Stopped' || status.phase === 'Idle'}
-                className="rounded border border-neutral-300 px-2 py-1 disabled:opacity-40 dark:border-neutral-700"
-              >
-                停止
-              </button>
-              <button
-                onClick={() =>
-                  void act(async () => {
-                    await api.serviceStop(project.id)
-                    await api.serviceStart(project.id)
-                  })
-                }
-                disabled={busy || transitional}
-                className="rounded border border-neutral-300 px-2 py-1 disabled:opacity-40 dark:border-neutral-700"
-              >
-                重启
-              </button>
-              <button
-                onClick={() => void act(async () => void (await api.serviceStep(project.id, 'install')))}
-                disabled={busy || transitional || running || !cfg.install}
-                className="rounded border border-neutral-300 px-2 py-1 disabled:opacity-40 dark:border-neutral-700"
-              >
-                安装依赖
-              </button>
-              <button
-                onClick={() => void act(async () => void (await api.serviceStep(project.id, 'build')))}
-                disabled={busy || transitional || running || !cfg.build}
-                className="rounded border border-neutral-300 px-2 py-1 disabled:opacity-40 dark:border-neutral-700"
-              >
-                构建
-              </button>
-              <button
-                onClick={() => void act(async () => void (await api.openServiceUrl(project.id)))}
-                disabled={status?.port == null}
-                className="rounded border border-neutral-300 px-2 py-1 disabled:opacity-40 dark:border-neutral-700"
-              >
-                打开
-              </button>
-              <button
-                onClick={() => setEditing(true)}
-                className="ml-auto rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
-              >
-                编辑命令
-              </button>
-            </div>
-
-            <div className="mt-3 overflow-hidden rounded border border-neutral-300 dark:border-neutral-700">
-              <div className="flex items-center gap-2 border-b border-neutral-300 bg-neutral-100 px-2 py-1 dark:border-neutral-700 dark:bg-neutral-800">
-                <span className="font-mono text-[11px] font-semibold">日志 · {lines.length} 行</span>
-                <button
-                  onClick={() => setLines([])}
-                  className="ml-auto rounded border border-neutral-300 px-2 py-0.5 text-[11px] dark:border-neutral-600"
-                >
-                  清空
-                </button>
-              </div>
-              <pre
-                ref={logRef}
-                className="max-h-[40vh] select-text overflow-auto whitespace-pre-wrap p-2 font-mono text-[11px] leading-relaxed"
-              >
-                {lines.length === 0 ? '（暂无输出）' : lines.join('\n')}
-              </pre>
-            </div>
-          </>
         )}
 
-        {editing && (
+        {services.map((v) => (
+          <ServiceCard
+            key={v.spec.name}
+            project={project}
+            view={v}
+            status={statuses[statusKey(project.id, v.spec.name)] ?? v.status}
+            busy={busy}
+            open={active === v.spec.name}
+            onToggle={() => setActive(active === v.spec.name ? null : v.spec.name)}
+            onEdit={() => setEditing(v.spec.name)}
+            onRefresh={load}
+            act={act}
+          />
+        ))}
+
+        {data && !data.descriptor_error && services.length === 0 && (
+          <DetectPanel
+            project={project}
+            detected={data.detected}
+            onDone={() => void load()}
+            onError={onError}
+            busy={busy}
+            act={act}
+          />
+        )}
+
+        {data && services.length > 0 && (
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+            <button
+              onClick={() => setCreating(true)}
+              className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+            >
+              添加服务…
+            </button>
+            <button
+              onClick={() => void act('stop-all', async () => void (await api.serviceStopAll(project.id)))}
+              disabled={busy !== null || running === 0}
+              className="rounded border border-neutral-300 px-2 py-1 disabled:opacity-40 dark:border-neutral-700"
+            >
+              全部停止
+            </button>
+            <button
+              onClick={() => void act('refresh', load)}
+              className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700"
+            >
+              刷新
+            </button>
+            <span className="ml-auto text-[11px] text-neutral-500">
+              来源：{data.descriptor_exists ? '.project-ctrl.json' : '本机数据库'}
+            </span>
+          </div>
+        )}
+
+        {(editing || creating) && (
           <EditForm
-            initial={cfg}
-            onCancel={() => setEditing(false)}
-            onSave={(next) =>
-              void act(async () => {
-                await api.saveServiceConfig(project.id, next)
-                setCfg(next)
-                setEditing(false)
-                setProblems(await api.servicePreflight(project.id, 'start'))
+            initial={creating ? null : services.find((v) => v.spec.name === editing)?.spec ?? null}
+            existingNames={services.map((v) => v.spec.name)}
+            onCancel={() => {
+              setEditing(null)
+              setCreating(false)
+            }}
+            onSave={(spec) =>
+              void act('save', async () => {
+                await api.saveService(project.id, spec)
+                setEditing(null)
+                setCreating(false)
+                await load()
               })
             }
           />
@@ -327,94 +237,656 @@ export default function ServiceSection({
   )
 }
 
-/** 探测阶段的人读说明（技术栈未识别、engines 非精确版本等）。 */
-function DetectProblems({ detect }: { detect: DetectResult | null }) {
-  if (!detect || detect.problems.length === 0) return null
+function ServiceCard({
+  project,
+  view,
+  status,
+  busy,
+  open,
+  onToggle,
+  onEdit,
+  onRefresh,
+  act,
+}: {
+  project: ProjectInfo
+  view: ServiceView
+  status: ServiceStatus | null
+  busy: string | null
+  open: boolean
+  onToggle: () => void
+  onEdit: () => void
+  onRefresh: () => Promise<void>
+  act: (tag: string, fn: () => Promise<void>) => Promise<void>
+}) {
+  const spec = view.spec
+  const name = spec.name
+  const line = statusLine(status)
+  const isRunning = status?.phase === 'Running'
+  const isStep = status?.phase === 'Step'
+  const [lines, setLines] = useState<string[]>([])
+  const [problems, setProblems] = useState<string[]>([])
+  const [containers, setContainers] = useState<ContainerView[] | null>(null)
+  const logRef = useRef<HTMLPreElement | null>(null)
+
+  // 展开时才拉日志 + 预检，避免无谓 IO
+  useEffect(() => {
+    if (!open) return
+    let alive = true
+    void (async () => {
+      try {
+        const l = await api.serviceLogs(project.id, name)
+        if (alive) setLines(l)
+        const pf = await api.servicePreflight(project.id, name)
+        if (alive) setProblems(pf)
+      } catch {
+        /* 预检/日志失败不打断 UI */
+      }
+    })()
+    const un: UnlistenFn[] = []
+    void listen<{ key: string; lines: string[] }>('svc:log', (e) => {
+      if (!alive || e.payload.key !== statusKey(project.id, name)) return
+      setLines((prev) => [...prev, ...e.payload.lines].slice(-2000))
+    }).then((f) => un.push(f))
+    return () => {
+      alive = false
+      un.forEach((f) => f())
+    }
+  }, [open, project.id, name])
+
+  useEffect(() => {
+    const el = logRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [lines])
+
+  const loadContainers = async () => {
+    try {
+      setContainers(await api.dockerPs(project.id, name))
+    } catch {
+      setContainers([])
+    }
+  }
+
+  useEffect(() => {
+    if (open && spec.docker) void loadContainers()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, name])
+
+  const stepLabel = (s: { name: string }) => s.name
+
   return (
-    <ul className="mt-2 list-inside list-disc text-xs text-neutral-500">
-      {detect.problems.map((p) => (
-        <li key={p}>{p}</li>
-      ))}
-    </ul>
+    <div className="mb-2 rounded border border-neutral-300 last:mb-0 dark:border-neutral-700">
+      <button
+        onClick={onToggle}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 px-2 py-1.5 text-left text-xs hover:bg-neutral-50 dark:hover:bg-neutral-800"
+      >
+        <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${line.dot}`} aria-hidden />
+        <span className="font-semibold">{name}</span>
+        <span className="text-neutral-500">{line.label}</span>
+        {line.detail && <span className="font-mono text-[11px] text-neutral-500">{line.detail}</span>}
+        {spec.docker && <span className="rounded bg-blue-100 px-1 text-[10px] text-blue-800 dark:bg-blue-900 dark:text-blue-100">docker</span>}
+        <span className="ml-auto font-mono text-[10px] text-neutral-400">{view.layer === 'descriptor' ? '.json' : 'db'}</span>
+      </button>
+
+      {open && (
+        <div className="border-t border-neutral-300 p-2 dark:border-neutral-700">
+          {status?.note && (
+            <div className="mb-1 text-[11px] text-amber-700 dark:text-amber-400">{status.note}</div>
+          )}
+          {view.warnings.length > 0 && (
+            <ul className="mb-1 list-inside list-disc text-[11px] text-amber-700 dark:text-amber-400">
+              {view.warnings.map((w) => (
+                <li key={w}>{w}</li>
+              ))}
+            </ul>
+          )}
+          {problems.length > 0 && (
+            <ul className="mb-1 list-inside list-disc text-[11px] text-red-600 dark:text-red-400">
+              {problems.map((p) => (
+                <li key={p}>{p}</li>
+              ))}
+            </ul>
+          )}
+
+          <div className="flex flex-wrap gap-1.5 text-[11px]">
+            <button
+              onClick={() => void act(`start-${name}`, async () => void (await api.serviceStart(project.id, name)))}
+              disabled={busy !== null || isRunning || isStep || problems.length > 0 || !spec.run}
+              title={problems[0] ?? (!spec.run ? '该服务没有 run 命令' : '')}
+              className="rounded bg-emerald-600 px-2 py-0.5 text-white disabled:opacity-40"
+            >
+              启动
+            </button>
+            <button
+              onClick={() => void act(`stop-${name}`, async () => void (await api.serviceStop(project.id, name)))}
+              disabled={busy !== null || (!isRunning && !isStep)}
+              className="rounded border border-neutral-300 px-2 py-0.5 disabled:opacity-40 dark:border-neutral-700"
+            >
+              停止
+            </button>
+            <button
+              onClick={() =>
+                void act(`restart-${name}`, async () => {
+                  await api.serviceStop(project.id, name)
+                  await api.serviceStart(project.id, name)
+                })
+              }
+              disabled={busy !== null || isStep || !spec.run}
+              className="rounded border border-neutral-300 px-2 py-0.5 disabled:opacity-40 dark:border-neutral-700"
+            >
+              重启
+            </button>
+            <button
+              onClick={() => void act(`url-${name}`, async () => void (await api.openServiceUrl(project.id, name)))}
+              disabled={status?.port == null}
+              className="rounded border border-neutral-300 px-2 py-0.5 disabled:opacity-40 dark:border-neutral-700"
+            >
+              打开
+            </button>
+            {(spec.steps ?? []).map((s) => (
+              <button
+                key={s.name}
+                onClick={() =>
+                  void act(`step-${name}-${s.name}`, async () => void (await api.serviceStep(project.id, name, s.name)))
+                }
+                disabled={busy !== null || isRunning || isStep}
+                className="rounded border border-neutral-300 px-2 py-0.5 disabled:opacity-40 dark:border-neutral-700"
+              >
+                {stepLabel(s)}
+              </button>
+            ))}
+            {spec.docker && (
+              <>
+                <button
+                  onClick={() =>
+                    void act(`up-${name}`, async () => {
+                      await api.dockerUp(project.id, name)
+                      await loadContainers()
+                    })
+                  }
+                  disabled={busy !== null}
+                  className="rounded bg-blue-600 px-2 py-0.5 text-white disabled:opacity-40"
+                >
+                  compose up
+                </button>
+                <button
+                  onClick={() =>
+                    void act(`down-${name}`, async () => {
+                      await api.dockerDown(project.id, name)
+                      await loadContainers()
+                    })
+                  }
+                  disabled={busy !== null}
+                  className="rounded border border-neutral-300 px-2 py-0.5 disabled:opacity-40 dark:border-neutral-700"
+                >
+                  compose down
+                </button>
+              </>
+            )}
+            <button
+              onClick={onEdit}
+              className="ml-auto rounded border border-neutral-300 px-2 py-0.5 dark:border-neutral-700"
+            >
+              编辑
+            </button>
+            <button
+              onClick={() => void act(`refresh-${name}`, onRefresh)}
+              className="rounded border border-neutral-300 px-2 py-0.5 dark:border-neutral-700"
+            >
+              刷新
+            </button>
+          </div>
+
+          {spec.docker && containers && (
+            <div className="mt-2 overflow-hidden rounded border border-neutral-300 dark:border-neutral-700">
+              <div className="border-b border-neutral-300 bg-neutral-100 px-2 py-1 text-[11px] font-semibold dark:border-neutral-700 dark:bg-neutral-800">
+                容器 · {spec.docker.files.join(' + ')}
+              </div>
+              {containers.length === 0 ? (
+                <div className="p-2 text-[11px] text-neutral-500">（没有运行中的容器）</div>
+              ) : (
+                <table className="w-full text-left text-[11px]">
+                  <tbody>
+                    {containers.map((c) => (
+                      <tr key={c.name} className="border-b border-neutral-200 last:border-0 dark:border-neutral-800">
+                        <td className="px-2 py-1 font-mono">{c.service}</td>
+                        <td className="px-2 py-1">{c.state}</td>
+                        <td className="px-2 py-1 text-neutral-500">{c.status}</td>
+                        <td className="px-2 py-1 font-mono text-neutral-500">{c.ports}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
+
+          <MeOverride project={project} name={name} view={view} onSaved={onRefresh} act={act} />
+
+          <div className="mt-2 overflow-hidden rounded border border-neutral-300 dark:border-neutral-700">
+            <div className="flex items-center gap-2 border-b border-neutral-300 bg-neutral-100 px-2 py-1 dark:border-neutral-700 dark:bg-neutral-800">
+              <span className="font-mono text-[11px] font-semibold">日志 · {lines.length} 行</span>
+              <button
+                onClick={() => setLines([])}
+                className="ml-auto rounded border border-neutral-300 px-2 py-0.5 text-[11px] dark:border-neutral-600"
+              >
+                清空
+              </button>
+            </div>
+            <pre
+              ref={logRef}
+              className="max-h-[40vh] select-text overflow-auto whitespace-pre-wrap p-2 font-mono text-[11px] leading-relaxed"
+            >
+              {lines.length === 0 ? '（暂无输出）' : lines.join('\n')}
+            </pre>
+          </div>
+        </div>
+      )}
+    </div>
   )
+}
+
+/** 本机覆盖：端口偏移与「退出后保留」。只写 `~/.project-ctrl/overrides.json`。 */
+function MeOverride({
+  project,
+  name,
+  view,
+  onSaved,
+  act,
+}: {
+  project: ProjectInfo
+  name: string
+  view: ServiceView
+  onSaved: () => Promise<void>
+  act: (tag: string, fn: () => Promise<void>) => Promise<void>
+}) {
+  const [offset, setOffset] = useState(String(view.port_offset || ''))
+  const [keep, setKeep] = useState(view.keep_alive)
+
+  useEffect(() => {
+    setOffset(view.port_offset ? String(view.port_offset) : '')
+    setKeep(view.keep_alive)
+  }, [view.port_offset, view.keep_alive])
+
+  const dirty =
+    (Number(offset || 0) || 0) !== view.port_offset || keep !== view.keep_alive
+
+  const save = () =>
+    act(`me-${name}`, async () => {
+      const next: ServiceOverride | null =
+        Number(offset || 0) === 0 && !keep
+          ? null
+          : { port_offset: Number(offset || 0) || null, keep_alive: keep || null }
+      await api.setServiceOverride(project.id, name, next)
+      await onSaved()
+    })
+
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-2 rounded border border-dashed border-neutral-300 px-2 py-1.5 text-[11px] dark:border-neutral-700">
+      <span className="text-neutral-500">本机</span>
+      <label className="inline-flex items-center gap-1">
+        端口偏移
+        <input
+          value={offset}
+          onChange={(e) => setOffset(e.target.value.replace(/[^\d]/g, ''))}
+          placeholder="0"
+          className="w-14 rounded border border-neutral-300 px-1 py-0.5 font-mono dark:border-neutral-700 dark:bg-neutral-800"
+        />
+      </label>
+      <label className="inline-flex items-center gap-1">
+        <input type="checkbox" checked={keep} onChange={(e) => setKeep(e.target.checked)} />
+        退出后保留进程
+      </label>
+      <button
+        onClick={save}
+        disabled={!dirty}
+        className="rounded border border-neutral-300 px-2 py-0.5 disabled:opacity-40 dark:border-neutral-700"
+      >
+        保存
+      </button>
+    </div>
+  )
+}
+
+/** 未配置时：探测结果 + 三条路径（保存到本机 / 固化为声明 / 手工填写）。 */
+function DetectPanel({
+  project,
+  detected,
+  onDone,
+  onError,
+  busy,
+  act,
+}: {
+  project: ProjectInfo
+  detected: DetectResult
+  onDone: () => void
+  onError: (m: string | null) => void
+  busy: string | null
+  act: (tag: string, fn: () => Promise<void>) => Promise<void>
+}) {
+  const [input, setInput] = useState('')
+  const compose = detected.compose_stacks
+
+  /** 探测结果 → 一条可保存的声明（不写仓库文件）。 */
+  const fromCandidate = (argv: string[], listen: number | null, requires: number[]): ServiceSpec => ({
+    name: guessName(argv),
+    run: argv,
+    steps: detected.build ? [{ name: 'build', argv: detected.build, timeout_s: 1800 }] : [],
+    ports: { listen, requires },
+    env: {},
+  })
+
+  const saveCandidate = (argv: string[]) =>
+    act('adopt', async () => {
+      await api.saveService(project.id, fromCandidate(argv, detected.dev_port, detected.requires_ports))
+      onDone()
+    })
+
+  const saveCompose = (stack: ComposeCandidate) =>
+    act('adopt-compose', async () => {
+      const files = [stack.file, ...stack.overrides]
+      await api.saveService(project.id, {
+        name: stack.file.includes('/') ? stack.file.split('/')[0] : 'docker',
+        docker: { files, services: stack.services, project_name: null },
+        ports: { requires: stack.ports },
+      })
+      onDone()
+    })
+
+  return (
+    <div>
+      <div className="text-sm text-neutral-500">
+        该项目还没有服务声明。下面是从文件里探测到的候选——点「保存」只写本机数据库，不会动你的仓库。
+      </div>
+
+      {detected.problems.length > 0 && (
+        <ul className="mt-2 list-inside list-disc text-xs text-neutral-500">
+          {detected.problems.map((p) => (
+            <li key={p}>{p}</li>
+          ))}
+        </ul>
+      )}
+
+      {detected.start_candidates.length > 0 && (
+        <div className="mt-2 space-y-1.5">
+          <div className="text-[11px] font-semibold text-neutral-500">package.json 脚本</div>
+          {detected.start_candidates.map((c) => (
+            <div key={c.join(' ')} className="flex items-center gap-2">
+              <code className="rounded bg-neutral-100 px-1.5 py-0.5 font-mono text-[11px] dark:bg-neutral-800">
+                {c.join(' ')}
+              </code>
+              <button
+                onClick={() => void saveCandidate(c)}
+                disabled={busy !== null}
+                className="rounded border border-neutral-300 px-2 py-0.5 text-xs disabled:opacity-40 dark:border-neutral-700"
+              >
+                保存
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {compose.length > 0 && (
+        <div className="mt-2 space-y-1.5">
+          <div className="text-[11px] font-semibold text-neutral-500">docker compose</div>
+          {compose.map((s) => (
+            <div key={s.file} className="flex flex-wrap items-center gap-2">
+              <code className="rounded bg-neutral-100 px-1.5 py-0.5 font-mono text-[11px] dark:bg-neutral-800">
+                {s.file}
+              </code>
+              <span className="text-[11px] text-neutral-500">{s.services.join(', ')}</span>
+              <button
+                onClick={() => void saveCompose(s)}
+                disabled={busy !== null}
+                className="rounded border border-neutral-300 px-2 py-0.5 text-xs disabled:opacity-40 dark:border-neutral-700"
+              >
+                保存
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {detected.make_targets.length > 0 && (
+        <div className="mt-2 text-[11px] text-neutral-500">
+          Makefile 目标：<span className="font-mono">{detected.make_targets.join(' ')}</span>
+        </div>
+      )}
+      {detected.script_candidates.length > 0 && (
+        <div className="mt-1 text-[11px] text-neutral-500">
+          脚本：<span className="font-mono">{detected.script_candidates.join(' ')}</span>
+        </div>
+      )}
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="手工输入启动命令，例如 pnpm dev"
+          className="w-64 rounded border border-neutral-300 px-2 py-1 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-800"
+        />
+        <button
+          onClick={() =>
+            void act('adopt-manual', async () => {
+              await api.saveService(project.id, fromCandidate(splitArgv(input), detected.dev_port, detected.requires_ports))
+              onDone()
+            })
+          }
+          disabled={busy !== null || splitArgv(input).length === 0}
+          className="rounded bg-blue-600 px-2 py-1 text-xs text-white disabled:opacity-40"
+        >
+          保存
+        </button>
+        <button
+          onClick={() => void act('solidify', async () => {
+            const text = await api.solidifyDescriptor(project.id, [], false)
+            onError(null)
+            void text
+          })}
+          title="把已有服务写进仓库内的 .project-ctrl.json"
+          className="ml-auto rounded border border-neutral-300 px-2 py-1 text-xs dark:border-neutral-700"
+        >
+          固化为仓库声明…
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/** 从 argv 里猜一个服务名（最多 24 字符，去重由后端约束）。 */
+function guessName(argv: string[]): string {
+  const cmd = argv.filter((a) => !a.startsWith('-'))[1] ?? argv[0] ?? 'service'
+  const cleaned = cmd.replace(/[^a-zA-Z0-9:_-]/g, '').slice(0, 24)
+  return cleaned || 'service'
 }
 
 function EditForm({
   initial,
+  existingNames,
   onSave,
   onCancel,
 }: {
-  initial: ServiceConfig | null
-  onSave: (c: ServiceConfig) => void
+  initial: ServiceSpec | null
+  existingNames: string[]
+  onSave: (c: ServiceSpec) => void
   onCancel: () => void
 }) {
-  const [install, setInstall] = useState(joinArgv(initial?.install ?? null))
-  const [build, setBuild] = useState(joinArgv(initial?.build ?? null))
-  const [start, setStart] = useState(joinArgv(initial?.start ?? null))
-  const [port, setPort] = useState(initial?.dev_port?.toString() ?? '')
-  const [requires, setRequires] = useState((initial?.requires_ports ?? []).join(' '))
-  const [pin, setPin] = useState(initial?.node_pin ?? '')
+  const isEdit = initial !== null
+  const [name, setName] = useState(initial?.name ?? '')
+  const [cwd, setCwd] = useState(initial?.cwd ?? '')
+  const [run, setRun] = useState(joinArgv(initial?.run ?? null))
+  const [steps, setSteps] = useState(
+    (initial?.steps ?? []).map((s) => `${s.name}=${joinArgv(s.argv)}`).join('\n'),
+  )
+  const [envFiles, setEnvFiles] = useState((initial?.env_files ?? []).join(' '))
+  const [envLines, setEnvLines] = useState(
+    Object.entries(initial?.env ?? {}).map(([k, v]) => `${k}=${v}`).join('\n'),
+  )
+  const [listen, setListen] = useState(initial?.ports?.listen?.toString() ?? '')
+  const [requires, setRequires] = useState((initial?.ports?.requires ?? []).join(' '))
+  const [depends, setDepends] = useState((initial?.depends_on ?? []).join(' '))
+  const [restart, setRestart] = useState<'never' | 'on-failure' | 'always'>(
+    initial?.restart ?? 'on-failure',
+  )
+  const [dockerFiles, setDockerFiles] = useState((initial?.docker?.files ?? []).join(' '))
+  const [dockerServices, setDockerServices] = useState((initial?.docker?.services ?? []).join(' '))
+  const [timeout, setTimeoutSec] = useState(
+    initial?.health?.timeout_ms ? String(initial.health.timeout_ms / 1000) : '',
+  )
+
+  const dup = !isEdit && existingNames.includes(name.trim())
+  const canSave = name.trim() !== '' && !dup && (splitArgv(run).length > 0 || splitArgv(steps).length > 0 || dockerFiles.trim() !== '')
 
   const input =
     'w-full rounded border border-neutral-300 bg-white px-2 py-1 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-800'
 
   const save = () => {
-    const cfg: ServiceConfig = {
-      install: install.trim() ? install.split(/\s+/).filter(Boolean) : null,
-      build: build.trim() ? build.split(/\s+/).filter(Boolean) : null,
-      start: start.split(/\s+/).filter(Boolean),
-      dev_port: port.trim() ? Number(port.trim()) : null,
-      requires_ports: requires
-        .split(/\s+/)
-        .filter(Boolean)
-        .map(Number)
-        .filter((n) => Number.isFinite(n)),
-      env: initial?.env ?? {},
-      node_pin: pin.trim() ? pin.trim() : null,
-      toolchain: initial?.toolchain ?? [],
-      origin: 'manual',
+    const parsedSteps = steps
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .map((l) => {
+        const [n, ...rest] = l.split('=')
+        return { name: n.trim(), argv: splitArgv(rest.join('=')), timeout_s: 1800 }
+      })
+    const env: Record<string, string> = {}
+    envLines
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .forEach((l) => {
+        const i = l.indexOf('=')
+        if (i > 0) env[l.slice(0, i).trim()] = l.slice(i + 1)
+      })
+    const spec: ServiceSpec = {
+      name: name.trim(),
+      cwd: cwd.trim() || null,
+      run: splitArgv(run).length > 0 ? splitArgv(run) : null,
+      steps: parsedSteps,
+      env_files: splitArgv(envFiles),
+      env,
+      ports: {
+        listen: listen.trim() ? Number(listen) : null,
+        requires: splitArgv(requires).map(Number).filter((n) => Number.isFinite(n)),
+      },
+      health: splitArgv(run).length > 0
+        ? { type: 'port', timeout_ms: timeout.trim() ? Number(timeout) * 1000 : null }
+        : null,
+      depends_on: splitArgv(depends),
+      restart,
+      docker: dockerFiles.trim()
+        ? {
+            files: splitArgv(dockerFiles),
+            project_name: null,
+            services: splitArgv(dockerServices),
+          }
+        : null,
     }
-    onSave(cfg)
+    onSave(spec)
   }
+
+  const label = 'block text-[11px] text-neutral-500'
 
   return (
     <div className="mt-3 rounded border border-neutral-300 p-3 dark:border-neutral-700">
-      <div className="text-xs font-semibold">编辑命令（空格分隔参数）</div>
+      <div className="text-xs font-semibold">{isEdit ? `编辑 ${initial?.name}` : '添加服务'}</div>
       <div className="mt-2 space-y-2">
-        <label className="block text-[11px] text-neutral-500">
-          安装
-          <input value={install} onChange={(e) => setInstall(e.target.value)} placeholder="pnpm install" className={input} />
-        </label>
-        <label className="block text-[11px] text-neutral-500">
-          构建
-          <input value={build} onChange={(e) => setBuild(e.target.value)} placeholder="pnpm run build" className={input} />
-        </label>
-        <label className="block text-[11px] text-neutral-500">
-          启动（必填）
-          <input value={start} onChange={(e) => setStart(e.target.value)} placeholder="pnpm dev" className={input} />
-        </label>
         <div className="flex gap-2">
-          <label className="block flex-1 text-[11px] text-neutral-500">
-            开发端口
-            <input value={port} onChange={(e) => setPort(e.target.value)} placeholder="留空则不管理端口" className={input} />
+          <label className="block w-40">
+            <span className={label}>名称（唯一）</span>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              disabled={isEdit}
+              className={input}
+            />
           </label>
-          <label className="block flex-1 text-[11px] text-neutral-500">
-            依赖端口（须已监听）
+          <label className="block flex-1">
+            <span className={label}>工作目录（相对项目根，可选）</span>
+            <input value={cwd} onChange={(e) => setCwd(e.target.value)} placeholder="frontend" className={input} />
+          </label>
+        </div>
+        {dup && <div className="text-[11px] text-red-600">已存在同名服务：{name}</div>}
+
+        <label className="block">
+          <span className={label}>启动命令（空格分隔参数）</span>
+          <input value={run} onChange={(e) => setRun(e.target.value)} placeholder="pnpm dev" className={input} />
+        </label>
+
+        <label className="block">
+          <span className={label}>一次性步骤（每行 `名称=命令`，默认不随启动执行）</span>
+          <textarea
+            value={steps}
+            onChange={(e) => setSteps(e.target.value)}
+            rows={2}
+            placeholder={'install=pnpm install\nbuild=pnpm run build'}
+            className={input}
+          />
+        </label>
+
+        <div className="flex gap-2">
+          <label className="block flex-1">
+            <span className={label}>env 文件（相对项目根）</span>
+            <input value={envFiles} onChange={(e) => setEnvFiles(e.target.value)} placeholder=".env.local" className={input} />
+          </label>
+          <label className="block flex-1">
+            <span className={label}>依赖服务（depends_on）</span>
+            <input value={depends} onChange={(e) => setDepends(e.target.value)} placeholder="db" className={input} />
+          </label>
+        </div>
+
+        <label className="block">
+          <span className={label}>环境变量（每行 `KEY=VALUE`）</span>
+          <textarea value={envLines} onChange={(e) => setEnvLines(e.target.value)} rows={2} className={input} />
+        </label>
+
+        <div className="flex gap-2">
+          <label className="block flex-1">
+            <span className={label}>监听端口</span>
+            <input value={listen} onChange={(e) => setListen(e.target.value.replace(/[^\d]/g, ''))} className={input} />
+          </label>
+          <label className="block flex-1">
+            <span className={label}>依赖端口</span>
             <input value={requires} onChange={(e) => setRequires(e.target.value)} placeholder="5432" className={input} />
           </label>
-          <label className="block flex-1 text-[11px] text-neutral-500">
-            node 版本
-            <input value={pin} onChange={(e) => setPin(e.target.value)} placeholder="24.16.0" className={input} />
+          <label className="block flex-1">
+            <span className={label}>就绪超时（秒）</span>
+            <input value={timeout} onChange={(e) => setTimeoutSec(e.target.value.replace(/[^\d]/g, ''))} placeholder="30" className={input} />
+          </label>
+          <label className="block w-32">
+            <span className={label}>崩溃重启</span>
+            <select
+              value={restart}
+              onChange={(e) => setRestart(e.target.value as 'never' | 'on-failure' | 'always')}
+              className={input}
+            >
+              <option value="never">不重启</option>
+              <option value="on-failure">失败时</option>
+              <option value="always">总是</option>
+            </select>
+          </label>
+        </div>
+
+        <div className="flex gap-2">
+          <label className="block flex-1">
+            <span className={label}>compose 文件（空格分隔，多个按序叠加）</span>
+            <input value={dockerFiles} onChange={(e) => setDockerFiles(e.target.value)} placeholder="infra/docker-compose.yml" className={input} />
+          </label>
+          <label className="block flex-1">
+            <span className={label}>compose 子服务</span>
+            <input value={dockerServices} onChange={(e) => setDockerServices(e.target.value)} placeholder="postgres minio" className={input} />
           </label>
         </div>
       </div>
+
       <div className="mt-3 flex justify-end gap-2 text-xs">
         <button onClick={onCancel} className="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700">
           取消
         </button>
         <button
           onClick={save}
-          disabled={start.split(/\s+/).filter(Boolean).length === 0}
+          disabled={!canSave}
           className="rounded bg-blue-600 px-2 py-1 text-white disabled:opacity-40"
         >
           保存

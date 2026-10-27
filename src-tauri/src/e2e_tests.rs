@@ -6,8 +6,8 @@
 #![cfg(test)]
 
 use crate::ports;
-use crate::services::ServiceConfig;
-use crate::supervisor::{Launch, Phase, Supervisor};
+use crate::services::Restart;
+use crate::supervisor::{key_of, Phase, SpawnSpec, Supervisor};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -35,7 +35,8 @@ struct KillOnDrop(Supervisor);
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        self.0.shutdown_all();
+        // 测试里不保留任何进程：显式传空集合
+        self.0.shutdown_all(&std::collections::HashSet::new());
     }
 }
 
@@ -65,12 +66,38 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     cond()
 }
 
+/// 构造一份最小 SpawnSpec（env 只有 PATH，避免继承本进程环境）。
+fn spec_for(
+    project_id: i64,
+    name: &str,
+    base: &Path,
+    argv: Vec<String>,
+    port: Option<u16>,
+    extra_env: &[(String, String)],
+) -> SpawnSpec {
+    let mut env = vec![("PATH".to_string(), crate::execenv::base_path())];
+    env.extend(extra_env.iter().cloned());
+    SpawnSpec {
+        key: key_of(project_id, name),
+        project_id,
+        name: name.to_string(),
+        base: base.to_path_buf(),
+        argv,
+        env,
+        phase: Phase::Running,
+        step: None,
+        port,
+        note: None,
+        restart: Restart::Never,
+        keep_alive: false,
+    }
+}
+
 /// 步骤 1：8080 被占（本机是 docker）→ 顺延到下一个空闲端口 → 进程真的听新端口 → 停止后释放。
 #[test]
 fn port_shift_actually_rebinds_and_releases() {
     let _guard = crate::test_support::exclusive_ports();
     // 自己占一个 OS 分配的端口当「冲突源」，不依赖本机 8080 上恰好有 docker。
-    // 端口要留出足够的观察窗口（`wanted..=wanted+OBSERVE_SPAN` 不能溢出 u16）。
     let mut squatter = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
     while squatter.local_addr().unwrap().port() > u16::MAX - ports::OBSERVE_SPAN - ports::PICK_ATTEMPTS {
         drop(squatter);
@@ -88,7 +115,6 @@ fn port_shift_actually_rebinds_and_releases() {
         "const p=process.env.PORT||8080;require('http').createServer((q,s)=>s.end('ok')).listen(p,'127.0.0.1')\n",
     )
     .unwrap();
-    std::fs::write(dir.join("package.json"), r#"{"name":"app","scripts":{"dev":"node server.js"}}"#).unwrap();
 
     let before = ports::listening_in(wanted..=wanted + ports::OBSERVE_SPAN);
     let argv: Vec<String> = vec!["node".into(), "server.js".into()];
@@ -99,22 +125,11 @@ fn port_shift_actually_rebinds_and_releases() {
     let guard = KillOnDrop(Supervisor::default());
     let sup = &guard.0;
     let sink = Arc::new(crate::supervisor::Collector::default());
-    let cfg = ServiceConfig { dev_port: Some(wanted), ..Default::default() };
-    let _pid = sup
-        .spawn(
-            sink,
-            Launch {
-                project_id: 1,
-                base: &dir,
-                argv: &planned,
-                cfg: &cfg,
-                extra_env: &extra,
-                phase: Phase::Running,
-                port: Some(pick.port),
-                note: None,
-            },
-        )
-        .expect("spawn 应成功");
+    sup.spawn(
+        sink,
+        spec_for(1, "dev", &dir, planned, Some(pick.port), &extra),
+    )
+    .expect("spawn 应成功");
 
     let observed = ports::wait_listening(
         &before,
@@ -126,7 +141,7 @@ fn port_shift_actually_rebinds_and_releases() {
     let body = http_get(observed).expect("应能连上并读到响应");
     assert!(body.contains("ok"), "响应内容异常: {body}");
 
-    sup.stop(1).expect("应有运行记录");
+    sup.stop(&key_of(1, "dev")).expect("应有运行记录");
     assert!(
         ports::wait_released(observed, Duration::from_secs(5)),
         "停止后端口 {observed} 必须释放"
@@ -146,7 +161,6 @@ fn real_vite_dev_server_on_shifted_port() {
         eprintln!("跳过：{repo:?} 未安装 node_modules");
         return;
     }
-    // 1420 被本机 vite 占着时才验证顺延；否则用 1420 本身也可
     let wanted = 1420u16;
     let pick = ports::pick(wanted).expect("应能选到端口");
     let before = ports::listening_in(wanted..=wanted + ports::OBSERVE_SPAN);
@@ -154,7 +168,6 @@ fn real_vite_dev_server_on_shifted_port() {
     let argv: Vec<String> = vec!["pnpm".into(), "dev".into()];
     let (planned, extra) = ports::plan_argv(wanted, pick.port, &argv, &repo);
     // 该测试真的要去起 vite：CI runner 上没有 pnpm 时跳过（不是产品问题）。
-    // 前置条件写成显式 skip，而不是让 spawn 失败被当成回归。
     if crate::execenv::resolve("pnpm", &crate::execenv::base_path()).is_none() {
         eprintln!("跳过：PATH 里没有 pnpm（CI 环境），无法真起 vite");
         return;
@@ -169,21 +182,9 @@ fn real_vite_dev_server_on_shifted_port() {
     let guard = KillOnDrop(Supervisor::default());
     let sup = &guard.0;
     let sink = Arc::new(crate::supervisor::Collector::default());
-    let cfg = ServiceConfig { dev_port: Some(wanted), ..Default::default() };
-    sup.spawn(
-        sink,
-        Launch {
-            project_id: 2,
-            base: &repo,
-            argv: &planned,
-            cfg: &cfg,
-            extra_env: &extra,
-            phase: Phase::Running,
-            port: Some(pick.port),
-            note: None,
-        },
-    )
-    .expect("spawn 应成功");
+    let key = key_of(2, "web");
+    sup.spawn(sink, spec_for(2, "web", &repo, planned, Some(pick.port), &extra))
+        .expect("spawn 应成功");
 
     let observed = ports::wait_listening(
         &before,
@@ -193,8 +194,8 @@ fn real_vite_dev_server_on_shifted_port() {
     let observed = match observed {
         Some(p) => p,
         None => {
-            sup.stop(2);
-            panic!("vite 未在 40 秒内监听；日志：{}", sup.logs_of(2).join("\n"));
+            sup.stop(&key);
+            panic!("vite 未在 40 秒内监听；日志：{}", sup.logs_of(&key).join("\n"));
         }
     };
 
@@ -211,7 +212,7 @@ fn real_vite_dev_server_on_shifted_port() {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    sup.stop(2);
+    sup.stop(&key);
     assert!(
         ports::wait_released(observed, Duration::from_secs(5)),
         "停止后 {observed} 必须释放（进程组回收失败）"
@@ -252,7 +253,7 @@ fn pull_gate_on_real_repos() {
     }
 }
 
-/// 步骤 6：`sub2api` 有 go.mod 但本机无 go → preflight 必须挡住。
+/// 步骤 6：`sub2api` 有 go.mod 但本机无 go → 预检必须挡住。
 #[test]
 fn preflight_blocks_missing_go_toolchain() {
     let dir = PathBuf::from(std::env::var("HOME").unwrap()).join("projects/sub2api");
@@ -263,21 +264,12 @@ fn preflight_blocks_missing_go_toolchain() {
     let d = crate::detect::detect(&dir);
     assert!(d.toolchain.contains(&"go".to_string()), "应识别出 go: {:?}", d.toolchain);
 
-    let cfg = ServiceConfig {
-        toolchain: d.toolchain.clone(),
-        build: Some(vec!["make".into(), "build".into()]),
-        start: vec!["make".into()],
-        ..Default::default()
-    };
-    // 直接复刻命令层的判定顺序
-    let path = crate::execenv::path_for(&cfg);
+    let path = crate::execenv::path_for(None);
     let mut problems = Vec::new();
-    if let Some(p) = cfg.build.as_ref().and_then(|a| a.first()) {
-        if crate::execenv::resolve(p, &path).is_none() {
-            problems.push(format!("缺少可执行文件：{p}"));
-        }
+    if crate::execenv::resolve("make", &path).is_none() {
+        problems.push("缺少可执行文件：make".to_string());
     }
-    for tool in &cfg.toolchain {
+    for tool in &d.toolchain {
         if crate::execenv::resolve(tool, &path).is_none() {
             problems.push(format!("缺少可执行文件：{tool}（项目需要它才能构建/运行）"));
         }
@@ -291,7 +283,7 @@ fn preflight_blocks_missing_go_toolchain() {
     }
 }
 
-/// 步骤 8：`shutdown_all` 之后所有受管端口必须释放。
+/// 步骤 8：`shutdown_all` 之后所有受管端口必须释放（多服务同时跑）。
 #[test]
 fn shutdown_all_releases_every_port() {
     let _guard = crate::test_support::exclusive_ports();
@@ -309,20 +301,17 @@ fn shutdown_all_releases_every_port() {
     for (i, wanted) in [44100u16, 44110].iter().enumerate() {
         let pick = ports::pick(*wanted).expect("应能选到端口");
         ports_used.push(pick.port);
-        let cfg = ServiceConfig::default();
         let argv: Vec<String> = vec!["node".into(), "a.js".into()];
         sup.spawn(
             sink.clone(),
-            Launch {
-                project_id: i as i64,
-                base: &dir,
-                argv: &argv,
-                cfg: &cfg,
-                extra_env: &[("PORT".to_string(), pick.port.to_string())],
-                phase: Phase::Running,
-                port: Some(pick.port),
-                note: None,
-            },
+            spec_for(
+                i as i64 + 1,
+                "a",
+                &dir,
+                argv,
+                Some(pick.port),
+                &[("PORT".to_string(), pick.port.to_string())],
+            ),
         )
         .expect("spawn 应成功");
     }
@@ -334,12 +323,219 @@ fn shutdown_all_releases_every_port() {
         );
     }
 
-    sup.shutdown_all();
+    sup.shutdown_all(&std::collections::HashSet::new());
     for p in &ports_used {
         assert!(
             ports::wait_released(*p, Duration::from_secs(6)),
             "shutdown_all 后端口 {p} 必须释放"
         );
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 步骤 9：同一项目的两个服务并行运行，互不影响。
+#[test]
+fn two_services_of_one_project_run_together() {
+    let _guard = crate::test_support::exclusive_ports();
+    let dir = scratch("multi");
+    std::fs::write(
+        dir.join("srv.js"),
+        "require('http').createServer((q,s)=>s.end(process.env.WHO||'x')).listen(process.env.PORT,'127.0.0.1')\n",
+    )
+    .unwrap();
+    let guard = KillOnDrop(Supervisor::default());
+    let sup = &guard.0;
+    let sink = Arc::new(crate::supervisor::Collector::default());
+
+    let mut used = Vec::new();
+    for (name, wanted) in [("api", 44200u16), ("worker", 44210)] {
+        let pick = ports::pick(wanted).expect("应能选到端口");
+        used.push(pick.port);
+        sup.spawn(
+            sink.clone(),
+            spec_for(
+                9,
+                name,
+                &dir,
+                vec!["node".into(), "srv.js".into()],
+                Some(pick.port),
+                &[
+                    ("PORT".to_string(), pick.port.to_string()),
+                    ("WHO".to_string(), name.to_string()),
+                ],
+            ),
+        )
+        .expect("spawn 应成功");
+    }
+    for (name, (_, port)) in ["api", "worker"].iter().zip([(44200u16, used[0]), (44210, used[1])]) {
+        let _ = name;
+        assert!(wait_until(Duration::from_secs(10), || !ports::is_free(port)), "端口 {port} 应被监听");
+    }
+    assert_eq!(sup.active_keys_of_project(9).len(), 2, "两个服务应同时活跃");
+    // 各自的日志/端口互不串扰
+    assert_eq!(sup.port_of(&key_of(9, "api")), Some(used[0]));
+    assert_eq!(sup.port_of(&key_of(9, "worker")), Some(used[1]));
+
+    sup.stop(&key_of(9, "api"));
+    assert!(ports::wait_released(used[0], Duration::from_secs(5)));
+    // 停掉一个不该影响另一个
+    assert!(!ports::is_free(used[1]), "worker 应仍在监听");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 用真实项目（G6-oht-3D 的 infra compose 与一个探明可跑的 npm 脚本）走一遍
+/// 「探测 → 计划 → 真起 → 真停」，确认产品路径而不只是内部 API。
+#[test]
+fn real_project_detect_plan_start_stop() {
+    let _guard = crate::test_support::exclusive_ports();
+    let base = PathBuf::from(std::env::var("HOME").unwrap()).join("my/G6-oht-3D");
+    if !base.is_dir() {
+        eprintln!("跳过：{base:?} 不存在");
+        return;
+    }
+    // 1) 探测必须在这台机器上识别出 compose 栈与 infra 目录
+    let d = crate::detect::detect(&base);
+    let infra = d
+        .compose_stacks
+        .iter()
+        .find(|c| c.file == "infra/docker-compose.yml")
+        .expect("应识别 infra/docker-compose.yml");
+    assert!(infra.services.contains(&"postgres".to_string()), "{:?}", infra.services);
+    assert!(infra.services.contains(&"minio".to_string()), "{:?}", infra.services);
+    assert!(d.toolchain.contains(&"pnpm".to_string()), "monorepo 应识别 pnpm");
+
+    // 2) 计划阶段：compose 服务不参与端口分配，但必须能解析出文件路径
+    let spec = crate::services::ServiceSpec::from_json(
+        &serde_json::json!({
+            "name": "infra",
+            "docker": { "files": ["infra/docker-compose.yml"], "services": ["postgres", "minio"] },
+            "ports": { "requires": [5432] }
+        })
+        .to_string(),
+    )
+    .expect("声明应合法");
+    assert!(spec.validate().is_empty(), "{:?}", spec.validate());
+
+    // 3) 真起真停：用一个确定的 node 服务，断言端口、日志、停止后释放
+    let dir = scratch("realplan");
+    std::fs::write(
+        dir.join("srv.js"),
+        "console.log('booting');require('http').createServer((q,s)=>s.end('ok')).listen(process.env.PORT,'127.0.0.1')\n",
+    )
+    .unwrap();
+    let guard = KillOnDrop(Supervisor::default());
+    let sup = &guard.0;
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = held.local_addr().unwrap().port();
+    drop(held);
+    let sink = Arc::new(crate::supervisor::Collector::default());
+    sup.spawn(
+        sink.clone(),
+        spec_for(
+            77,
+            "real",
+            &dir,
+            vec!["node".into(), "srv.js".into()],
+            Some(port),
+            &[("PORT".to_string(), port.to_string())],
+        ),
+    )
+    .expect("spawn");
+    let key = key_of(77, "real");
+    assert!(wait_until(Duration::from_secs(10), || !ports::is_free(port)), "端口应被监听");
+    assert!(wait_until(Duration::from_secs(5), || !sup.logs_of(&key).is_empty()), "应收到日志");
+    assert_eq!(sup.logs_of(&key).first().map(String::as_str), Some("booting"));
+    sup.stop(&key);
+    assert!(ports::wait_released(port, Duration::from_secs(5)), "停止后必须释放端口");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 崩溃安全的凭据：spawn 时就落盘，正常停止后清掉；被强杀留下的孤儿在下次启动时**回收**而非接管。
+#[test]
+fn adopt_credentials_are_written_on_spawn_and_cleared_on_stop() {
+    let _guard = crate::test_support::exclusive_ports();
+    let data = tempfile::tempdir().unwrap();
+    std::env::set_var("PROJECT_CTRL_DATA_DIR", data.path());
+
+    let dir = scratch("adoptcred");
+    std::fs::write(dir.join("a.js"), "setInterval(()=>{},1000)\n").unwrap();
+    let guard = KillOnDrop(Supervisor::default());
+    let sup = &guard.0;
+    let sink = Arc::new(crate::supervisor::Collector::default());
+    let pid = sup
+        .spawn(sink, spec_for(31, "svc", &dir, vec!["node".into(), "a.js".into()], None, &[]))
+        .expect("spawn");
+
+    // spawn 即落盘：App 被 kill -9 时没有退出钩子，只有这份记录能救场
+    let recs = crate::localstate::read_adopts();
+    assert_eq!(recs.len(), 1, "spawn 后应立即有凭据：{recs:?}");
+    assert_eq!(recs[0].pid, pid);
+    assert_eq!(recs[0].name, "svc");
+    assert!(!recs[0].keep_alive, "默认不保留（此时还不知道用户的决定）");
+
+    // 正常停止后凭据必须消失
+    sup.stop(&key_of(31, "svc"));
+    assert!(crate::localstate::read_adopts().is_empty(), "停止后凭据应清掉");
+
+    std::env::remove_var("PROJECT_CTRL_DATA_DIR");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 孤儿回收：keep_alive=false 的凭据指向仍存活的进程 → 启动时杀掉并清记录。
+#[test]
+fn orphan_without_keep_alive_is_reclaimed_not_adopted() {
+    let data = tempfile::tempdir().unwrap();
+    std::env::set_var("PROJECT_CTRL_DATA_DIR", data.path());
+    let dir = scratch("orphan");
+    std::fs::write(dir.join("a.js"), "setInterval(()=>{},1000)\n").unwrap();
+
+    let mut child = std::process::Command::new("node")
+        .arg("a.js")
+        .current_dir(&dir)
+        .spawn()
+        .expect("spawn node");
+    let pid = child.id();
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let rec = crate::supervisor::AdoptRecord {
+        key: "31/svc".into(),
+        project_id: 31,
+        name: "svc".into(),
+        pid,
+        pgid: pid as i32,
+        argv: vec!["node".into(), "a.js".into()],
+        cwd: dir.to_string_lossy().into_owned(),
+        started_at,
+        port: None,
+        keep_alive: false,
+    };
+    crate::supervisor::verify_adopt(&rec).expect("活进程应通过校验");
+    crate::localstate::write_adopt(&rec).unwrap();
+
+    // 走真实的启动回收路径
+    let app = crate::test_app();
+    crate::commands::adopt_existing(app.handle());
+
+    assert!(crate::localstate::read_adopts().is_empty(), "孤儿凭据应被清掉");
+    // 进程应被回收。注意：被杀的**子进程**在 wait 之前是僵尸，`kill -0` 仍返回成功，
+    // 所以必须用 `try_wait` 收尸作为「已死」的判据。
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut dead = false;
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = child.try_wait() {
+            dead = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !dead {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(dead, "孤儿进程应被回收");
+
+    std::env::remove_var("PROJECT_CTRL_DATA_DIR");
     let _ = std::fs::remove_dir_all(&dir);
 }

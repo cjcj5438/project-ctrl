@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 /// 顺延尝试的上限个数（wanted..=wanted+PICK_ATTEMPTS-1）。
 pub const PICK_ATTEMPTS: u16 = 10;
 /// 实测校准时向后观察的端口个数（比分配范围宽，因为框架可能自己继续 +1）。
+#[cfg(test)]
 pub const OBSERVE_SPAN: u16 = 40;
 
 const LSOF: &str = "/usr/sbin/lsof";
@@ -99,6 +100,8 @@ pub fn holder(port: u16) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// 只在测试里使用：产品代码按「上次端口优先」自行用 `is_free` 逐个试（见 `plan::plan_port`）。
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pick {
     pub port: u16,
@@ -107,6 +110,7 @@ pub struct Pick {
 }
 
 /// 从 `port` 起找一个空闲端口，最多试 `PICK_ATTEMPTS` 个。全占返回 None。
+#[cfg(test)]
 pub fn pick(port: u16) -> Option<Pick> {
     let listening = listen_set();
     for offset in 0..PICK_ATTEMPTS {
@@ -125,6 +129,7 @@ pub fn pick(port: u16) -> Option<Pick> {
 ///
 /// 只返回**区间内**的端口（全局 `lsof` 快照仅用于判定，不能直接当结果——
 /// `wait_listening` 靠 `difference` 找新端口，返回全局集合会把区间外的端口也算进去）。
+#[cfg(test)]
 pub fn listening_in(range: std::ops::RangeInclusive<u16>) -> HashSet<u16> {
     let all = listen_set();
     range.filter(|p| all.contains(p) || !bind_free(*p)).collect()
@@ -201,6 +206,7 @@ pub fn plan_argv(
 ///
 /// `before` 是 spawn 前的监听快照；返回观察区间内第一个新出现在监听状态的端口。
 /// 只用于**报告真相**，不影响分配决策。
+#[cfg(test)]
 pub fn wait_listening(
     before: &HashSet<u16>,
     range: std::ops::RangeInclusive<u16>,

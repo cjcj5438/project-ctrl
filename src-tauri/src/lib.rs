@@ -4,10 +4,14 @@ mod e2e_tests;
 #[cfg(test)]
 mod ipc_tests;
 mod db;
+mod descriptor;
 mod detect;
+mod docker;
 mod execenv;
 mod git;
+mod localstate;
 mod logic;
+mod plan;
 mod ports;
 mod readme;
 mod services;
@@ -46,17 +50,24 @@ fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R>
             commands::open_external,
             commands::run_git,
             commands::project_size,
-            commands::service_config,
-            commands::save_service_config,
-            commands::delete_service_config,
-            commands::detect_service,
+            commands::project_services,
+            commands::save_service,
+            commands::delete_service,
+            commands::solidify_descriptor,
+            commands::set_service_override,
+            commands::service_override,
+            commands::read_descriptor,
             commands::service_status,
             commands::service_logs,
             commands::service_preflight,
             commands::service_start,
             commands::service_stop,
+            commands::service_stop_all,
             commands::service_step,
             commands::open_service_url,
+            commands::docker_up,
+            commands::docker_down,
+            commands::docker_ps,
             commands::source_info,
             commands::source_fetch,
             commands::source_pull,
@@ -90,13 +101,21 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
+    // 启动时先收养上次留下的进程（声明了 keep_alive 的服务），再进入事件循环。
+    {
+        use tauri::Manager;
+        if app.try_state::<supervisor::Supervisor>().is_some() {
+            commands::adopt_existing(app.handle());
+        }
+    }
+
     app.run(|app, event| {
         // 退出路径有两条：macOS 的 Cmd+Q 只发 `Exit`，不经过 `ExitRequested`（实测）。
         // 两条都要收子进程，否则关掉 App 后服务继续裸跑、占着端口。
         if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
             use tauri::Manager;
             if let Some(sup) = app.try_state::<supervisor::Supervisor>() {
-                sup.shutdown_all();
+                commands::register_adoptable(&sup);
             }
         }
     });

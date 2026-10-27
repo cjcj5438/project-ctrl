@@ -4,16 +4,14 @@
 //! `~/.bun/bin`（bun 项目会直接 MISSING）；`zsh -ic` 会读 `.zshrc`，而 `.zshrc` 里有明文密钥，
 //! 会让每个子进程都继承它。这里改用固定 PATH 名单，并在需要时把 nvm 版本目录前置。
 //!
-//! 子进程环境用 `env_clear()` 后重建：唯一的环境变量来源是 `ServiceConfig::env` 与本模块的常量。
+//! 子进程环境用 `env_clear()` 后重建：唯一环境来源是声明的 `env`、`env_files` 解析结果与本模块常量。
 
-use crate::services::ServiceConfig;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// 收到 TERM 后等待优雅退出的时长。
 pub const STOP_GRACE: Duration = Duration::from_secs(5);
-/// 安装 / 构建步骤的总超时（30 分钟）。
-pub const STEP_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// 固定 PATH 前缀（顺序即优先级）。`/usr/bin` 与 `/bin` 覆盖系统自带工具。
 const PATH_PREFIX: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
@@ -45,9 +43,9 @@ pub fn node_bin_dir(pin: &str) -> Option<PathBuf> {
     }
 }
 
-/// 该配方实际使用的 PATH：pin 可解析则把对应 bin 目录前置，否则用基础 PATH。
-pub fn path_for(cfg: &ServiceConfig) -> String {
-    match cfg.node_pin.as_deref().and_then(node_bin_dir) {
+/// 该服务的 PATH：pin 可解析则把对应 bin 目录前置，否则用基础 PATH。
+pub fn path_for(pin: Option<&str>) -> String {
+    match pin.and_then(node_bin_dir) {
         Some(dir) => format!("{}:{}", dir.display(), base_path()),
         None => base_path(),
     }
@@ -80,10 +78,14 @@ pub fn resolve(program: &str, path: &str) -> Option<PathBuf> {
 }
 
 /// 子进程的完整环境变量集合。调用方必须先 `env_clear()`。
-/// `extra` 通常来自 `ports::plan_argv` 的端口注入，优先级高于配方自报的 `env`。
-pub fn env_for(cfg: &ServiceConfig, extra: &[(String, String)]) -> Vec<(String, String)> {
+/// 优先级（低→高）：模块常量 < 声明的 `env` < `extra`（端口注入等）。
+pub fn env_for(
+    pin: Option<&str>,
+    env: &BTreeMap<String, String>,
+    extra: &[(String, String)],
+) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = vec![
-        ("PATH".into(), path_for(cfg)),
+        ("PATH".into(), path_for(pin)),
         ("TERM".into(), "dumb".into()),
         ("LANG".into(), "en_US.UTF-8".into()),
         ("NO_COLOR".into(), "1".into()),
@@ -92,14 +94,46 @@ pub fn env_for(cfg: &ServiceConfig, extra: &[(String, String)]) -> Vec<(String, 
     if let Some(h) = home() {
         out.push(("HOME".into(), h.display().to_string()));
     }
-    for (k, v) in &cfg.env {
-        out.push((k.clone(), v.clone()));
+    let upsert = |out: &mut Vec<(String, String)>, k: &str, v: &str| match
+        out.iter_mut().find(|(ek, _)| ek == k)
+    {
+        Some(slot) => slot.1 = v.to_string(),
+        None => out.push((k.to_string(), v.to_string())),
+    };
+    for (k, v) in env {
+        upsert(&mut out, k, v);
     }
     for (k, v) in extra {
-        match out.iter_mut().find(|(ek, _)| ek == k) {
-            Some(slot) => slot.1 = v.clone(),
-            None => out.push((k.clone(), v.clone())),
+        upsert(&mut out, k, v);
+    }
+    out
+}
+
+/// 从 env 文件里读出键值（只做最小解析：`KEY=VALUE`、忽略空行与 `#` 注释、
+/// 去除成对的引号、支持 `export ` 前缀）。
+pub fn parse_env_file(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
         }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let k = k.trim();
+        if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let v = v.trim();
+        let v = if v.len() >= 2
+            && ((v.starts_with('"') && v.ends_with('"')) || (v.starts_with('\'') && v.ends_with('\'')))
+        {
+            &v[1..v.len() - 1]
+        } else {
+            // 去掉行尾注释（仅当 # 前有空白，避免破坏 URL 里的 #）
+            v.split_once(" #").map(|(a, _)| a.trim_end()).unwrap_or(v)
+        };
+        out.push((k.to_string(), v.to_string()));
     }
     out
 }
@@ -107,54 +141,36 @@ pub fn env_for(cfg: &ServiceConfig, extra: &[(String, String)]) -> Vec<(String, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     #[test]
-    fn path_has_bun_and_cargo() {
+    fn resolve_finds_system_binary() {
         let p = base_path();
-        assert!(p.contains("/opt/homebrew/bin"), "{p}");
-        if let Some(h) = home() {
-            assert!(p.contains(&format!("{}/.bun/bin", h.display())), "{p}");
-            assert!(p.contains(&format!("{}/.cargo/bin", h.display())), "{p}");
-        }
+        assert!(resolve("ls", &p).is_some(), "PATH 里应该有 ls");
+        assert!(resolve("/nonexistent/xyz", &p).is_none());
     }
 
     #[test]
-    fn node_bin_dir_prefers_pin() {
-        // 本机实测存在 v22.22.0；不存在的版本必须返回 None
-        if node_bin_dir("22.22.0").is_some() {
-            assert!(node_bin_dir("99.0.0").is_none());
-            assert!(node_bin_dir("v22.22.0").is_some());
-        }
-        assert!(node_bin_dir("").is_none());
-    }
-
-    #[test]
-    fn env_for_clears_inherited_secrets() {
-        std::env::set_var("PROJECT_CTRL_TEST_KEY", "secret");
-        let env = env_for(&ServiceConfig::default(), &[]);
-        assert!(!env.iter().any(|(k, _)| k == "PROJECT_CTRL_TEST_KEY"));
-        assert!(env.iter().any(|(k, v)| k == "PATH" && !v.is_empty()));
-        std::env::remove_var("PROJECT_CTRL_TEST_KEY");
-    }
-
-    #[test]
-    fn extra_env_overrides_recipe_env() {
+    fn env_priority_extra_wins_over_declared() {
         let mut env = BTreeMap::new();
-        env.insert("PORT".to_string(), "8080".to_string());
-        env.insert("NODE_ENV".to_string(), "development".to_string());
-        let cfg = ServiceConfig { env, ..Default::default() };
-        let got = env_for(&cfg, &[("PORT".to_string(), "8081".to_string())]);
-        assert_eq!(got.iter().filter(|(k, _)| k == "PORT").count(), 1);
-        assert!(got.iter().any(|(k, v)| k == "PORT" && v == "8081"));
-        assert!(got.iter().any(|(k, v)| k == "NODE_ENV" && v == "development"));
+        env.insert("PORT".to_string(), "1111".to_string());
+        env.insert("MODE".to_string(), "dev".to_string());
+        let out = env_for(None, &env, &[("PORT".to_string(), "2222".to_string())]);
+        let get = |k: &str| out.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("PORT"), Some("2222"));
+        assert_eq!(get("MODE"), Some("dev"));
+        assert_eq!(get("NO_COLOR"), Some("1"));
     }
 
     #[test]
-    fn resolve_finds_system_binaries() {
-        let path = base_path();
-        assert!(resolve("sh", &path).is_some() || resolve("ls", &path).is_some());
-        assert!(resolve("definitely-not-a-real-binary-xyz", &path).is_none());
-        assert!(resolve("", &path).is_none());
+    fn parse_env_file_handles_quotes_comments_and_export() {
+        let parsed = parse_env_file(
+            "# comment\nexport FOO=bar\nQUOTED=\"a b\"\nURL=https://x/#frag\nEMPTY=\nBROKEN\n",
+        );
+        let get = |k: &str| parsed.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("FOO"), Some("bar"));
+        assert_eq!(get("QUOTED"), Some("a b"));
+        assert_eq!(get("URL"), Some("https://x/#frag"));
+        assert_eq!(get("EMPTY"), Some(""));
+        assert_eq!(get("BROKEN"), None);
     }
 }

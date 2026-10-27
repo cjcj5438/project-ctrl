@@ -39,27 +39,99 @@ export function isConflict(e: unknown): e is { kind: 'conflict'; current_mtime: 
   return typeof e === 'object' && e !== null && 'kind' in e && e.kind === 'conflict'
 }
 
-export type Phase = 'Idle' | 'Installing' | 'Building' | 'Running' | 'Stopped' | 'Crashed' | 'Failed'
+export type Phase = 'Idle' | 'Step' | 'Running' | 'Stopped' | 'Crashed' | 'Failed'
 
 export interface ServiceStatus {
+  /** `"{project_id}/{name}"`，精确匹配用。 */
+  key: string
   project_id: number
+  name: string
   phase: Phase
+  /** 仅 phase==='Step' 时指出当前步骤名。 */
+  step: string | null
   port: number | null
   pid: number | null
   exit_code: number | null
   note: string | null
+  /** 本次运行已自动重启的次数。 */
+  restarts: number
+  /** 本次运行（不含重启）起始 unix 秒。 */
+  started_at: number
 }
 
-export interface ServiceConfig {
-  install: string[] | null
-  build: string[] | null
-  start: string[]
-  dev_port: number | null
-  requires_ports: number[]
-  env: Record<string, string>
-  node_pin: string | null
-  toolchain: string[]
+export type Restart = 'never' | 'on-failure' | 'always'
+
+export interface Step {
+  name: string
+  argv: string[]
+  timeout_s: number
+}
+
+export interface Health {
+  type: 'port' | 'http'
+  path?: string | null
+  timeout_ms?: number | null
+}
+
+export interface Ports {
+  listen?: number | null
+  requires?: number[]
+}
+
+export interface DockerSpec {
+  files: string[]
+  project_name?: string | null
+  services: string[]
+}
+
+/** 服务声明：仓库内 `.project-ctrl.json` 与数据库共用同一份结构。 */
+export interface ServiceSpec {
+  name: string
+  cwd?: string | null
+  run?: string[] | null
+  steps?: Step[]
+  env_files?: string[]
+  env?: Record<string, string>
+  ports?: Ports
+  health?: Health | null
+  depends_on?: string[]
+  restart?: Restart
+  docker?: DockerSpec | null
+}
+
+export interface ServiceView {
+  spec: ServiceSpec
+  /** `descriptor` | `db` */
+  layer: string
   origin: string
+  keep_alive: boolean
+  port_offset: number
+  status: ServiceStatus | null
+  warnings: string[]
+}
+
+export interface ProjectServices {
+  services: ServiceView[]
+  /** 仓库内有描述文件但解析失败时的错误（UI 必须显示）。 */
+  descriptor_error: string | null
+  descriptor_exists: boolean
+  detected: DetectResult
+}
+
+/** 本机层的覆盖（只由用户写）。 */
+export interface ServiceOverride {
+  port_offset?: number | null
+  keep_alive?: boolean | null
+  restart?: Restart | null
+  env?: Record<string, string>
+  env_files?: string[]
+}
+
+export interface ComposeCandidate {
+  file: string
+  services: string[]
+  ports: number[]
+  overrides: string[]
 }
 
 export interface DetectResult {
@@ -72,6 +144,17 @@ export interface DetectResult {
   node_pin: string | null
   toolchain: string[]
   problems: string[]
+  compose_stacks: ComposeCandidate[]
+  make_targets: string[]
+  script_candidates: string[]
+}
+
+export interface ContainerView {
+  name: string
+  service: string
+  state: string
+  status: string
+  ports: string
 }
 
 export interface SourceInfo {
@@ -95,7 +178,9 @@ export interface ImportReport {
 
 /** 事件 payload（与服务端 `LogPayload` 一致）。 */
 export interface LogPayload {
+  key: string
   project_id: number
+  name: string
   lines: string[]
 }
 
@@ -131,19 +216,29 @@ export const api = {
   runGit: (id: number, kind: 'status' | 'log') => invoke<GitResult>('run_git', { id, kind }),
   projectSize: (id: number) => invoke<number>('project_size', { id }),
 
-  serviceConfig: (id: number) => invoke<ServiceConfig | null>('service_config', { id }),
-  saveServiceConfig: (id: number, config: ServiceConfig) =>
-    invoke<void>('save_service_config', { id, config }),
-  deleteServiceConfig: (id: number) => invoke<void>('delete_service_config', { id }),
-  detectService: (id: number) => invoke<DetectResult>('detect_service', { id }),
+  projectServices: (id: number) => invoke<ProjectServices>('project_services', { id }),
+  saveService: (id: number, spec: ServiceSpec) => invoke<void>('save_service', { id, spec }),
+  deleteService: (id: number, name: string) => invoke<void>('delete_service', { id, name }),
+  solidifyDescriptor: (id: number, names: string[], overwrite: boolean) =>
+    invoke<string>('solidify_descriptor', { id, names, overwrite }),
+  readDescriptor: (id: number) => invoke<string | null>('read_descriptor', { id }),
   serviceStatus: () => invoke<ServiceStatus[]>('service_status'),
-  serviceLogs: (id: number) => invoke<string[]>('service_logs', { id }),
-  servicePreflight: (id: number, step: 'install' | 'build' | 'start') =>
-    invoke<string[]>('service_preflight', { id, step }),
-  serviceStart: (id: number) => invoke<ServiceStatus>('service_start', { id }),
-  serviceStop: (id: number) => invoke<void>('service_stop', { id }),
-  serviceStep: (id: number, step: 'install' | 'build') => invoke<void>('service_step', { id, step }),
-  openServiceUrl: (id: number) => invoke<void>('open_service_url', { id }),
+  serviceLogs: (id: number, name: string) => invoke<string[]>('service_logs', { id, name }),
+  servicePreflight: (id: number, name: string, step?: string) =>
+    invoke<string[]>('service_preflight', { id, name, step: step ?? null }),
+  serviceStart: (id: number, name: string) => invoke<ServiceStatus>('service_start', { id, name }),
+  serviceStop: (id: number, name: string) => invoke<void>('service_stop', { id, name }),
+  serviceStopAll: (id: number) => invoke<void>('service_stop_all', { id }),
+  serviceStep: (id: number, name: string, step: string) =>
+    invoke<void>('service_step', { id, name, step }),
+  openServiceUrl: (id: number, name: string) => invoke<void>('open_service_url', { id, name }),
+  serviceOverride: (id: number, name: string) =>
+    invoke<ServiceOverride | null>('service_override', { id, name }),
+  setServiceOverride: (id: number, name: string, patch: ServiceOverride | null) =>
+    invoke<void>('set_service_override', { id, name, patch }),
+  dockerUp: (id: number, name: string) => invoke<string>('docker_up', { id, name }),
+  dockerDown: (id: number, name: string) => invoke<string>('docker_down', { id, name }),
+  dockerPs: (id: number, name: string) => invoke<ContainerView[]>('docker_ps', { id, name }),
 
   sourceInfo: (id: number) => invoke<SourceInfo>('source_info', { id }),
   sourceFetch: (id: number) => invoke<GitResult>('source_fetch', { id }),

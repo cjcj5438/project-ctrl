@@ -230,10 +230,15 @@ mod tests {
     use std::time::SystemTime;
 
     fn tmp() -> PathBuf {
+        // macOS 的 `SystemTime::now()` 精度可能只有微秒级：并行测试会拿到相同的时间戳，
+        // 于是两个测试共用同一个目录、`git init` 互相踩。计数器保证唯一。
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let d = std::env::temp_dir().join(format!(
-            "pc-git-test-{}-{}",
+            "pc-git-test-{}-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos(),
+            seq
         ));
         fs::create_dir_all(&d).unwrap();
         d
