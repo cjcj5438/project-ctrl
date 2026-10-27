@@ -1448,10 +1448,6 @@ pub fn register_adoptable(sup: &supervisor::Supervisor) {
     // #12：clear 后置——先 shutdown_all(keep)，再对非 keep 的 key 清凭据。
     // 之前 clear 在 shutdown 之前，中间被 SIGKILL 会留下永久孤儿（有进程无凭据）。
     sup.shutdown_all(&keep);
-    // TODO(集成者): 这里应对“非 keep 且进程组已死”的 key 才 clear，组仍活的保留
-    // 记录（keep_alive=false 留待下次回收）。需要 supervisor::group_alive 提为
-    // pub(crate) 后补校验：`if !keep.contains(&k) && !supervisor::group_alive(pgid)`。
-    // supervisor.rs 非本 slice 文件，不能改——现先实现 clear 后置，校验待补。
     for rec in &records {
         if keep.contains(&rec.key) {
             if let Err(e) =
@@ -1460,10 +1456,22 @@ pub fn register_adoptable(sup: &supervisor::Supervisor) {
                 // #52：写凭据失败必须可见（之前 `let _ =` 静默吞掉）。
                 eprintln!("register_adoptable: 写收养凭据 {} 失败：{e}", rec.key);
             }
-        } else {
+        } else if adoptable_should_clear(&keep, rec, supervisor::Supervisor::group_alive(rec.pgid)) {
             localstate::clear_adopt(&rec.key);
+        } else {
+            eprintln!("register_adoptable: {} 的进程组仍存活，保留凭据待下次回收", rec.key);
         }
     }
+}
+
+/// 退出清理是否删凭据（#12，纯函数）：keep 的不删；非 keep 但组仍活的不删
+/// （KILL 失败/EPERM 时清掉就是永久孤儿）；只有组已死才删。
+fn adoptable_should_clear(
+    keep: &std::collections::HashSet<String>,
+    rec: &supervisor::AdoptRecord,
+    group_alive: bool,
+) -> bool {
+    !keep.contains(&rec.key) && !group_alive
 }
 
 /// 退出时的保留决定（#13，纯函数）。
@@ -1714,6 +1722,33 @@ mod name_tests {
         drop(conn);
         let pf = super::service_preflight(id, "jobs".into(), None).unwrap();
         assert_eq!(pf, vec!["jobs 没有 run 命令"]);
+    }
+
+    #[test]
+    fn exit_clear_keeps_record_when_group_survives() {
+        // #12：退出清理的删凭据决定——keep 的保留；非 keep 但组仍活的也保留
+        // （KILL 失败/EPERM 时清掉就是永久孤儿）；只有组已死才清。
+        use std::collections::HashSet;
+        let rec = || crate::supervisor::AdoptRecord {
+            key: "1/a".into(),
+            project_id: 1,
+            name: "a".into(),
+            pid: 1234,
+            pgid: 1234,
+            argv: vec!["sleep".into()],
+            cwd: "/tmp".into(),
+            started_at: 1,
+            port: None,
+            keep_alive: false,
+        };
+        let keep: HashSet<String> = ["1/a".to_string()].into_iter().collect();
+        let empty: HashSet<String> = HashSet::new();
+        assert!(!super::adoptable_should_clear(&keep, &rec(), false), "keep 的不删");
+        assert!(
+            !super::adoptable_should_clear(&empty, &rec(), true),
+            "组仍活的不删（否则永久孤儿）"
+        );
+        assert!(super::adoptable_should_clear(&empty, &rec(), false), "组已死的删");
     }
 }
 

@@ -699,7 +699,7 @@ impl Supervisor {
             .status();
     }
 
-    fn group_alive(pgid: i32) -> bool {
+    pub(crate) fn group_alive(pgid: i32) -> bool {
         // #44：pgid<=0 时 `kill -0 -- -0` 语义是“当前进程组”，必须先拦掉。
         if pgid <= 0 {
             return false;
