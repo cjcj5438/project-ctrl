@@ -11,6 +11,7 @@ import DetailView from './Detail'
 import UpdateBanner from './Update'
 import ProbePanel, { ExternalPanel } from './Probe'
 import { ErrorBanner, StatusDot } from './components'
+import { opsBadCount, opsRows } from './ops'
 import { IconMonitor, IconMoon, IconPencil, IconSearch, IconSun, IconX } from './icons'
 import { applyTheme, loadTheme, saveTheme, watchSystemTheme, type ThemeMode } from './theme'
 import { humanSize } from './format'
@@ -162,13 +163,7 @@ export default function App() {
 
   // 运维条：所有活跃/异常服务，按「异常 > 运行中 > 其它」排序。
   // 空数组时整条不渲染——没有运行中的服务就没有运维条，不做空装饰。
-  const opsRows = useMemo(() => {
-    const rank = (st: ServiceStatus) =>
-      st.phase === 'Crashed' || st.phase === 'Failed' ? 0 : st.phase === 'Running' ? 1 : 2
-    return Object.values(statuses)
-      .filter((st) => st.phase === 'Running' || st.phase === 'Step' || st.phase === 'Crashed' || st.phase === 'Failed')
-      .sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name))
-  }, [statuses])
+  const ops = useMemo(() => opsRows(statuses), [statuses])
 
   const projectName = (id: number) => projects.find((p) => p.id === id)?.name ?? `#${id}`
 
@@ -375,15 +370,15 @@ export default function App() {
               }`}
             >
               {v === 'projects' ? '项目' : '服务'}
-              {v === 'services' && opsRows.length > 0 && (
-                <span className="ml-1.5 text-xs text-muted">{opsRows.length}</span>
+              {v === 'services' && ops.length > 0 && (
+                <span className="ml-1.5 text-xs text-muted">{ops.length}</span>
               )}
             </button>
           ))}
         </div>
 
         {/* 运维条：只在有活跃/异常服务时出现 */}
-        {view === 'projects' && opsRows.length > 0 && <OpsBar rows={opsRows} projectName={projectName} onOpen={setDetailId} />}
+        {view === 'projects' && ops.length > 0 && <OpsBar rows={ops} projectName={projectName} onOpen={setDetailId} />}
 
         <div className="mt-4 flex flex-wrap items-center gap-2">
           <span className="text-sm text-muted">筛选：</span>
@@ -568,7 +563,7 @@ export default function App() {
         </div>
         )}
 
-        {view === 'services' && <ServicesView rows={opsRows} projectName={projectName} onOpen={setDetailId} />}
+        {view === 'services' && <ServicesView rows={ops} projectName={projectName} onOpen={setDetailId} />}
 
         {scanRoot && (
           <div className="fixed inset-0 flex items-center justify-center bg-black/40 p-6">
@@ -906,7 +901,7 @@ function OpsBar({
   projectName: (id: number) => string
   onOpen: (id: number) => void
 }) {
-  const bad = rows.filter((r) => r.phase === 'Crashed' || r.phase === 'Failed').length
+  const bad = opsBadCount(rows)
   return (
     <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface-raised px-3 py-2 text-xs">
       <span className="font-medium text-muted">运行中</span>
