@@ -43,3 +43,41 @@ impl Drop for ScopedDataDir {
         }
     }
 }
+
+/// `HOME` 是**进程级**环境变量：改它的测试必须串行，
+/// 否则并行测试会读到对方的家目录（表现为「外部扫描读到真机 plist」这类偶发失败）。
+///
+/// 独立的 `HOME_LOCK`（与 `DATA_DIR_LOCK` 是两把锁，不是同一把）：
+/// HOME 与 PROJECT_CTRL_DATA_DIR 是两个不同的环境变量，各自串行即可；
+/// 若复用同一把锁，同时需要两者的测试会自死锁。
+/// 同时需要两者的测试必须先构造 `ScopedHome` 再构造 `ScopedDataDir`
+/// （固定顺序，避免两锁反转死锁）。
+static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+/// 把 HOME 指到 `dir`，并在离开作用域时恢复原值。
+///
+/// 与 `ScopedDataDir` 互斥方式不同：两者各持自己的锁，若一个测试同时需要两者，
+/// 必须先构造 `ScopedHome` 再构造 `ScopedDataDir`（固定顺序，避免死锁）。
+/// 实际场景里同时改两者的是 ipc 的 Harness（ScopedDataDir）+ 外部扫描 fixture（ScopedHome）。
+pub struct ScopedHome {
+    _guard: MutexGuard<'static, ()>,
+    prev: Option<OsString>,
+}
+
+impl ScopedHome {
+    pub fn new(dir: &Path) -> Self {
+        let guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", dir);
+        Self { _guard: guard, prev }
+    }
+}
+
+impl Drop for ScopedHome {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}

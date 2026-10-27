@@ -14,11 +14,13 @@ use tauri::{Manager, WebviewWindowBuilder};
 static DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 每个测试用独立的数据目录，避免污染真实的 `~/.project-ctrl`。
+///
+/// 只负责建目录，不碰环境变量：`set_var` 必须在拿住锁之后做（见 `Harness::new`），
+/// 否则等锁期间其他持锁测试会读到这个还没生效完的目录（#74 串库偶发）。
 fn temp_data_dir(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("pc-ipc-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    std::env::set_var("PROJECT_CTRL_DATA_DIR", &d);
     d
 }
 
@@ -35,6 +37,9 @@ impl Harness {
     fn new(tag: &str) -> Self {
         let port_guard = crate::test_support::exclusive_ports();
         let db_guard = DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 先拿锁、再 set：锁内设置保证等锁期间没有中间状态外露。
+        // `ScopedDataDir::new` 内部再拿 `DATA_DIR_LOCK`（固定顺序 port→db→data，不死锁），
+        // 并在 drop 时恢复环境——所以建目录与 set 必须都在这里按此顺序完成。
         let data = temp_data_dir(tag);
         // 同一把锁保证不与 e2e 里改数据目录的测试并行
         let data_guard = crate::test_support::ScopedDataDir::new(&data);
@@ -73,9 +78,10 @@ impl Drop for Harness {
         if let Some(sup) = self.app.try_state::<crate::supervisor::Supervisor>() {
             sup.shutdown_all(&std::collections::HashSet::new());
         }
-        // 收养凭据与本机状态都在数据目录里，随 _data 一起丢弃
+        // 收养凭据与本机状态都在数据目录里，随 _data 一起丢弃。
+        // 环境恢复由 `_data_guard`（ScopedDataDir 的 Drop）负责：它会恢复旧值
+        // 而不是粗暴 remove——这里不再动环境，避免与 guard 的恢复打架。
         let _ = &self._data;
-        std::env::remove_var("PROJECT_CTRL_DATA_DIR");
     }
 }
 
@@ -84,10 +90,24 @@ fn sample_service(dir: &std::path::Path) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(
         dir.join("server.js"),
-        "const p=process.env.PORT;require('http').createServer((q,s)=>s.end('ok')).listen(p,'127.0.0.1')\n",
+        "console.log('booting');const p=process.env.PORT;require('http').createServer((q,s)=>s.end('ok')).listen(p,'127.0.0.1')\n",
     )
     .unwrap();
     std::fs::write(dir.join("package.json"), r#"{"name":"app","scripts":{"dev":"node server.js"}}"#).unwrap();
+}
+
+/// 轮询 `service_logs` 直到非空（5s 上限）：进程输出需要经过读线程→环形缓冲，
+/// 起后立刻读可能是空——单次判定会把时序抖动误判成失败。
+fn wait_logs_nonempty(h: &Harness, id: i64, name: &str) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let got = h.invoke("service_logs", json!({ "id": id, "name": name })).unwrap();
+        let nonempty = got.as_array().map(|a| !a.is_empty()).unwrap_or(false);
+        if nonempty || std::time::Instant::now() >= deadline {
+            return got;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 fn add_project(h: &Harness, path: &str) -> i64 {
@@ -213,6 +233,19 @@ fn ipc_start_stop_and_logs() {
         h.invoke("service_logs", json!({ "id": id, "name": "api" }))
     );
 
+    // #40：logs 必须真有内容（不只是出现在失败信息里）。
+    // sample 的 server.js 首行打印 booting（加这一行对其他测试无害：
+    // 它们不断言日志内容，logsargs 那个 save 后不起服务、读的是空缓冲）。
+    let logs = wait_logs_nonempty(&h, id, "api");
+    assert!(
+        logs.as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        "启动后 5 秒内 service_logs 应非空：{logs}"
+    );
+    assert!(
+        logs.as_array().unwrap().iter().any(|l| l.as_str().unwrap_or_default().contains("booting")),
+        "应收到启动行：{logs}"
+    );
+
     let all = h.invoke("service_status", json!({})).unwrap();
     assert!(all
         .as_array()
@@ -298,9 +331,13 @@ fn ipc_port_shift_reported() {
     let path = dir.to_string_lossy().into_owned();
     let id = add_project(&h, &path);
 
-    // 先占住 8080（本机通常已被 docker 占；这里再兜一层，确保测试自洽）
-    let holder = std::net::TcpListener::bind("127.0.0.1:8080");
-    let squatted = holder.is_ok();
+    // 先占住 8080：测试自带冲突源，不依赖本机 8080 上恰好有什么。
+    // 若 bind 失败，说明本机另有进程占着——顺延场景依然成立（is_free 看 bind+lsof）。
+    let holder = std::net::TcpListener::bind("127.0.0.1:8080").ok();
+    assert!(
+        !crate::ports::is_free(8080),
+        "前置条件：8080 必须处于被占状态，否则顺延场景不成立"
+    );
     h.invoke(
         "save_service",
         json!({
@@ -312,12 +349,7 @@ fn ipc_port_shift_reported() {
 
     let st = h.invoke("service_start", json!({ "id": id, "name": "api" })).expect("service_start");
     let port = st["port"].as_u64().expect("应有端口") as u16;
-    if !squatted && port == 8080 {
-        // 本机 8080 真空闲：不构成顺延场景，清理后跳过
-        h.invoke("service_stop", json!({ "id": id, "name": "api" })).ok();
-        let _ = std::fs::remove_dir_all(&dir);
-        return;
-    }
+    // 恒断言顺延：8080 已被占（上面已断言），返回 8080 就是产品 bug。
     assert_ne!(port, 8080, "8080 被占时必须顺延");
     let note = st["note"].as_str().unwrap_or_default().to_string();
     assert!(note.contains("8080"), "note 应说明 8080 被占：{note}");
@@ -440,8 +472,9 @@ fn ipc_step_runs_once_and_stops() {
     }
     assert!(done, "步骤应在 10 秒内结束并进入 Failed（一次性步骤不再运行）");
 
-    // 步骤不会被自动重启：等一段退避时间后仍是 Failed
-    std::thread::sleep(std::time::Duration::from_millis(1200));
+    // 步骤不会被自动重启：等超过一次退避窗口后仍是 Failed。
+    // 用产品常量表达（backoff(0)=BASE，BASE+BASE 覆盖首个重启窗口）。
+    std::thread::sleep(crate::supervisor::BACKOFF_BASE + crate::supervisor::BACKOFF_BASE);
     let all = h.invoke("service_status", json!({})).unwrap();
     let row = all.as_array().unwrap().iter().find(|s| s["project_id"] == id).cloned().unwrap();
     assert_eq!(row["phase"], "Failed");
@@ -512,7 +545,7 @@ fn ipc_solidify_descriptor() {
     .expect("save");
 
     let json_text = h
-        .invoke("solidify_descriptor", json!({ "id": id, "names": [], "overwrite": false }))
+        .invoke("solidify_descriptor", json!({ "id": id, "names": [], "overwrite": false, "confirm": true }))
         .expect("solidify");
     let text = json_text.as_str().unwrap();
     assert!(text.contains("\"api\""), "{text}");
@@ -520,7 +553,7 @@ fn ipc_solidify_descriptor() {
 
     // 再固化一次必须拒绝（不静默覆盖）
     let err = h
-        .invoke("solidify_descriptor", json!({ "id": id, "names": [], "overwrite": false }))
+        .invoke("solidify_descriptor", json!({ "id": id, "names": [], "overwrite": false, "confirm": true }))
         .expect_err("应拒绝覆盖");
     assert!(err.to_string().contains("已存在"), "{err}");
 
@@ -598,7 +631,7 @@ fn ipc_adopt_roundtrip_after_restart() {
         restart: crate::services::Restart::Never,
         keep_alive: true,
     };
-    sup.adopt(sink, spec, rec.pid, rec.started_at);
+    sup.adopt(sink, spec, rec.pid, rec.started_at).expect("收养应当成功");
     assert_eq!(
         sup.status_of(&rec.key).map(|s| s.phase),
         Some(crate::supervisor::Phase::Running)
@@ -611,7 +644,7 @@ fn ipc_adopt_roundtrip_after_restart() {
         &mut overrides,
         &path,
         "api",
-        Some(&localstate::Override { keep_alive: Some(true), ..Default::default() }),
+        Some(&localstate::OverridePatch { keep_alive: Some(Some(true)), ..Default::default() }),
     )
     .unwrap();
     localstate::save_overrides(&overrides).unwrap();
@@ -636,24 +669,164 @@ fn ipc_adopt_roundtrip_after_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #38：live 收养路径——手写凭据 + 真进程，走 `adopt_existing` 整条启动路径。
+///
+/// 与上面的 roundtrip 不同：这里不直调 `sup.adopt`，而是调产品在启动时调的
+/// `adopt_existing`——它要过 verify→keep_alive 分支→resolve_all→adopt 全链路。
+/// 用普通二进制 sleep（不依赖脚本归一化，与 #2 无关）。
+#[test]
+fn ipc_adopt_existing_takes_over_live_process() {
+    use crate::localstate;
+    use crate::supervisor::AdoptRecord;
+    use tauri::Manager;
+
+    let h = Harness::new("adoptlive");
+    let dir = std::env::temp_dir().join(format!("pc-ipc-adoptlive-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    sample_service(&dir);
+    let path = dir.to_string_lossy().into_owned();
+    let id = add_project(&h, &path);
+    // 数据库声明即可（adopt_existing 走 resolve_all，db 层也认）。
+    h.invoke("save_service", json!({ "id": id, "spec": { "name": "api", "run": ["sleep", "300"] } }))
+        .expect("save");
+
+    // 真进程 + 手写凭据（keep_alive=true 才走收养分支，否则走孤儿回收）。
+    // 独立进程组：收养后 Harness::drop 会 shutdown_all（TERM 进程组），
+    // 若 sleep 与测试进程同组，TERM 会误杀测试进程自身导致静默死亡。
+    let mut child = {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("300").current_dir(&dir).process_group(0);
+        cmd.spawn().expect("spawn sleep")
+    };
+    let pid = child.id();
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let rec = AdoptRecord {
+        key: format!("{id}/api"),
+        project_id: id,
+        name: "api".into(),
+        pid,
+        pgid: pid as i32,
+        argv: vec!["sleep".into(), "300".into()],
+        cwd: path.clone(),
+        started_at,
+        port: None,
+        keep_alive: true,
+    };
+    localstate::write_adopt(&rec).expect("写凭据");
+
+    // 走真实启动路径
+    crate::commands::adopt_existing(h.app.handle());
+
+    // 收养后：状态 Running + pid 一致 + 凭据仍在（收养成功不删凭据）。
+    let sup = h.app.state::<crate::supervisor::Supervisor>().inner().clone();
+    let st = sup.status_of(&rec.key).expect("收养后状态必须存在");
+    assert_eq!(st.phase, crate::supervisor::Phase::Running, "{st:?}");
+    assert_eq!(st.pid, Some(pid), "收养的 pid 必须与凭据一致：{st:?}");
+    assert_eq!(st.project_id, id);
+    assert_eq!(st.name, "api");
+    let left = localstate::read_adopts();
+    assert!(
+        left.iter().any(|r| r.key == rec.key && r.pid == pid && r.keep_alive),
+        "收养成功后凭据应保留：{left:?}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 外部监督者视图：只读扫 launchd + PM2，并标注是否已被本 App 管理。
+///
+/// #41(a)：hermetic——用 temp HOME + 自写 plist/PM2 fixture，不读真机；
+/// 断言条目非空且 changed_at 与文件 mtime 一致（只读未验 mtime 的旧写法会漏过）。
 #[test]
 fn ipc_external_scan_is_read_only_and_annotated() {
+    // 先拿 HOME 锁，再建 Harness（Harness 拿 port→db→data 锁，固定顺序不死锁）。
+    let fake_home = std::env::temp_dir().join(format!("pc-ipc-fakehome-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&fake_home);
+    let agents = fake_home.join("Library/LaunchAgents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let _home = crate::test_support::ScopedHome::new(&fake_home);
     let h = Harness::new("external");
+
+    // 被管项目：plist 的 cwd 指向它，scan 后应标 managed_project。
+    let proj = std::env::temp_dir().join(format!("pc-ipc-extproj-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&proj);
+    sample_service(&proj);
+    let proj_path = proj.to_string_lossy().into_owned();
+    let id = add_project(&h, &proj_path);
+    h.invoke("save_service", json!({ "id": id, "spec": { "name": "svc", "run": ["node", "x.js"] } }))
+        .expect("save");
+
+    // fixture 1：launchd plist（带 Label/cwd/命令）。
+    let plist = agents.join("com.test.demo.plist");
+    let label = "com.test.demo";
+    std::fs::write(
+        &plist,
+        format!(
+            r#"<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>node</string><string>server.js</string></array><key>WorkingDirectory</key><string>{proj_path}</string><key>KeepAlive</key><true/></dict></plist>"#
+        ),
+    )
+    .unwrap();
+    let expect_mtime = std::fs::metadata(&plist)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // fixture 2：PM2 ecosystem（node 求值，cwd 指向另一个 temp 目录）。
+    let pm2proj = std::env::temp_dir().join(format!("pc-ipc-pm2proj-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&pm2proj);
+    std::fs::create_dir_all(&pm2proj).unwrap();
+    let eco_dir = fake_home.join("my/PM2");
+    std::fs::create_dir_all(&eco_dir).unwrap();
+    std::fs::write(
+        eco_dir.join("ecosystem.config.js"),
+        format!("module.exports={{apps:[{{name:'pm2svc',cwd:'{}',script:'app.js',args:'--x 1'}}]}}", pm2proj.display()),
+    )
+    .unwrap();
+
     let list = h.invoke("external_scan", json!({})).unwrap();
     let arr = list.as_array().expect("应是数组");
-    // 本机装了 launchd agent，至少应能解析出几条；若环境没有则为空数组（不是错误）
-    for e in arr {
-        assert!(e["source"] == "pm2" || e["source"] == "launchd", "{e}");
-        assert!(e["config_path"].as_str().unwrap_or_default().len() > 0, "{e}");
-        assert!(e["managed_project"].is_null() || e["managed_project"].is_string(), "{e}");
-    }
+    // 非空断言：两个 fixture 都必须被扫出来（空数组零断言的旧写法到此为止）。
+    assert_eq!(arr.len(), 2, "temp HOME 下应恰好扫出 2 条：{list}");
+
+    let launchd = arr.iter().find(|e| e["source"] == "launchd").expect("应有 launchd 条目");
+    assert_eq!(launchd["name"], label);
+    assert_eq!(launchd["cwd"], proj_path);
+    assert_eq!(launchd["command"], json!(["node", "server.js"]));
+    assert_eq!(launchd["managed_project"], proj_path, "cwd 匹配的项目应被标注：{launchd}");
+    assert_eq!(launchd["declared"], false, "同名服务不存在时 declared 应为 false：{launchd}");
+    assert_eq!(
+        launchd["changed_at"], expect_mtime,
+        "changed_at 必须等于 plist 文件 mtime：{launchd}"
+    );
+    assert!(launchd["config_path"].as_str().unwrap_or_default().ends_with("com.test.demo.plist"));
+
+    let pm2 = arr.iter().find(|e| e["source"] == "pm2").expect("应有 pm2 条目");
+    assert_eq!(pm2["name"], "pm2svc");
+    assert_eq!(pm2["command"], json!(["app.js", "--x", "1"]));
+    assert!(pm2["managed_project"].is_null(), "未加入管理的目录不应标注：{pm2}");
+
+    // 只读：扫完 plist 与 ecosystem 原样不动。
+    let plist_after = std::fs::read_to_string(&plist).unwrap();
+    assert!(plist_after.contains(label), "扫描不应改写 plist");
 
     // reveal_file 对不存在的路径必须拒绝（不能变成任意路径 open）
     let err = h
         .invoke("reveal_file", json!({ "path": "/definitely/not/here.plist" }))
         .expect_err("应拒绝");
     assert!(err.to_string().contains("不存在"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&fake_home);
+    let _ = std::fs::remove_dir_all(&proj);
+    let _ = std::fs::remove_dir_all(&pm2proj);
 }
 
 /// 批量探测 + 批量采纳 + 临时运行：三条「快速关联」路径的行为契约。
@@ -731,28 +904,42 @@ fn ipc_probe_adopt_and_adhoc_paths() {
 
 /// 外部视图的「同步」语义：每次调用都重读文件，且能报出与声明的命令漂移。
 ///
-/// 直接拿本机真实的 launchd 条目做参照：找一条带 cwd 与命令的，把「同名服务 + 不同命令」
-/// 声明进它指向的目录，然后要求扫描结果报出 drift。
+/// #41(b)：hermetic——temp HOME + 自写 plist fixture，不依赖真机 launchd 条目；
+/// 逻辑与旧版一致（声明不同命令→报 drift，改一致→drift 消失），不断言跳过。
 #[test]
 fn ipc_external_scan_reports_drift_and_reloads() {
+    let fake_home = std::env::temp_dir().join(format!("pc-ipc-dhome-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&fake_home);
+    let agents = fake_home.join("Library/LaunchAgents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let _home = crate::test_support::ScopedHome::new(&fake_home);
     let h = Harness::new("drift");
-    let first = h.invoke("external_scan", json!({})).unwrap();
-    let items = first.as_array().unwrap().clone();
 
-    let Some(sample) = items
+    // 自写 plist：cwd 指向 temp 项目，命令固定。
+    let proj = std::env::temp_dir().join(format!("pc-ipc-dproj-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&proj);
+    sample_service(&proj);
+    let cwd = proj.to_string_lossy().into_owned();
+    let name = "com.test.drift";
+    std::fs::write(
+        agents.join("com.test.drift.plist"),
+        format!(
+            r#"<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>{name}</string><key>ProgramArguments</key><array><string>node</string><string>server.js</string></array><key>WorkingDirectory</key><string>{cwd}</string></dict></plist>"#
+        ),
+    )
+    .unwrap();
+
+    // 首扫：fixture 必须在，且此时无声明、无 drift。
+    let first = h.invoke("external_scan", json!({})).unwrap();
+    let sample = first
+        .as_array()
+        .unwrap()
         .iter()
-        .find(|e| e["cwd"].is_string() && e["command"].is_array())
+        .find(|e| e["name"] == name && e["source"] == "launchd")
         .cloned()
-    else {
-        eprintln!("跳过：本机没有带 cwd 与命令的 launchd 条目");
-        return;
-    };
-    let cwd = sample["cwd"].as_str().unwrap().to_string();
-    let name = sample["name"].as_str().unwrap().to_string();
-    if !std::path::Path::new(&cwd).is_dir() {
-        eprintln!("跳过：{cwd} 不存在");
-        return;
-    }
+        .expect("fixture plist 应被扫出");
+    assert_eq!(sample["declared"], false);
+    assert_eq!(sample["drift"], Value::Null);
 
     // 把该目录收进管理器，并声明一个与外部命令不同的同名服务
     let id = add_project(&h, &cwd);
@@ -798,6 +985,9 @@ fn ipc_external_scan_reports_drift_and_reloads() {
         .cloned()
         .unwrap();
     assert_eq!(hit2["drift"], Value::Null, "一致后不该再报漂移：{hit2}");
+
+    let _ = std::fs::remove_dir_all(&fake_home);
+    let _ = std::fs::remove_dir_all(&proj);
 }
 
 /// 退出时必须停掉 compose 日志跟随，否则每次 Cmd+Q 都漏一个 `docker compose logs -f`。
@@ -811,7 +1001,12 @@ fn ipc_exit_stops_all_docker_log_followers() {
 
     let h = Harness::new("dockerlogs");
     let dir = tempfile::tempdir().unwrap();
-    // 不用真 docker：用一个长命的 `sh` 冒充日志流，is_alive 判定才可控
+    // #10：不用真 docker——长命假脚本冒充日志流，is_alive 判定才可控。
+    // 旧写法注释说不用真 docker、实际调 follow（真 docker_bin），名实不符。
+    let script = dir.path().join("fake-docker");
+    std::fs::write(&script, "#!/bin/sh\nsleep 300\n").unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let bin = script.to_string_lossy().into_owned();
     let spec = DockerSpec { files: vec!["x.yml".into()], project_name: None, services: vec![] };
     let sup = h.app.state::<crate::supervisor::Supervisor>().inner().clone();
     let sink = std::sync::Arc::new(crate::supervisor::Collector::default());
@@ -819,7 +1014,7 @@ fn ipc_exit_stops_all_docker_log_followers() {
     // 直接构造两条流（不依赖 docker 是否安装）
     let mut logs = Vec::new();
     for name in ["a", "b"] {
-        let l = DockerLogs::follow(&sup, sink.clone(), dir.path(), &spec, 77, name)
+        let l = DockerLogs::follow_with_bin(&sup, sink.clone(), dir.path(), &spec, 77, name, bin.clone())
             .expect("应能开始跟随");
         assert!(l.is_alive(), "刚起的跟随进程应存活");
         logs.push(l);
@@ -877,17 +1072,18 @@ fn ipc_docker_log_group_stops_child_process_too() {
 
     let h = Harness::new("logptree");
     let dir = tempfile::tempdir().unwrap();
-    // 用 sh 冒充「docker compose + 插件子进程」的两层结构
+    // #37：`sleep 300 & wait` 保证父子两层都稳定存在（旧 `sleep 300` 是竞态：
+    // sh 启动 sleep 需要时间，单次 ps 快照若在 fork 前抓拍就抓不到子进程，
+    // for 零断言、测试空测通过）。
     let script = dir.path().join("fake-docker");
-    std::fs::write(&script, "#!/bin/sh\n# 模拟插件子进程：sleep 在同一个进程组里\nsleep 300\n").unwrap();
+    std::fs::write(&script, "#!/bin/sh\nsleep 300 & wait\n").unwrap();
     std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 
     let spec = DockerSpec { files: vec!["x.yml".into()], project_name: None, services: vec![] };
     let sup = h.app.state::<crate::supervisor::Supervisor>().inner().clone();
     let sink = std::sync::Arc::new(crate::supervisor::Collector::default());
 
-    // 让 follow 用的 docker_bin 指向我们的假脚本：通过 PATH 前置实现
-    let mut logs = DockerLogs::follow_with_bin(
+    let logs = DockerLogs::follow_with_bin(
         &sup,
         sink,
         dir.path(),
@@ -900,43 +1096,61 @@ fn ipc_docker_log_group_stops_child_process_too() {
     let pid = logs.pid();
     assert!(pid_is_running(pid), "跟随进程应存活");
 
-    // 找出同组的 sleep 子进程
-    let child = std::process::Command::new("/bin/ps")
-        .args(["-o", "pid=,pgid=", "-A"])
-        .output()
-        .ok()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(|l| {
-                    let mut it = l.split_whitespace();
-                    let p: u32 = it.next()?.parse().ok()?;
-                    let g: i32 = it.next()?.parse().ok()?;
-                    (g == pid as i32 && p != pid).then_some(p)
-                })
-                .collect::<Vec<u32>>()
-        })
-        .unwrap_or_default();
+    // 轮询等子进程出现（2s 上限）：fork 需要时间，单次快照会抓空。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let child: Vec<u32> = loop {
+        let found = std::process::Command::new("/bin/ps")
+            .args(["-o", "pid=,pgid=", "-A"])
+            .output()
+            .ok()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter_map(|l| {
+                        let mut it = l.split_whitespace();
+                        let p: u32 = it.next()?.parse().ok()?;
+                        let g: i32 = it.next()?.parse().ok()?;
+                        (g == pid as i32 && p != pid).then_some(p)
+                    })
+                    .collect::<Vec<u32>>()
+            })
+            .unwrap_or_default();
+        if !found.is_empty() || std::time::Instant::now() >= deadline {
+            break found;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    // 非空断言：没抓到子进程就是前置失败，不能空测通过。
+    assert!(!child.is_empty(), "假脚本应有 sleep 子进程（2s 内未出现）：跟随 pid={pid}");
 
     DockerLogs::stop(logs);
-    std::thread::sleep(std::time::Duration::from_millis(500));
 
-    assert!(!pid_is_running(pid), "父进程必须退出");
-    for c in &child {
-        assert!(!pid_is_running(*c), "同组的子进程 {c} 也必须退出（否则会留下孤儿）");
+    // 父+子全死才算过（轮询代替固定 500ms）。
+    for p in std::iter::once(pid).chain(child.iter().copied()) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut dead = false;
+        while std::time::Instant::now() < deadline {
+            if !pid_is_running(p) {
+                dead = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(dead, "stop 后进程 {p} 必须退出（否则会留下孤儿）");
     }
 }
 
-/// 进程是否真的还活着（僵尸也算死：它们不再占用任何资源语义）。
+/// 进程是否真的还活着。
+///
+/// #78：僵尸（stat 以 Z 开头）必须视为**活着/收割中**，而不是死了——
+/// 旧写法把 Z 视为死，父进程漏 wait 时测试会被蒙混过去（进程表里还有它）。
+/// 要求 `ps -o stat=` 输出空（进程彻底没了）才算死；调用点一律轮询而非单次判定，
+/// 给父进程留出 wait 收尸的时间（stop 后短暂 Z 是正常的，轮询等它消失）。
 fn pid_is_running(pid: u32) -> bool {
     std::process::Command::new("/bin/ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
         .output()
-        .map(|o| {
-            let s = String::from_utf8_lossy(&o.stdout);
-            let st = s.trim();
-            !st.is_empty() && !st.starts_with('Z')
-        })
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
         .unwrap_or(false)
 }
 
@@ -962,7 +1176,8 @@ fn ipc_service_logs_accepts_frontend_arg_shape() {
     let got = h
         .invoke("service_logs", json!({ "id": id, "name": "api" }))
         .expect("前端形状 { id, name } 必须被 service_logs 接受");
-    assert!(got.is_array(), "应返回行数组：{got}");
+    // #75：save 后未启动，缓冲是空的——精确断言空数组（is_array 太弱，非空数组也能过）。
+    assert_eq!(got, json!([]), "未启动的服务日志应为空数组：{got}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1015,5 +1230,17 @@ fn ipc_docker_logs_small_output_reaches_ui_promptly() {
     let lines: Vec<String> =
         sink.logs.lock().unwrap().iter().flat_map(|p| p.lines.clone()).collect();
     assert_eq!(lines, vec!["one".to_string(), "two".to_string(), "three".to_string()]);
+    // #75：stop 后跟随进程必须真死（轮询），不能只停了读线程留着 sleep 孤儿。
+    let pid = logs.pid();
     DockerLogs::stop(logs);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut dead = false;
+    while std::time::Instant::now() < deadline {
+        if !pid_is_running(pid) {
+            dead = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(dead, "stop 后跟随进程 {pid} 必须退出");
 }

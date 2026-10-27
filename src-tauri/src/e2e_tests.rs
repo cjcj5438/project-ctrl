@@ -253,34 +253,78 @@ fn pull_gate_on_real_repos() {
     }
 }
 
-/// 步骤 6：`sub2api` 有 go.mod 但本机无 go → 预检必须挡住。
+/// #39：temp 工程 + 真实 `service_preflight` IPC，缺 toolchain 必须挡住。
+///
+/// 旧写法手拼 problems（自写判定，不调产品代码），本机有 go 时还零断言通过。
+/// hermetic 方案：fixture 工程放 `go.mod` + `Makefile`（模拟 sub2api 的根 Makefile），
+/// 服务 run 用一个**必然不存在**的二进制（`definitely-not-a-real-binary-xyz`）——
+/// 不依赖本机是否装 go：run 缺失恒报；go 缺失与否则按本机实际分叉断言，
+/// 两个分支都有非空断言，没有 return 跳过。
 #[test]
 fn preflight_blocks_missing_go_toolchain() {
-    let dir = PathBuf::from(std::env::var("HOME").unwrap()).join("projects/sub2api");
-    if !dir.is_dir() {
-        eprintln!("跳过：{dir:?} 不存在");
-        return;
-    }
+    use serde_json::json;
+    use tauri::test::{get_ipc_response, INVOKE_KEY};
+    use tauri::webview::InvokeRequest;
+    use tauri::WebviewWindowBuilder;
+
+    let data = tempfile::tempdir().unwrap();
+    let _data_dir = crate::test_support::ScopedDataDir::new(data.path());
+    let app = crate::test_app();
+    let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .expect("webview 应能创建");
+    let invoke = |cmd: &str, args: serde_json::Value| {
+        let req = InvokeRequest {
+            cmd: cmd.to_string(),
+            callback: tauri::ipc::CallbackFn(0),
+            error: tauri::ipc::CallbackFn(1),
+            url: "tauri://localhost".parse().unwrap(),
+            body: tauri::ipc::InvokeBody::Json(args),
+            headers: Default::default(),
+            invoke_key: INVOKE_KEY.to_string(),
+        };
+        let raw = get_ipc_response(&webview, req).expect("ipc 应有响应");
+        raw.deserialize::<serde_json::Value>().expect("响应应可反序列化")
+    };
+
+    // temp 工程：go.mod（一级子目录也行，这里放根）+ Makefile（模拟 sub2api 形态）。
+    let dir = scratch("preflight-go");
+    std::fs::write(dir.join("go.mod"), "module example.com/demo\n\ngo 1.22\n").unwrap();
+    std::fs::write(dir.join("Makefile"), "build:\n\tgo build ./...\n").unwrap();
     let d = crate::detect::detect(&dir);
     assert!(d.toolchain.contains(&"go".to_string()), "应识别出 go: {:?}", d.toolchain);
 
-    let path = crate::execenv::path_for(None);
-    let mut problems = Vec::new();
-    if crate::execenv::resolve("make", &path).is_none() {
-        problems.push("缺少可执行文件：make".to_string());
-    }
-    for tool in &d.toolchain {
-        if crate::execenv::resolve(tool, &path).is_none() {
-            problems.push(format!("缺少可执行文件：{tool}（项目需要它才能构建/运行）"));
-        }
-    }
-    let go_missing = crate::execenv::resolve("go", &path).is_none();
+    let path = dir.to_string_lossy().into_owned();
+    let ids = invoke("add_projects", json!({ "paths": [path], "tags": [] }));
+    let id = ids[0].as_i64().unwrap();
+    // run 用必然不存在的二进制：preflight 恒报「缺 run」，不依赖本机装没装 go。
+    invoke(
+        "save_service",
+        json!({ "id": id, "spec": { "name": "api", "run": ["definitely-not-a-real-binary-xyz", "build"] } }),
+    );
+
+    // 调真实 preflight（产品代码），不是手拼判定。
+    let pf = invoke("service_preflight", json!({ "id": id, "name": "api" }));
+    let arr = pf.as_array().expect("preflight 应返回数组");
+    assert!(
+        arr.iter().any(|v| v.as_str().unwrap_or_default().contains("definitely-not-a-real-binary-xyz")),
+        "应报缺 run 命令：{pf}"
+    );
+    // go 分支：按本机实际分叉，两个分支都有断言（无跳过）。
+    let go_missing = crate::execenv::resolve("go", &crate::execenv::path_for(None)).is_none();
     if go_missing {
         assert!(
-            problems.iter().any(|p| p.contains("缺少可执行文件：go")),
-            "应报缺 go，实际：{problems:?}"
+            arr.iter().any(|v| v.as_str().unwrap_or_default().contains("缺少可执行文件：go")),
+            "本机无 go 时应报缺 go toolchain：{pf}"
+        );
+    } else {
+        assert!(
+            !arr.iter().any(|v| v.as_str().unwrap_or_default().contains("缺少可执行文件：go")),
+            "本机有 go 时不应报缺 go：{pf}"
         );
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 步骤 8：`shutdown_all` 之后所有受管端口必须释放（多服务同时跑）。
@@ -383,17 +427,26 @@ fn two_services_of_one_project_run_together() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 用真实项目（G6-oht-3D 的 infra compose 与一个探明可跑的 npm 脚本）走一遍
-/// 「探测 → 计划 → 真起 → 真停」，确认产品路径而不只是内部 API。
+/// 用 temp 工程走一遍「探测 → 计划 → 真起 → 真停」，确认产品路径而不只是内部 API。
+///
+/// #41(c)：hermetic——旧写法依赖 `~/my/G6-oht-3D` 真实项目与 infra compose；
+/// 改为 temp 工程自写 `infra/docker-compose.yml`（postgres+minio）与 pnpm 锁文件。
+/// 端口分配不用 `bind(:0)` 释放重抢（TOCTOU：释放后可能被别人抢走），
+/// 改用 `ports::pick` 在期望值附近选空闲端口（独占端口锁下无竞争）。
 #[test]
 fn real_project_detect_plan_start_stop() {
     let _guard = crate::test_support::exclusive_ports();
-    let base = PathBuf::from(std::env::var("HOME").unwrap()).join("my/G6-oht-3D");
-    if !base.is_dir() {
-        eprintln!("跳过：{base:?} 不存在");
-        return;
-    }
-    // 1) 探测必须在这台机器上识别出 compose 栈与 infra 目录
+    // 1) temp 工程模拟 monorepo：infra compose + pnpm 锁文件。
+    let base = scratch("realplan-base");
+    std::fs::create_dir_all(base.join("infra")).unwrap();
+    std::fs::write(
+        base.join("infra/docker-compose.yml"),
+        "services:\n  postgres:\n    image: postgres:16-alpine\n    ports:\n      - \"5432:5432\"\n  minio:\n    image: minio/minio:latest\n    ports:\n      - \"9000:9000\"\n",
+    )
+    .unwrap();
+    std::fs::write(base.join("package.json"), r#"{"name":"demo","private":true}"#).unwrap();
+    std::fs::write(base.join("pnpm-workspace.yaml"), "packages:\n  - apps/*\n").unwrap();
+    // 探测必须识别出 compose 栈与 infra 目录
     let d = crate::detect::detect(&base);
     let infra = d
         .compose_stacks
@@ -425,9 +478,8 @@ fn real_project_detect_plan_start_stop() {
     .unwrap();
     let guard = KillOnDrop(Supervisor::default());
     let sup = &guard.0;
-    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = held.local_addr().unwrap().port();
-    drop(held);
+    // 动态端口直连：直接用 pick 选一个空闲端口并立即 spawn，不释放重抢。
+    let port = ports::pick(44600).expect("应能选到空闲端口").port;
     let sink = Arc::new(crate::supervisor::Collector::default());
     sup.spawn(
         sink.clone(),
@@ -448,6 +500,7 @@ fn real_project_detect_plan_start_stop() {
     sup.stop(&key);
     assert!(ports::wait_released(port, Duration::from_secs(5)), "停止后必须释放端口");
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// 崩溃安全的凭据：spawn 时就落盘，正常停止后清掉；被强杀留下的孤儿在下次启动时**回收**而非接管。
@@ -529,86 +582,132 @@ fn orphan_without_keep_alive_is_reclaimed_not_adopted() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    // 无论断言成败都先收尸：失败路径直接 panic 会跳过 wait 留下僵尸。
     if !dead {
         let _ = child.kill();
-        let _ = child.wait();
     }
+    let _ = child.wait();
     assert!(dead, "孤儿进程应被回收");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 真实 docker：用本机已在运行的 `canboso-my` compose 栈验证 `ps` 解析。
-/// 只读，不启停容器；docker 不可用时跳过。
+/// #41(d)：temp compose + 本地镜像验证 `ps` 解析（只读被测函数，不启停外部栈）。
+///
+/// PATH 结论：`execenv::base_path()` 是固定前缀 + HOME 派生，**不 honor 进程 PATH**，
+/// 且 `docker::docker_bin()` 经 base_path 解析——本机装了真 docker 时任何 PATH 前置
+/// 的假脚本都会被真实现遮蔽（resolve 按前缀顺序命中 /usr/local/bin/docker）。
+/// 所以假脚本回放不可行，退到 temp compose + 本地镜像 + 真 daemon。
+/// daemon 不可用时测试**明确失败**（不 return 跳过），并在消息里说明原因。
 #[test]
 fn real_compose_ps_reports_services() {
-    let base = PathBuf::from(std::env::var("HOME").unwrap()).join("my/canboso-my");
-    let file = base.join("docker-compose.yml");
-    if !file.is_file() {
-        eprintln!("跳过：{file:?} 不存在");
-        return;
-    }
-    if crate::execenv::resolve("docker", &crate::execenv::base_path()).is_none() {
-        eprintln!("跳过：没有 docker");
-        return;
-    }
-    let spec = crate::services::DockerSpec {
-        files: vec!["docker-compose.yml".into()],
-        project_name: None,
-        services: vec!["postgres".into()],
-    };
-    let ps = match crate::docker::ps(&base, &spec) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("跳过：docker 不可用（{e}）");
-            return;
-        }
-    };
-    if ps.is_empty() {
-        eprintln!("跳过：容器未运行");
-        return;
-    }
-    let pg = ps.iter().find(|c| c.service == "postgres").expect("应解析出 postgres");
-    assert_eq!(pg.state, "running", "{:?}", pg);
+    // daemon 可用性是硬前置：不可用则明确失败，不要跳过。
+    let daemon_ok = std::process::Command::new("docker")
+        .args(["info", "--format", "{{.ServerVersion}}"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(daemon_ok, "docker daemon 不可用：本测试需要真 daemon（假脚本被 base_path 遮蔽，见注释）");
+
+    // temp 工程：只用本地已有镜像（postgres:16-alpine），不 pull。
+    // ports 用宿主侧临时端口（`127.0.0.1::5432` 由 daemon 随机分配）：既 hermetic
+    // （无固定端口冲突），又能覆盖 PublishedPort → ports 字段的解析路径。
+    let base = scratch("compose-ps");
+    std::fs::write(
+        base.join("docker-compose.yml"),
+        "services:\n  postgres:\n    image: postgres:16-alpine\n    environment:\n      POSTGRES_PASSWORD: pw\n    ports:\n      - \"127.0.0.1::5432\"\n",
+    )
+    .unwrap();
+    // 探测应识别该 compose 栈（产品路径不断）。
+    let d = crate::detect::detect(&base);
     assert!(
-        pg.ports.contains("5432"),
-        "PublishedPort 应被解析进 ports：{:?}",
-        pg
+        d.compose_stacks.iter().any(|c| c.file == "docker-compose.yml"),
+        "应识别 temp compose：{:?}",
+        d.compose_stacks
     );
 
+    // 起一个一次性的 postgres（项目名唯一，不污染别的栈）。
+    let proj = format!("pc-test-ps-{}", std::process::id());
+    let up = std::process::Command::new("docker")
+        .args(["compose", "-f", "docker-compose.yml", "-p", &proj, "up", "-d", "postgres"])
+        .current_dir(&base)
+        .output()
+        .expect("应能执行 docker compose up");
+    assert!(up.status.success(), "compose up 应成功：{}", String::from_utf8_lossy(&up.stderr));
+    // 等容器进入 running（最多 60s：首次解压镜像慢）。
+    let spec = crate::services::DockerSpec {
+        files: vec!["docker-compose.yml".into()],
+        project_name: Some(proj.clone()),
+        services: vec!["postgres".into()],
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let ps = loop {
+        let ps = crate::docker::ps(&base, &spec).expect("ps 应可执行");
+        if ps.iter().any(|c| c.service == "postgres" && c.state == "running") {
+            break ps;
+        }
+        assert!(Instant::now() < deadline, "postgres 应在 60s 内 running（当前：{ps:?}）");
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let pg = ps.iter().find(|c| c.service == "postgres").expect("应解析出 postgres");
+    assert_eq!(pg.state, "running", "{:?}", pg);
+    assert!(!pg.ports.is_empty(), "PublishedPort 应被解析进 ports：{pg:?}");
     // 过滤：只要 postgres 时不应返回别的服务
     let other = crate::services::DockerSpec {
         files: vec!["docker-compose.yml".into()],
-        project_name: None,
+        project_name: Some(proj.clone()),
         services: vec!["nonexistent-svc".into()],
     };
     assert!(crate::docker::ps(&base, &other).unwrap().is_empty(), "服务名过滤必须生效");
+
+    // 清理：down 掉一次性栈（-v 清掉匿名卷）。
+    let _ = std::process::Command::new("docker")
+        .args(["compose", "-p", &proj, "down", "-v"])
+        .current_dir(&base)
+        .output();
+    let _ = std::fs::remove_dir_all(&base);
 }
 
-/// 真实 docker：`logs -f` 必须把 compose 输出写进与服务共用的日志缓冲与事件通道。
+/// #41(d)：temp compose（postgres 本地镜像）验证 `logs -f` 进共享 sink。
+///
+/// 同 ps 测试：daemon 是硬前置，不可用则明确失败，不跳过。
 #[test]
 fn real_compose_logs_stream_into_shared_sink() {
-    let base = PathBuf::from(std::env::var("HOME").unwrap()).join("my/canboso-my");
-    if !base.join("docker-compose.yml").is_file() {
-        eprintln!("跳过：compose 文件不存在");
-        return;
-    }
-    if crate::execenv::resolve("docker", &crate::execenv::base_path()).is_none() {
-        eprintln!("跳过：没有 docker");
-        return;
-    }
+    let daemon_ok = std::process::Command::new("docker")
+        .args(["info", "--format", "{{.ServerVersion}}"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(daemon_ok, "docker daemon 不可用：本测试需要真 daemon（见 ps 测试注释）");
+
+    let base = scratch("compose-logs");
+    std::fs::write(
+        base.join("docker-compose.yml"),
+        "services:\n  postgres:\n    image: postgres:16-alpine\n    environment:\n      POSTGRES_PASSWORD: pw\n",
+    )
+    .unwrap();
+    let proj = format!("pc-test-logs-{}", std::process::id());
+    let up = std::process::Command::new("docker")
+        .args(["compose", "-f", "docker-compose.yml", "-p", &proj, "up", "-d", "postgres"])
+        .current_dir(&base)
+        .output()
+        .expect("应能执行 docker compose up");
+    assert!(up.status.success(), "compose up 应成功：{}", String::from_utf8_lossy(&up.stderr));
+
     let spec = crate::services::DockerSpec {
         files: vec!["docker-compose.yml".into()],
-        project_name: None,
+        project_name: Some(proj.clone()),
         services: vec!["postgres".into()],
     };
-    // 容器没跑时 logs 会立刻失败，先确认 ps 能看到它
-    match crate::docker::ps(&base, &spec) {
-        Ok(v) if v.iter().any(|c| c.service == "postgres" && c.state == "running") => {}
-        _ => {
-            eprintln!("跳过：postgres 未运行");
-            return;
+    // 等 running 再跟随（logs 对未运行容器会立刻失败）。
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let ps = crate::docker::ps(&base, &spec).expect("ps 应可执行");
+        if ps.iter().any(|c| c.service == "postgres" && c.state == "running") {
+            break;
         }
+        assert!(Instant::now() < deadline, "postgres 应在 60s 内 running（当前：{ps:?}）");
+        std::thread::sleep(Duration::from_millis(500));
     }
 
     let sup = Supervisor::default();
@@ -636,4 +735,11 @@ fn real_compose_logs_stream_into_shared_sink() {
     );
     let events = sink.logs.lock().unwrap();
     assert!(events.iter().all(|p| p.key == key), "事件必须带正确的服务 key");
+    drop(events);
+
+    let _ = std::process::Command::new("docker")
+        .args(["compose", "-p", &proj, "down", "-v"])
+        .current_dir(&base)
+        .output();
+    let _ = std::fs::remove_dir_all(&base);
 }
