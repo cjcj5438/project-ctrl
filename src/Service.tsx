@@ -562,10 +562,11 @@ function ServiceCard({
                 await api.serviceStop(project.id, name)
                 // 停止语义（与后端约定）：serviceStop 对 docker-only 不碰容器，
                 // 只停日志跟随/解绑——因此不写回 Stopped（容器还在 running，
-                // 写 Stopped 是假信息）。
+                // 写 Stopped 是假信息）。要停容器请用 compose down。
                 // 本地进程的 Stopped 事件随后会覆盖同一条，无害。
               })}
               disabled={busy !== null || (!isRunning && !isStep)}
+              title={!spec.run && spec.docker ? '仅停止日志跟随；要停容器请用 compose down' : ''}
             >
               停止
             </Button>
@@ -583,7 +584,17 @@ function ServiceCard({
               重启
             </Button>
             <Button size="sm"
-              onClick={() => void act(`url-${name}`, async () => void (await api.openServiceUrl(project.id, name)))}
+              onClick={() => void act(`url-${name}`, async () => {
+                // docker-only 不进 supervisor：openServiceUrl 走 port_of 必失败，
+                // 直接用快照里的 port 经 open_external 打开。
+                if (!spec.run && spec.docker) {
+                  const port = status?.port
+                  if (port == null) throw new Error('该服务没有监听端口')
+                  await api.openExternal(`http://127.0.0.1:${port}`)
+                } else {
+                  await api.openServiceUrl(project.id, name)
+                }
+              })}
               disabled={status?.port == null}
             >
               打开
