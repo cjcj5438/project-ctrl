@@ -10,7 +10,7 @@ import {
 import DetailView from './Detail'
 import UpdateBanner from './Update'
 import ProbePanel, { ExternalPanel } from './Probe'
-import { StatusDot } from './components'
+import { ErrorBanner, StatusDot } from './components'
 import { IconMonitor, IconMoon, IconPencil, IconSearch, IconSun, IconX } from './icons'
 import { applyTheme, loadTheme, saveTheme, watchSystemTheme, type ThemeMode } from './theme'
 import { humanSize } from './format'
@@ -361,11 +361,7 @@ export default function App() {
           </div>
         </header>
 
-        {error && (
-          <div className="mt-4 rounded-lg border border-error/50 bg-error/10 px-3 py-2 text-sm text-error">
-            {error}
-          </div>
-        )}
+        {error && <ErrorBanner text={error} onClose={() => setError(null)} />}
 
         {/* 双视图：项目（默认）与服务；服务视图只显示运行态，不是「另一个列表」 */}
         <div className="mt-4 flex items-center gap-1 text-sm" role="group" aria-label="视图切换">

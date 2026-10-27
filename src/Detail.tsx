@@ -4,6 +4,7 @@ import { humanSize } from './format'
 import ReadmeSection from './Readme'
 import ServiceSection from './Service'
 import SourceSection from './Source'
+import { ErrorBanner } from './components'
 import { IconChevronLeft, IconX } from './icons'
 import { pickDirectory } from './util'
 
@@ -100,11 +101,7 @@ export default function DetailView({
           返回
         </button>
 
-        {error && (
-          <div className="mt-4 rounded-lg border border-error/50 bg-error/10 px-3 py-2 text-sm text-error ">
-            {error}
-          </div>
-        )}
+        {error && <ErrorBanner text={error} onClose={() => setError(null)} />}
 
         <div className="mt-4 flex items-center gap-2">
           <h1 className="text-xl font-bold">{project.name}</h1>
