@@ -121,7 +121,8 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 # 3) 应用正在运行则优雅退出（最多等约 10 秒，不强杀）
-if pgrep -f "$BINARY" >/dev/null 2>&1; then
+# 两个安装位置都查：/Applications 与 ~/Applications（pgrep 按二进制全路径匹配）
+if pgrep -f "$BINARY" >/dev/null 2>&1 || pgrep -f "$HOME/Applications/$APP_NAME/Contents/MacOS/project-ctrl" >/dev/null 2>&1; then
   log "应用正在运行，请求退出…"
   if [ "$DRY_RUN" -eq 1 ]; then
     log "[dry-run] osascript -e 'tell application \"project-ctrl\" to quit'"
@@ -129,10 +130,10 @@ if pgrep -f "$BINARY" >/dev/null 2>&1; then
   else
     osascript -e 'tell application "project-ctrl" to quit' || true
     for _ in $(seq 1 10); do
-      pgrep -f "$BINARY" >/dev/null 2>&1 || break
+      pgrep -f "$BINARY" >/dev/null 2>&1 || pgrep -f "$HOME/Applications/$APP_NAME/Contents/MacOS/project-ctrl" >/dev/null 2>&1 || break
       sleep 1
     done
-    if pgrep -f "$BINARY" >/dev/null 2>&1; then
+    if pgrep -f "$BINARY" >/dev/null 2>&1 || pgrep -f "$HOME/Applications/$APP_NAME/Contents/MacOS/project-ctrl" >/dev/null 2>&1; then
       echo "错误：project-ctrl 仍在运行，请手动退出后重试（不强制结束进程）" >&2
       exit 1
     fi

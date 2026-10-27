@@ -38,10 +38,20 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME#v}"
           pkg="$(node -p "require('./package.json').version")"
-          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)"
-          echo "tag=$tag  package.json=$pkg  src-tauri/Cargo.toml=$crate"
-          if [ "$tag" != "$pkg" ] || [ "$tag" != "$crate" ]; then
-            echo "::error::版本不一致：tag=$tag, package.json=$pkg, src-tauri/Cargo.toml=$crate（请先同步版本再打 tag）"
+          # Cargo.toml 只认文件顶部 [package] 段内的 version 行（dependencies 里的
+          # version 键在后面的 [...] 段里，不会被取到；比 sed|head -1 严格）
+          crate="$(node -e "
+            const fs = require('fs');
+            const text = fs.readFileSync('src-tauri/Cargo.toml', 'utf8');
+            const seg = text.split(/^\[.*\]/m)[1] ?? '';
+            const m = seg.match(/^version\s*=\s*\"([^\"]+)\"/m);
+            if (!m) { console.error('Cargo.toml [package] 段未找到 version'); process.exit(1); }
+            console.log(m[1]);
+          ")"
+          conf="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          echo "tag=$tag  package.json=$pkg  Cargo.toml=$crate  tauri.conf.json=$conf"
+          if [ "$tag" != "$pkg" ] || [ "$tag" != "$crate" ] || [ "$tag" != "$conf" ]; then
+            echo "::error::版本不一致：tag=$tag, package.json=$pkg, Cargo.toml=$crate, tauri.conf.json=$conf（请先同步三处版本再打 tag）"
             exit 1
           fi
 

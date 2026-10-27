@@ -67,7 +67,7 @@ pnpm tauri build --bundles app
 产物在 `src-tauri/target/release/bundle/macos/project-ctrl.app`（arm64，ad-hoc 签名），复制到
 `/Applications` 即可使用。`tauri.conf.json` 中 `bundle.macOS.signingIdentity = "-"`：Apple Silicon 上
 未签名二进制无法运行，这里用 ad-hoc 签名，使 `pnpm tauri build` 一步产出可运行的 .app。
-不做公证、不做自动更新、不生成 dmg。
+不做公证、不生成 dmg。自动更新见下节「发布与更新」（应用内 updater + Release latest.json）。
 
 本地构建出的 .app 不带 quarantine 标记，通常可直接打开；本项目未做公证，若 .app 是从别处拷贝或下载来的
 而遇到「无法验证开发者」，可在「系统设置 → 隐私与安全性」中对该应用选择「仍要打开」。
@@ -76,14 +76,14 @@ pnpm tauri build --bundles app
 
 ### 发版流程
 
-1. 同步版本号：`package.json` 与 `src-tauri/Cargo.toml` 都改成新版本（两者必须一致）。
+1. 同步版本号：`package.json`、`src-tauri/Cargo.toml` 与 `src-tauri/tauri.conf.json` 都改成新版本（三处必须一致，CI 会校验）。
 2. commit，然后打 tag 并推送：
    ```sh
    git tag vX.Y.Z
    git push origin vX.Y.Z
    ```
 3. tag 会触发 `.github/workflows/release.yml`（`macos-latest`，arm64）：CI 先校验 tag（去掉 `v`）与
-   上述两处版本号一致，再跑 `pnpm build` 与 `cargo test`，最后用 tauri-action 构建并创建 Release，
+   上述三处版本号一致，再跑 `pnpm build` 与 `cargo test`，最后用 tauri-action 构建并创建 Release，
    附带 `project-ctrl.app.tar.gz`、其 `.sig` 与 `latest.json`（App 的更新源）。
 
 ### GitHub Secrets
@@ -119,7 +119,7 @@ scripts/install.sh --open          # 安装完成后启动
 ## 数据与配置
 
 - SQLite 库位于 `~/.project-ctrl/`，4 张表：`projects`（路径唯一、加入时间）、`tags`（名称唯一）、
-  `project_tags`（关联，外键级联）、`services`（每个项目至多一份配方 JSON，外键级联）。
+  `project_tags`（关联，外键级联）、`services`（每项目多行，`UNIQUE(project_id, name)`，外键级联）。
 - 环境变量 `PROJECT_CTRL_DATA_DIR` 可覆盖数据目录（测试 / 验证时指向 `/tmp`，避免污染真实数据）。
 
 ## 对用户目录的写入边界
@@ -138,13 +138,13 @@ scripts/install.sh --open          # 安装完成后启动
 
 ## 服务运行器的工作方式
 
-- 配方只存在库里（`services.config`），不往项目目录写任何配置文件。
+- 配方优先来自仓库内 `.project-ctrl.json`（见「仓库内声明」），没有描述文件时才用库里的本机配方；点「固化为仓库声明…」会把库里配方写进项目目录。
 - 子进程用 `process_group(0)` 起在独立进程组里，停止时对整组发 `TERM`（宽限 5 秒）再 `KILL`，
   因此 `pnpm dev` 派生出的 node/vite 不会逃出去继续占端口。
 - 子进程环境从零构造（`env_clear()` 后只给 `PATH`/`HOME`/`TERM`/`LANG`/`NO_COLOR` 与配方自报的变量），
   不继承 shell 环境，所以 `.zshrc` 里的密钥不会进入服务进程。
 - 日志按服务保留最近 2000 行，攒批推送（不逐行），前端订阅事件增量追加。
-- 运行状态只存在于内存：App 重启后一律从「未运行」开始，不收养上次残留的进程。
+- 运行状态只存在于内存；勾了「退出后保留进程」的服务会在退出时写凭据、下次启动三重校验后收养（见 USAGE 第 8 节），其余进程退出时收掉。
 - 关闭 App（包括 macOS 的 `Cmd+Q`，它只发 `RunEvent::Exit`）会收掉全部**仍在运行/构建**的进程组；
   已停止的记录不会再被发信号（进程组早已退出，pid 可能已被系统复用给别的进程）。
 
