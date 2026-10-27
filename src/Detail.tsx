@@ -152,15 +152,17 @@ export default function DetailView({
                     </button>
                   </span>
                 ))}
-                {project.auto_tags.map((t) => (
-                  <span
-                    key={t}
-                    className="rounded-full border border-dashed border-border px-2 py-0.5 text-xs text-muted "
-                    title="自动 tag（只读）"
-                  >
-                    {t}
-                  </span>
-                ))}
+                {project.auto_tags
+                  .filter((t) => !project.manual_tags.includes(t))
+                  .map((t) => (
+                    <span
+                      key={t}
+                      className="rounded-full border border-dashed border-border px-2 py-0.5 text-xs text-muted"
+                      title="自动 tag（只读）"
+                    >
+                      {t}
+                    </span>
+                  ))}
                 <input
                   value={tagInput}
                   onChange={(e) => setTagInput(e.target.value)}
