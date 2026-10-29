@@ -2,5 +2,11 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "windows": ["main"],
-  "permissions": ["dialog:allow-open", "updater:default", "process:allow-restart", "core:event:default"]
+  "permissions": [
+    "dialog:allow-open",
+    "updater:default",
+    "process:allow-restart",
+    "core:event:default",
+    "core:window:allow-start-dragging"
+  ]
 }

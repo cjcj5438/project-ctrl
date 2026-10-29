@@ -7,6 +7,13 @@ mod db;
 mod descriptor;
 mod detect;
 mod docker;
+mod ai_gate;
+mod ai_proto;
+mod ai_commands;
+mod ai_settings;
+mod ai_context;
+mod ai_session;
+mod ai_tasks;
 mod execenv;
 mod external;
 mod git;
@@ -30,13 +37,19 @@ fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R>
         .plugin(tauri_plugin_process::init())
         .manage(supervisor::Supervisor::default())
         .manage(commands::DockerLogsRegistry::default())
+        .manage(ai_session::AiManager::default())
         .invoke_handler(tauri::generate_handler![
+            ai_commands::ai_status,
+            ai_commands::ai_models,
+            ai_commands::ai_save_settings,
             commands::list_projects,
             commands::list_tags,
             commands::dev_pick_dir,
             commands::scan_directory,
             commands::add_projects,
             commands::set_project_tags,
+            commands::set_project_profile,
+            commands::open_in_vscode_at,
             commands::rename_tag,
             commands::delete_tag,
             commands::relink_project,
@@ -83,6 +96,21 @@ fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R>
             commands::source_pull,
             commands::clone_repo,
             commands::import_pm2,
+            ai_session::ai_open,
+            ai_session::ai_snapshot,
+            ai_session::ai_sessions,
+            ai_session::ai_send,
+            ai_session::ai_retry,
+            ai_session::ai_abort,
+            ai_session::ai_close,
+            ai_session::ai_set_model,
+            ai_tasks::ai_run_task,
+            ai_tasks::ai_card_action,
+            ai_tasks::ai_batch_profile,
+            ai_tasks::ai_batch_status,
+            ai_tasks::ai_batch_adopt,
+            ai_tasks::ai_batch_dismiss,
+            ai_tasks::ai_batch_cancel,
         ])
 }
 
@@ -97,9 +125,16 @@ pub fn builder<R: tauri::Runtime>() -> tauri::Builder<R> {
 /// `generate_context!` 每个 crate 只能用一次（它会定义一个符号），所以放在这里共享。
 #[cfg(test)]
 pub fn test_app() -> tauri::App<tauri::test::MockRuntime> {
-    configure(tauri::test::mock_builder())
+    use tauri::Manager;
+    let app = configure(tauri::test::mock_builder())
         .build(tauri::generate_context!())
-        .expect("mock app 应能构建")
+        .expect("mock app 应能构建");
+    // 与生产装配一致：出口与宿主钩子都装好，但测试不会真的去 spawn pi。
+    if let Some(ai) = app.try_state::<ai_session::AiManager>() {
+        ai.attach(app.handle());
+        ai.set_host_handler(ai_tasks::host_handler(app.handle().clone()));
+    }
+    app
 }
 
 /// 信号 handler 往里写一个字节的管道写端。handler 内只能做 async-signal-safe
@@ -125,7 +160,7 @@ unsafe extern "C" fn on_signal(sig: libc::c_int) {
 static EXIT_CLEANUP_DONE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// 两条退出清理：① compose 日志流 ② 受管服务。返回 true 表示本次真正执行了。
+/// 三条退出清理：① compose 日志流 ② 受管服务 ③ AI 子系统。返回 true 表示本次真正执行了。
 #[cfg(not(test))]
 fn exit_cleanup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
     use std::sync::atomic::Ordering;
@@ -142,6 +177,10 @@ fn exit_cleanup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
     if let Some(sup) = app.try_state::<supervisor::Supervisor>() {
         commands::register_adoptable(&sup);
     }
+    // ③ AI 子系统：让校验循环回滚，再收掉 pi 进程与临时文件。
+    if let Some(ai) = app.try_state::<ai_session::AiManager>() {
+        ai.shutdown_all();
+    }
     true
 }
 
@@ -153,6 +192,20 @@ pub fn run() {
     let app = builder::<tauri::Wry>()
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
+
+    // AI 子系统：写扩展与系统提示词、清上次残留、装出口与宿主钩子。
+    // 这些失败都不该挡住启动：AI 用不了，其余功能照常。
+    if let Err(e) = ai_session::install_assets() {
+        eprintln!("安装 AI 资源失败：{e}");
+    }
+    ai_session::boot_cleanup();
+    {
+        use tauri::Manager;
+        if let Some(ai) = app.try_state::<ai_session::AiManager>() {
+            ai.attach(app.handle());
+            ai.set_host_handler(ai_tasks::host_handler(app.handle().clone()));
+        }
+    }
 
     // 启动时先收养上次留下的进程（声明了 keep_alive 的服务），再进入事件循环。
     {

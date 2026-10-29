@@ -12,6 +12,7 @@
     "@types/react-dom": "^19.1.0",
     "@vitejs/plugin-react": "^4.2.0",
     "codemirror": "^6.0.2",
+    "diff": "^9.0.0",
     "dompurify": "^3.4.17",
     "marked": "^18.1.1",
     "react": "^19.1.0",
@@ -31,5 +32,5 @@
     "test": "vitest run"
   },
   "type": "module",
-  "version": "0.4.0"
+  "version": "0.5.0"
 }

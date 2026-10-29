@@ -1,33 +1,83 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, errorText, type ProjectInfo } from './api'
-import { humanSize } from './format'
+import Overview from './Overview'
 import ReadmeSection from './Readme'
 import ServiceSection from './Service'
 import SourceSection from './Source'
-import { ErrorBanner } from './components'
-import { IconChevronLeft, IconX } from './icons'
+import { Button, IconButton, Menu, Tabs } from './components'
+import {
+  IconChevronLeft,
+  IconCode,
+  IconFolder,
+  IconGithub,
+  IconMoreHorizontal,
+  IconPencil,
+  IconSparkles,
+  IconTerminal,
+} from './icons'
 import { pickDirectory } from './util'
+import type { AiIntent, AiTask, DetailTab } from './route'
+import AiPanel from './AiPanel'
 
-/** 详情页：项目信息 + tag 编辑 + 打开按钮 + README 区域。 */
-export default function DetailView({
+const TABS: { id: DetailTab; label: string }[] = [
+  { id: 'overview', label: '概览' },
+  { id: 'services', label: '服务' },
+  { id: 'source', label: '源码' },
+  { id: 'readme', label: 'README' },
+]
+
+/**
+ * 项目详情：头部（返回 / 名称 / 路径 / 打开动作）+ 页签 + 内容区（右侧留 AI 抽屉槽）。
+ *
+ * README 有未保存修改时，任何会离开当前页签的动作都先确认——包括切换页签、
+ * 返回列表、移除项目。确认框复用 Readme 里同一套文案。收起 AI 抽屉不算离开，
+ * 所以不拦（草稿留着，用户随时可以再展开）。
+ */
+export default function Detail({
   project,
   size,
+  runningServiceCount,
+  dirtyCount,
   onBack,
   onChanged,
   onRemoved,
+  onEditTags,
+  tab,
+  onTab,
+  onAiTask,
+  ai,
+  onRouteSettings,
 }: {
   project: ProjectInfo
   size?: number | null
+  runningServiceCount: number
+  dirtyCount: number | null
   onBack: () => void
   onChanged: () => Promise<void> | void
   onRemoved: () => void
+  onEditTags: (p: ProjectInfo) => void
+  tab: DetailTab
+  onTab: (t: DetailTab) => void
+  onAiTask: (task: AiTask) => void
+  /** 外部（概览 / 服务页 / 侧栏）发起的 AI 请求：nonce 变化即打开抽屉。 */
+  ai?: AiIntent
+  /** 抽屉里「打开设置」的去处。 */
+  onRouteSettings: () => void
 }) {
   const [readmeDirty, setReadmeDirty] = useState(false)
   const [guard, setGuard] = useState<null | (() => void)>(null)
   const [removeOpen, setRemoveOpen] = useState(false)
-  const [tagInput, setTagInput] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [git, setGit] = useState<{ kind: 'status' | 'log'; loading: boolean; text: string } | null>(null)
+  const [aiOpen, setAiOpen] = useState(false)
+  /**
+   * 待消费的 AI 任务：抽屉取走后立刻清空（`onTaskConsumed`），
+   * 这样收起面板再从按钮展开不会重跑上一次的任务。
+   */
+  const [pendingAi, setPendingAi] = useState<{ task: AiTask; nonce: number } | null>(null)
+  /** AI 生成的 README 草稿：nonce 让 Readme 只应用一次。 */
+  const [readmeDraft, setReadmeDraft] = useState<{ content: string; nonce: number } | undefined>(undefined)
+  const draftNonce = useRef(0)
   const aliveRef = useRef(true)
   const gitReq = useRef(0)
 
@@ -37,6 +87,26 @@ export default function DetailView({
       aliveRef.current = false
     }
   }, [])
+
+  // 换项目时清空一次性的视图内状态：未保存标记挂在旧项目上，
+  // 带着它去新项目会误判「有未保存修改」。
+  useEffect(() => {
+    setReadmeDirty(false)
+    setGuard(null)
+    setGit(null)
+    setRemoveOpen(false)
+    setError(null)
+    setReadmeDraft(undefined)
+    setPendingAi(null)
+  }, [project.id])
+
+  // 有新的 AI 请求落在路由上：打开抽屉；带任务的交给抽屉，`open` 只开抽屉
+  // （侧栏点已有会话），不能顺手发一个任务。
+  useEffect(() => {
+    if (!ai) return
+    setAiOpen(true)
+    setPendingAi('task' in ai ? { task: ai.task, nonce: ai.nonce } : null)
+  }, [ai?.nonce])
 
   const onDirtyChange = useCallback((d: boolean) => setReadmeDirty(d), [])
   const onError = useCallback((m: string | null) => setError(m), [])
@@ -50,26 +120,29 @@ export default function DetailView({
     }
   }
 
+  /** AI 草稿落到 README 页签：切过去并让 README 灌入内容（脏编辑器由它自己确认）。 */
+  const openReadmeDraft = (content: string) => {
+    draftNonce.current += 1
+    setReadmeDraft({ content, nonce: draftNonce.current })
+    if (tab !== 'readme') onTab('readme')
+  }
+
   // 有未保存 README 修改时，先确认再执行后续动作
   const guardUnsaved = (proceed: () => void) => {
     if (readmeDirty) setGuard(() => proceed)
     else proceed()
   }
 
-  const addTag = async () => {
-    const t = tagInput.trim()
-    if (!t) return
-    await run(async () => {
-      await api.setProjectTags(project.id, [...new Set([...project.manual_tags, t])])
-      setTagInput('')
-      await onChanged()
-    })
-  }
-
-  const removeTag = async (t: string) => {
-    await run(async () => {
-      await api.setProjectTags(project.id, project.manual_tags.filter((x) => x !== t))
-      await onChanged()
+  const switchTab = (t: DetailTab) => {
+    if (t === tab) return
+    // 离开 README 才需要拦；在 README 里换到别的页签也一样拦。
+    // 确认放弃后把脏标记清零：README 组件卸载时不会再回调 onDirtyChange，
+    // 不清的话返回列表仍会被拦、页签栏还挂着「未保存」。
+    guardUnsaved(() => {
+      setReadmeDirty(false)
+      // 离开 README 后草稿任务作废：再回来时不该把用户的后续编辑顶掉
+      setReadmeDraft(undefined)
+      onTab(t)
     })
   }
 
@@ -102,207 +175,262 @@ export default function DetailView({
     }
   }
 
+  const tabItems = TABS.map((t) => ({
+    id: t.id,
+    label: t.label,
+    badge:
+      t.id === 'services' && runningServiceCount > 0
+        ? runningServiceCount
+        : t.id === 'source' && dirtyCount !== null && dirtyCount > 0
+          ? dirtyCount
+          : undefined,
+  }))
+
   return (
-    <div className="min-h-screen bg-surface-raised text-fg ">
-      <div className="mx-auto max-w-4xl px-6 py-6">
-        <button
-          type="button"
-          onClick={() => guardUnsaved(onBack)}
-          className="inline-flex items-center gap-1 rounded-lg border border-border px-3 py-1.5 text-sm"
-        >
-          <IconChevronLeft />
-          返回
-        </button>
-
-        {error && <ErrorBanner text={error} onClose={() => setError(null)} />}
-
-        <div className="mt-4 flex items-center gap-2">
-          <h1 className="text-xl font-bold">{project.name}</h1>
+    <div className="flex min-h-0 flex-1 flex-col">
+      <header className="flex h-[52px] shrink-0 items-center gap-2 border-b border-border px-2">
+        {/* 拖动区只挂在标题与空白上：按钮自身没有该属性，点击不会被当成拖窗口 */}
+        <div className="flex min-w-0 flex-1 items-center gap-2 pr-2">
+          <IconButton
+            label="返回列表"
+            onClick={() =>
+              guardUnsaved(() => {
+                setReadmeDirty(false)
+                setReadmeDraft(undefined)
+                onBack()
+              })
+            }
+          >
+            <IconChevronLeft size={15} />
+          </IconButton>
+          <h1 data-tauri-drag-region className="min-w-0 max-w-[40%] truncate text-[17px] font-semibold">
+            {project.name}
+          </h1>
           {project.missing && (
-            <span className="rounded border border-error/40 bg-error/10 px-1.5 py-0.5 text-xs text-error">
+            <span className="shrink-0 rounded border border-error/40 bg-error/10 px-1.5 py-0.5 text-[11px] text-error">
               路径丢失
             </span>
           )}
-        </div>
-        <div className="mt-1 break-all text-xs text-muted">{project.path}</div>
-        <div className="mt-1 text-xs text-muted">创建日期：{project.created_date ?? '未知'}</div>
-        {!project.missing && (
-          <div className="mt-1 text-xs text-muted">
-            大小：{size === undefined ? '计算中…' : size === null ? '—' : humanSize(size)}
-          </div>
-        )}
-
-        {project.missing ? (
-          <div className="mt-6 flex gap-2">
-            <button type="button" onClick={relink} className="rounded bg-primary px-3 py-1.5 text-sm text-primary-fg hover:brightness-95">
-              重新关联
-            </button>
+          {!project.missing && (
             <button
               type="button"
-              onClick={() => guardUnsaved(remove)}
-              className="rounded border border-border px-3 py-1.5 text-sm "
+              onClick={() => void run(() => api.openInFinder(project.id))}
+              title={`${project.path}（点击在 Finder 中显示）`}
+              className="min-w-0 max-w-[45%] truncate text-left font-mono text-[11px] text-muted hover:text-fg"
             >
-              移除
+              {project.path}
+            </button>
+          )}
+          <div data-tauri-drag-region className="h-full min-w-2 flex-1" />
+          <IconButton label="编辑 tag" className="h-6 w-6" onClick={() => onEditTags(project)}>
+            <IconPencil size={12} />
+          </IconButton>
+        </div>
+
+        <div className="flex shrink-0 items-center gap-0.5">
+          {project.missing ? (
+            <>
+              <Button size="sm" variant="primary" onClick={relink}>
+                重新关联
+              </Button>
+              <Button size="sm" variant="danger" onClick={() => setRemoveOpen(true)}>
+                移除
+              </Button>
+            </>
+          ) : (
+            <>
+              <IconButton label="在 Finder 中显示" onClick={() => void run(() => api.openInFinder(project.id))}>
+                <IconFolder size={14} />
+              </IconButton>
+              <IconButton label="在 iTerm 中打开" onClick={() => void run(() => api.openInIterm(project.id))}>
+                <IconTerminal size={14} />
+              </IconButton>
+              <IconButton label="在 VS Code 中打开" onClick={() => void run(() => api.openInVscode(project.id))}>
+                <IconCode size={14} />
+              </IconButton>
+              {project.github_url && (
+                <IconButton label="打开 GitHub 仓库" onClick={() => void run(() => api.openGithub(project.id))}>
+                  <IconGithub size={14} />
+                </IconButton>
+              )}
+              <Menu
+                align="end"
+                trigger={
+                  <IconButton label="更多操作">
+                    <IconMoreHorizontal size={14} />
+                  </IconButton>
+                }
+                items={[
+                  ...(project.has_git
+                    ? [
+                        { label: 'git status', onSelect: () => void showGit('status') },
+                        { label: 'git log', onSelect: () => void showGit('log') },
+                      ]
+                    : []),
+                  {
+                    label: '从管理器移除',
+                    danger: true,
+                    onSelect: () => guardUnsaved(() => setRemoveOpen(true)),
+                  },
+                ]}
+              />
+            </>
+          )}
+          <Button
+            size="sm"
+            variant={aiOpen ? 'primary' : 'outline'}
+            onClick={() => setAiOpen((v) => !v)}
+            aria-pressed={aiOpen}
+            title="AI 助手"
+            className="ml-1"
+          >
+            <IconSparkles size={13} />
+            AI 助手
+          </Button>
+        </div>
+      </header>
+
+      {/* 路径丢失时没有可读的内容：不显示页签，只留重新关联 / 移除 */}
+      {!project.missing && (
+        <div className="flex shrink-0 items-center gap-3 border-b border-border px-3">
+          <Tabs items={tabItems} value={tab} onChange={(id) => switchTab(id as DetailTab)} />
+          {readmeDirty && tab === 'readme' && (
+            <span className="ml-auto shrink-0 pr-1 text-[11px] text-warning">●未保存</span>
+          )}
+        </div>
+      )}
+
+      {error && (
+        <div className="mx-3 mt-2 flex items-start gap-2 rounded-[var(--radius-card)] border border-error/40 bg-error/10 px-3 py-2 text-[12px] text-error">
+          <span className="min-w-0 flex-1 break-words">{error}</span>
+          <button type="button" onClick={() => setError(null)} className="shrink-0 text-[11px] underline">
+            关闭
+          </button>
+        </div>
+      )}
+
+      {git && (
+        <div className="mx-3 mt-2 overflow-hidden rounded-[var(--radius-card)] border border-border">
+          <div className="flex items-center gap-3 border-b border-border bg-surface-raised px-3 py-1.5">
+            <span className="font-mono text-[11px] font-semibold">$ git {git.kind}</span>
+            {git.loading && <span className="text-[11px] text-muted">执行中…</span>}
+            <button
+              type="button"
+              onClick={() => setGit(null)}
+              className="ml-auto rounded border border-border px-2 py-0.5 text-[11px]"
+            >
+              关闭
             </button>
           </div>
-        ) : (
-          <>
-            <div className="mt-4">
-              <div className="text-sm font-semibold text-muted">tag</div>
-              <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                {project.manual_tags.map((t) => (
-                  <span
-                    key={t}
-                    className="inline-flex items-center gap-1 rounded-full border border-success/40 bg-success/10 px-2 py-0.5 text-xs text-fg"
-                  >
-                    {t}
-                    <button
-                      type="button"
-                      onClick={() => removeTag(t)}
-                      title="移除 tag"
-                      aria-label={`移除 tag ${t}`}
-                      className="opacity-60 transition-opacity hover:opacity-100"
-                    >
-                      <IconX size={12} />
-                    </button>
-                  </span>
-                ))}
-                {project.auto_tags
-                  .filter((t) => !project.manual_tags.includes(t))
-                  .map((t) => (
-                    <span
-                      key={t}
-                      className="rounded-full border border-dashed border-border px-2 py-0.5 text-xs text-muted"
-                      title="自动 tag（只读）"
-                    >
-                      {t}
-                    </span>
-                  ))}
-                <input
-                  value={tagInput}
-                  onChange={(e) => setTagInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') void addTag()
-                  }}
-                  placeholder="添加 tag…"
-                  className="w-32 rounded-full border border-border bg-surface px-2 py-0.5 text-xs focus:border-primary"
-                />
-                <button type="button" onClick={addTag} className="rounded-full border border-border px-2 py-0.5 text-xs ">
-                  添加
-                </button>
-              </div>
+          <pre className="max-h-[35vh] select-text overflow-auto whitespace-pre bg-surface-sunken p-3 font-mono text-[11px] leading-relaxed">
+            {git.loading ? '' : git.text}
+          </pre>
+        </div>
+      )}
+
+      <div className="flex min-h-0 flex-1">
+        <div className="min-w-0 flex-1 overflow-y-auto p-4">
+          {project.missing ? (
+            <div className="mt-8 rounded-[var(--radius-card)] border border-dashed border-border p-8 text-center text-[13px] text-muted">
+              项目路径已丢失：<span className="font-mono">{project.path}</span>
+              <br />
+              重新关联到新位置，或从管理器移除。
             </div>
-
-            <div className="mt-4 flex flex-wrap gap-2 text-xs">
-              <button type="button" onClick={() => run(() => api.openInFinder(project.id))} className="rounded border border-border px-2 py-1 ">
-                Finder
-              </button>
-              <button type="button" onClick={() => run(() => api.openInIterm(project.id))} className="rounded border border-border px-2 py-1 ">
-                iTerm
-              </button>
-              <button type="button" onClick={() => run(() => api.openInVscode(project.id))} className="rounded border border-border px-2 py-1 ">
-                VS Code
-              </button>
-              {project.github_url && (
-                <button type="button" onClick={() => run(() => api.openGithub(project.id))} className="rounded border border-border px-2 py-1 ">
-                  GitHub
-                </button>
-              )}
-              {project.has_git && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => void showGit('status')}
-                    className="rounded border border-border px-2 py-1 "
-                  >
-                    git status
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void showGit('log')}
-                    className="rounded border border-border px-2 py-1 "
-                  >
-                    git log
-                  </button>
-                </>
-              )}
-              <button
-                type="button"
-                onClick={() => guardUnsaved(() => setRemoveOpen(true))}
-                className="ml-auto rounded border border-error/50 px-2 py-1 text-error "
-              >
-                从管理器移除
-              </button>
-            </div>
-
-            {git && (
-              <div className="mt-4 overflow-hidden rounded-lg border border-border ">
-                <div className="flex items-center gap-3 border-b border-border bg-surface-raised px-3 py-2 ">
-                  <span className="font-mono text-xs font-semibold">$ git {git.kind}</span>
-                  {git.loading && <span className="text-xs text-muted">执行中…</span>}
-                  <button
-                    type="button"
-                    onClick={() => setGit(null)}
-                    className="ml-auto rounded border border-border px-2 py-0.5 text-xs "
-                  >
-                    关闭
-                  </button>
-                </div>
-                <pre className="max-h-[50vh] select-text overflow-auto whitespace-pre p-3 font-mono text-xs leading-relaxed">
-                  {git.loading ? '' : git.text}
-                </pre>
-              </div>
-            )}
-
+          ) : tab === 'overview' ? (
+            <Overview project={project} size={size} onChanged={onChanged} onAiTask={onAiTask} />
+          ) : tab === 'services' ? (
+            <ServiceSection
+              project={project}
+              onError={onError}
+              onAiDiagnose={(service) => onAiTask({ kind: 'diagnose', service })}
+            />
+          ) : tab === 'source' ? (
             <SourceSection project={project} />
-            <ServiceSection project={project} onError={onError} />
+          ) : (
+            <ReadmeSection
+              key={project.path}
+              projectId={project.id}
+              onDirtyChange={onDirtyChange}
+              onError={onError}
+              aiDraft={readmeDraft}
+              onAiDraftApplied={() => setReadmeDraft(undefined)}
+            />
+          )}
+        </div>
 
-            <ReadmeSection key={project.path} projectId={project.id} onDirtyChange={onDirtyChange} onError={onError} />
-          </>
-        )}
-
-        {removeOpen && (
-          <div className="fixed inset-0 z-30 flex items-center justify-center bg-scrim p-6">
-            <div className="w-full max-w-sm rounded-xl bg-surface p-5 ">
-              <h3 className="font-semibold">移除项目</h3>
-              <p className="mt-2 text-sm">从管理器移除「{project.name}」？只删记录，不动文件。</p>
-              <div className="mt-4 flex justify-end gap-2">
-                <button type="button" onClick={() => setRemoveOpen(false)} className="rounded-lg border border-border px-3 py-1.5 text-sm ">
-                  取消
-                </button>
-                <button type="button" onClick={remove} className="rounded-lg bg-error-solid px-3 py-1.5 text-sm text-on-solid hover:brightness-95">
-                  确认
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {guard && (
-          <div className="fixed inset-0 z-40 flex items-center justify-center bg-scrim p-6">
-            <div className="w-full max-w-sm rounded-xl bg-surface p-5 ">
-              <h3 className="font-semibold">放弃未保存的修改？</h3>
-              <p className="mt-2 text-sm">README 有未保存的修改，继续将丢失这些修改。</p>
-              <div className="mt-4 flex justify-end gap-2">
-                <button type="button" onClick={() => setGuard(null)} className="rounded-lg border border-border px-3 py-1.5 text-sm ">
-                  取消
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const p = guard
-                    setGuard(null)
-                    p()
-                  }}
-                  className="rounded-lg bg-error-solid px-3 py-1.5 text-sm text-on-solid hover:brightness-95"
-                >
-                  放弃修改
-                </button>
-              </div>
-            </div>
-          </div>
+        {aiOpen && !project.missing && (
+          <aside
+            className="flex w-[400px] shrink-0 flex-col overflow-hidden border-l border-border"
+            data-ai-panel-slot
+            aria-label="AI 助手"
+          >
+            <AiPanel
+              projectId={project.id}
+              projectName={project.name}
+              initialTask={pendingAi?.task}
+              taskNonce={pendingAi?.nonce}
+              onTaskConsumed={() => setPendingAi(null)}
+              onOpenSettings={onRouteSettings}
+              onOpenReadmeDraft={openReadmeDraft}
+              onClose={() => setAiOpen(false)}
+            />
+          </aside>
         )}
       </div>
+
+      {removeOpen && (
+        <div className="fixed inset-0 z-30 flex items-center justify-center bg-scrim p-6">
+          <div className="w-full max-w-sm rounded-xl bg-surface p-5">
+            <h3 className="font-semibold">移除项目</h3>
+            <p className="mt-2 text-sm">从管理器移除「{project.name}」？只删记录，不动文件。</p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setRemoveOpen(false)}
+                className="rounded-lg border border-border px-3 py-1.5 text-sm"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={remove}
+                className="rounded-lg bg-error-solid px-3 py-1.5 text-sm text-on-solid hover:brightness-95"
+              >
+                确认
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {guard && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-scrim p-6">
+          <div className="w-full max-w-sm rounded-xl bg-surface p-5">
+            <h3 className="font-semibold">放弃未保存的修改？</h3>
+            <p className="mt-2 text-sm">README 有未保存的修改，继续将丢失这些修改。</p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setGuard(null)}
+                className="rounded-lg border border-border px-3 py-1.5 text-sm"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const p = guard
+                  setGuard(null)
+                  p()
+                }}
+                className="rounded-lg bg-error-solid px-3 py-1.5 text-sm text-on-solid hover:brightness-95"
+              >
+                放弃修改
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

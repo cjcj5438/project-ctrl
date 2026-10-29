@@ -5,8 +5,15 @@
       {
         "label": "main",
         "title": "project-ctrl",
-        "width": 1200,
-        "height": 800
+        "width": 1360,
+        "height": 860,
+        "minWidth": 1280,
+        "minHeight": 760,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 18, "y": 22 },
+        "transparent": true,
+        "windowEffects": { "effects": ["sidebar"], "state": "followsWindowActiveState" }
       }
     ],
     "security": {
@@ -49,5 +56,5 @@
     }
   },
   "productName": "project-ctrl",
-  "version": "0.4.0"
+  "version": "0.5.0"
 }

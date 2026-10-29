@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   api,
   errorText,
@@ -14,6 +14,7 @@ import {
   type ServiceView,
 } from './api'
 import { Button } from './components'
+import { IconStethoscope } from './icons'
 import { applyBatch, applySnapshot, type LogCursor } from './logCursor'
 import { subscribe } from './util'
 const PHASE_LABEL: Record<Phase, string> = {
@@ -89,11 +90,12 @@ async function dockerSnapshot(
 export default function ServiceSection({
   project,
   onError,
+  onAiDiagnose,
 }: {
   project: ProjectInfo
   onError: (m: string | null) => void
+  onAiDiagnose?: (name: string) => void
 }) {
-  const [opened, setOpened] = useState(false)
   const [data, setData] = useState<ProjectServices | null>(null)
   const [statuses, setStatuses] = useState<Record<string, ServiceStatus>>({})
   const [busy, setBusy] = useState<string | null>(null)
@@ -144,17 +146,18 @@ export default function ServiceSection({
   }, [project.id])
 
   useEffect(() => {
-    if (opened) void load()
-  }, [opened, load])
+    void load()
+  }, [load])
 
-  // 只在展开时订阅，避免列表页常驻监听
-  useEffect(() => {
-    if (!opened) return
-    return subscribe<ServiceStatus>('svc:state', (e) => {
-      if (e.payload.project_id !== project.id) return
-      setStatuses((prev) => ({ ...prev, [e.payload.key]: e.payload }))
-    })
-  }, [opened, project.id])
+  // 服务页签挂载期间订阅；页签切走即退订，不留常驻监听
+  useEffect(
+    () =>
+      subscribe<ServiceStatus>('svc:state', (e) => {
+        if (e.payload.project_id !== project.id) return
+        setStatuses((prev) => ({ ...prev, [e.payload.key]: e.payload }))
+      }),
+    [project.id],
+  )
 
   const act = async (tag: string, fn: () => Promise<void>) => {
     setBusy(tag)
@@ -197,7 +200,7 @@ export default function ServiceSection({
   }).length
 
   const summary = !data
-    ? '展开查看'
+    ? '读取中…'
     : data.descriptor_error
       ? '描述文件有误'
       : services.length === 0
@@ -205,26 +208,21 @@ export default function ServiceSection({
         : `${services.length} 个服务${running > 0 ? ` · ${running} 个运行中` : ''}`
 
   return (
-    <details
-      className="mt-4 rounded-lg border border-border "
-      onToggle={(e) => {
-        if (e.currentTarget.open) setOpened(true)
-      }}
-    >
-      <summary className="cursor-pointer px-3 py-2 text-sm font-semibold">
-        服务
+    <section aria-label="服务">
+      <div className="flex items-center gap-2 pb-2">
+        <h2 className="text-[13px] font-semibold">服务</h2>
         {services.length > 0 && (
           <span
-            className={`ml-2 inline-block h-2 w-2 rounded-full align-middle ${
+            className={`inline-block h-2 w-2 rounded-full ${
               running > 0 ? DOT.Running : DOT.Stopped
             }`}
             aria-hidden
           />
         )}
-        <span className="ml-1 font-normal text-muted">{summary}</span>
-      </summary>
+        <span className="text-[12px] text-muted">{summary}</span>
+      </div>
 
-      <div className="border-t border-border p-3 ">
+      <div>
         {data?.descriptor_error && (
           <div className="mb-3 rounded border border-error/50 bg-error/10 px-2 py-1.5 text-xs text-error ">
             <div className="font-semibold">.project-ctrl.json 无法解析，服务不可用</div>
@@ -250,6 +248,7 @@ export default function ServiceSection({
               setStatuses((prev) => ({ ...prev, [statusKey(project.id, v.spec.name)]: st }))
             }
             act={act}
+            onAiDiagnose={onAiDiagnose}
           />
         ))}
 
@@ -258,7 +257,6 @@ export default function ServiceSection({
             project={project}
             detected={data.detected}
             onDone={() => void load()}
-            onError={onError}
             busy={busy}
             act={act}
           />
@@ -356,7 +354,7 @@ export default function ServiceSection({
           />
         )}
       </div>
-    </details>
+    </section>
   )
 }
 
@@ -371,6 +369,7 @@ function ServiceCard({
   onRefresh,
   onStatus,
   act,
+  onAiDiagnose,
 }: {
   project: ProjectInfo
   view: ServiceView
@@ -382,6 +381,7 @@ function ServiceCard({
   onRefresh: () => Promise<void>
   onStatus: (st: ServiceStatus) => void
   act: (tag: string, fn: () => Promise<void>) => Promise<void>
+  onAiDiagnose?: (name: string) => void
 }) {
   const spec = view.spec
   const name = spec.name
@@ -706,10 +706,21 @@ function ServiceCard({
                 </Button>
               </>
             )}
+            {(status?.phase === 'Crashed' || status?.phase === 'Failed') && onAiDiagnose && (
+              <Button
+                size="sm"
+                onClick={() => onAiDiagnose(name)}
+                title={`让 AI 诊断 ${name} 的失败原因`}
+                className="ml-auto"
+              >
+                <IconStethoscope size={12} />
+                AI 诊断
+              </Button>
+            )}
             <button
               type="button"
               onClick={onEdit}
-              className="ml-auto rounded border border-border px-2 py-0.5 "
+              className={`${status?.phase === 'Crashed' || status?.phase === 'Failed' ? '' : 'ml-auto'} rounded border border-border px-2 py-0.5 `}
             >
               编辑
             </button>
@@ -782,7 +793,7 @@ function ServiceCard({
             )}
             <pre
               ref={logRef}
-              className="max-h-[40vh] select-text overflow-auto whitespace-pre-wrap p-2 font-mono text-[11px] leading-relaxed"
+              className="max-h-[40vh] select-text overflow-auto whitespace-pre-wrap bg-surface-sunken p-2 font-mono text-[11px] leading-relaxed"
             >
               {lines.length === 0 && !logErr ? '（暂无输出）' : lines.join('\n')}
             </pre>
@@ -878,14 +889,12 @@ function DetectPanel({
   project,
   detected,
   onDone,
-  onError,
   busy,
   act,
 }: {
   project: ProjectInfo
   detected: DetectResult
   onDone: () => void
-  onError: (m: string | null) => void
   busy: string | null
   act: (tag: string, fn: () => Promise<void>) => Promise<void>
 }) {
@@ -937,7 +946,7 @@ function DetectPanel({
           <div className="text-[11px] font-semibold text-muted">package.json 脚本</div>
           {detected.start_candidates.map((c) => (
             <div key={c.join(' ')} className="flex items-center gap-2">
-              <code className="rounded bg-surface-raised px-1.5 py-0.5 font-mono text-[11px] ">
+              <code className="rounded bg-surface-sunken px-1.5 py-0.5 font-mono text-[11px] ">
                 {c.join(' ')}
               </code>
               <button
@@ -958,7 +967,7 @@ function DetectPanel({
           <div className="text-[11px] font-semibold text-muted">docker compose</div>
           {compose.map((s) => (
             <div key={s.file} className="flex flex-wrap items-center gap-2">
-              <code className="rounded bg-surface-raised px-1.5 py-0.5 font-mono text-[11px] ">
+              <code className="rounded bg-surface-sunken px-1.5 py-0.5 font-mono text-[11px] ">
                 {s.file}
               </code>
               <span className="text-[11px] text-muted">{s.services.join(', ')}</span>

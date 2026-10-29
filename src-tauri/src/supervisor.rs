@@ -881,8 +881,13 @@ impl Supervisor {
                 }
             }
         }
-        // #4：clear 后置——kill 流程结束后再删凭据，避免“进程没死、凭据已删”的假停。
-        crate::localstate::clear_adopt(key);
+        // 与退出路径 adoptable_should_clear 同语义：只有确认组已死才清凭据。
+        // KILL 失败（EPERM/僵死）时保留凭据，下次启动 reclaim 补杀，不留无凭据孤儿。
+        if Self::group_alive(pgid) {
+            eprintln!("supervisor: {key} 的进程组在 KILL 后仍存活，保留凭据待下次回收");
+        } else {
+            crate::localstate::clear_adopt(key);
+        }
         self.status_of(key)
     }
 

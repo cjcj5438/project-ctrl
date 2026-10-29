@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 原子写：tmp + fsync + rename（#16），新建文件 0600（#26）。
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+///
+/// AI 设置/会话的落盘也复用这里（同样是 0600 + tmp+rename），避免多一份实现。
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{e}"))?;
     }

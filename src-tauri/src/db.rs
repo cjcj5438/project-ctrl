@@ -19,7 +19,8 @@ pub fn data_dir() -> PathBuf {
 }
 
 /// 有序迁移列表。索引 i 表示「升到版本 i+1」。
-const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[migrate_to_v1, migrate_to_v2];
+const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] =
+    &[migrate_to_v1, migrate_to_v2, migrate_to_v3];
 
 /// 打开（必要时迁移）数据库。
 pub fn open_db() -> rusqlite::Result<Connection> {
@@ -127,6 +128,16 @@ fn migrate_to_v2(conn: &Connection) -> rusqlite::Result<()> {
     create_services_quarantine(conn)
 }
 
+/// v3：AI 项目画像列（`summary` / `stack` / `profiled_at`）。
+/// 只 ALTER 加列，绝不删数据；老行天然得到 `stack='[]'`、`summary=NULL`。
+fn migrate_to_v3(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE projects ADD COLUMN summary TEXT;
+         ALTER TABLE projects ADD COLUMN stack TEXT NOT NULL DEFAULT '[]';
+         ALTER TABLE projects ADD COLUMN profiled_at INTEGER;",
+    )
+}
+
 fn create_services_quarantine(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS services_quarantine (
@@ -217,12 +228,39 @@ pub fn project_path(conn: &Connection, id: i64) -> rusqlite::Result<Option<Strin
 pub struct ProjectRow {
     pub id: i64,
     pub path: String,
+    /// AI 生成的项目一句话描述（v3 起为 NULL）。
+    pub summary: Option<String>,
+    /// AI 识别的技术栈（库内是 JSON 文本，读出即解析）。
+    pub stack: Vec<String>,
 }
 
 pub fn all_projects(conn: &Connection) -> rusqlite::Result<Vec<ProjectRow>> {
-    let mut st = conn.prepare("SELECT id, path FROM projects ORDER BY id ASC")?;
-    let rows = st.query_map([], |r| Ok(ProjectRow { id: r.get(0)?, path: r.get(1)? }))?;
+    let mut st = conn.prepare("SELECT id, path, summary, stack FROM projects ORDER BY id ASC")?;
+    let rows = st.query_map([], |r| {
+        let stack_json: String = r.get(3)?;
+        // 解析失败按空处理：画像只是辅助信息，不该让整个项目列表打不开。
+        let stack = serde_json::from_str(&stack_json).unwrap_or_else(|e| {
+            eprintln!("projects.stack 解析失败，已按空处理：{e}");
+            vec![]
+        });
+        Ok(ProjectRow { id: r.get(0)?, path: r.get(1)?, summary: r.get(2)?, stack })
+    })?;
     rows.collect()
+}
+
+/// 写入 AI 项目画像（`summary` / `stack` / `profiled_at`）。空描述就存 NULL。
+pub fn set_project_profile(
+    conn: &Connection,
+    id: i64,
+    summary: Option<&str>,
+    stack: &[String],
+) -> rusqlite::Result<()> {
+    let stack_json = serde_json::to_string(stack).unwrap_or_else(|_| "[]".into());
+    conn.execute(
+        "UPDATE projects SET summary = ?1, stack = ?2, profiled_at = ?3 WHERE id = ?4",
+        params![summary, stack_json, now_secs(), id],
+    )?;
+    Ok(())
 }
 
 pub fn remove_project(conn: &Connection, id: i64) -> rusqlite::Result<()> {
@@ -350,6 +388,25 @@ pub fn delete_service(conn: &Connection, project_id: i64, name: &str) -> rusqlit
         params![project_id, name],
     )?;
     Ok(())
+}
+
+/// 整体替换项目的服务集合（AI 提议采用时用）。
+///
+/// 用事务包住「全删 + 逐条插入」：AI 提议是整组生效的，中途失败不能让用户看到
+/// 半套（删了旧的、新的只写进一半）这种中间态。
+// 目前只有测试调用；AI 提议落库那一步接上来之后再删掉这个 allow。
+#[allow(dead_code)]
+pub fn replace_services(
+    conn: &Connection,
+    project_id: i64,
+    items: &[(ServiceSpec, Derived)],
+) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM services WHERE project_id = ?1", params![project_id])?;
+    for (spec, derived) in items {
+        insert_service(&tx, project_id, spec, derived)?;
+    }
+    tx.commit()
 }
 
 /// 项目下所有服务的名字（用于重名检查与 depends_on 校验）。
@@ -585,6 +642,64 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='services_quarantine'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn v3_adds_profile_columns_without_touching_existing_rows() {
+        // 造一个「v2 时代」的库：v1 基线 + 一条项目行，再让迁移补 v3 列。
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, added_at INTEGER NOT NULL);
+             CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+             CREATE TABLE project_tags (project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE, PRIMARY KEY (project_id, tag_id));
+             INSERT INTO projects (id, path, added_at) VALUES (3, '/x/old', 11);",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+
+        let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(v, 3);
+        // 老行没被删，且新列取默认值
+        let rows = all_projects(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/x/old");
+        assert!(rows[0].stack.is_empty(), "老行的 stack 应为空数组");
+        assert_eq!(rows[0].summary, None);
+        let profiled: Option<i64> =
+            conn.query_row("SELECT profiled_at FROM projects WHERE id = 3", [], |r| r.get(0)).unwrap();
+        assert_eq!(profiled, None, "未画像的项目 profiled_at 为 NULL");
+    }
+
+    #[test]
+    fn profile_roundtrip_and_replace_services_replaces_set() {
+        let conn = mem();
+        let p = add_project(&conn, "/x/a").unwrap();
+
+        // summary + stack 往返
+        set_project_profile(&conn, p, Some("一个示例项目"), &["Rust".into(), "Tauri".into()]).unwrap();
+        let row = all_projects(&conn).unwrap().pop().unwrap();
+        assert_eq!(row.summary.as_deref(), Some("一个示例项目"));
+        assert_eq!(row.stack, vec!["Rust".to_string(), "Tauri".to_string()]);
+        let profiled_at: Option<i64> =
+            conn.query_row("SELECT profiled_at FROM projects WHERE id = ?1", params![p], |r| r.get(0))
+                .unwrap();
+        assert!(profiled_at.unwrap_or(0) > 0, "profiled_at 应被写入");
+
+        // 空描述存 NULL
+        set_project_profile(&conn, p, None, &[]).unwrap();
+        let row = all_projects(&conn).unwrap().pop().unwrap();
+        assert_eq!(row.summary, None);
+        assert!(row.stack.is_empty());
+
+        // replace_services 是整体替换，不是追加
+        insert_service(&conn, p, &spec("api"), &Derived::manual()).unwrap();
+        insert_service(&conn, p, &spec("worker"), &Derived::manual()).unwrap();
+        assert_eq!(service_names(&conn, p).unwrap(), vec!["api", "worker"]);
+        replace_services(&conn, p, &[(spec("solo"), Derived::manual())]).unwrap();
+        let rows = services_of(&conn, p).unwrap();
+        assert_eq!(rows.len(), 1, "旧集合必须被整体替换");
+        assert_eq!(ServiceSpec::from_json(&rows[0].config).unwrap().name, "solo");
     }
 }
 

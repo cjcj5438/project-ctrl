@@ -23,6 +23,10 @@ pub struct ProjectInfo {
     auto_tags: Vec<String>,
     github_url: Option<String>,
     has_git: bool,
+    /// AI 生成的项目描述；没跑过画像时为 None。
+    summary: Option<String>,
+    /// AI 识别的技术栈；没跑过画像时为空。
+    stack: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -94,6 +98,8 @@ pub fn list_projects() -> Result<Vec<ProjectInfo>, String> {
             has_git,
             id: r.id,
             path: r.path,
+            summary: r.summary,
+            stack: r.stack,
         });
     }
     // 默认创建时间倒序（缺失/未知沉底），同值按名称
@@ -166,6 +172,41 @@ pub fn set_project_tags(id: i64, tags: Vec<String>) -> Result<(), String> {
     db::set_project_tags(&conn, id, &tags).map_err(|e| e.to_string())
 }
 
+/// 保存 AI 项目画像（描述 + 技术栈）。空描述存 NULL，标签去空去重。
+#[tauri::command]
+pub fn set_project_profile(
+    id: i64,
+    summary: Option<String>,
+    stack: Vec<String>,
+) -> Result<(), String> {
+    existing_project_path(id)?;
+    let summary = summary.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    if let Some(s) = summary.as_deref() {
+        if s.chars().count() > 120 {
+            return Err("描述不能超过 120 字".to_string());
+        }
+    }
+    let mut trimmed: Vec<String> = Vec::with_capacity(stack.len());
+    for item in stack {
+        let x = item.trim();
+        if x.is_empty() {
+            continue;
+        }
+        if x.chars().count() > 32 {
+            return Err(format!("技术栈条目过长：{x}"));
+        }
+        // 去重但保留首次出现的顺序
+        if !trimmed.iter().any(|t| t == x) {
+            trimmed.push(x.to_string());
+        }
+    }
+    if trimmed.len() > 12 {
+        return Err("技术栈最多 12 项".to_string());
+    }
+    let conn = db::open_db().map_err(|e| e.to_string())?;
+    db::set_project_profile(&conn, id, summary.as_deref(), &trimmed).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn rename_tag(old_name: String, new_name: String) -> Result<(), String> {
     let new_name = new_name.trim().to_string();
@@ -191,10 +232,19 @@ pub fn relink_project(id: i64, new_path: String) -> Result<(), String> {
     db::update_project_path(&conn, id, &new_path).map_err(|e| e.to_string())
 }
 
+/// 删除项目并关掉它的 AI 会话（前端只传 `id`，`app` 由 Tauri 注入）。
 #[tauri::command]
-pub fn remove_project(id: i64) -> Result<(), String> {
+pub fn remove_project<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    id: i64,
+) -> Result<(), String> {
     let conn = db::open_db().map_err(|e| e.to_string())?;
-    db::remove_project(&conn, id).map_err(|e| e.to_string())
+    db::remove_project(&conn, id).map_err(|e| e.to_string())?;
+    // 会话收尾失败不该让删除失败：库里已经没有这个项目了。
+    if let Some(ai) = tauri::Manager::try_state::<crate::ai_session::AiManager>(&app) {
+        let _ = ai.close_project(id);
+    }
+    Ok(())
 }
 
 /// 按 id 从库里取项目路径（命令不接受前端传入的路径，杜绝任意路径）。
@@ -207,7 +257,7 @@ fn project_path(id: i64) -> Result<PathBuf, String> {
 }
 
 /// 取项目路径并要求目录存在（供所有新增的写/执行类命令使用）。
-fn existing_project_path(id: i64) -> Result<PathBuf, String> {
+pub(crate) fn existing_project_path(id: i64) -> Result<PathBuf, String> {
     let base = project_path(id)?;
     if !base.is_dir() {
         return Err("项目路径不存在".to_string());
@@ -243,6 +293,36 @@ pub fn open_in_finder(id: i64) -> Result<(), String> {
 pub fn open_in_vscode(id: i64) -> Result<(), String> {
     let path = project_path(id)?;
     run_command("open", &["-a", "Visual Studio Code", &path.to_string_lossy()])
+}
+
+/// 在 VS Code 中打开项目内的某个文件（可选定位到行）。
+///
+/// 只打开编辑器 URL，不读不写任何文件内容。
+#[tauri::command]
+pub fn open_in_vscode_at(id: i64, rel_path: String, line: Option<u32>) -> Result<(), String> {
+    let base = existing_project_path(id)?;
+    // 复用 #18 的终检：绝对路径 / `..` / 符号链接穿越一律拒绝。
+    let abs = crate::services::resolve_within(&base, &rel_path)?;
+    let mut url = format!("vscode://file{}", encode_path_for_url(&abs.to_string_lossy()));
+    if let Some(line) = line {
+        url.push_str(&format!(":{line}"));
+    }
+    run_command("open", &[&url])
+}
+
+/// 路径段 percent-encode：只保留 URL 路径里安全的 ASCII，其余按 UTF-8 字节写成 `%XX`（大写）。
+/// 中文路径不编码的话 `open` 会拿到一个不存在的路径。
+fn encode_path_for_url(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for b in path.as_bytes() {
+        let c = *b as char;
+        if c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '~' | '-') {
+            out.push(c);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 #[tauri::command]
@@ -415,7 +495,7 @@ fn view_of(sup: &supervisor::Supervisor, r: &Resolved) -> ServiceView {
     }
 }
 
-fn resolve_all_or_err(id: i64) -> Result<(PathBuf, Vec<Resolved>, localstate::Overrides), String> {
+pub(crate) fn resolve_all_or_err(id: i64) -> Result<(PathBuf, Vec<Resolved>, localstate::Overrides), String> {
     let base = existing_project_path(id)?;
     let conn = db::open_db().map_err(|e| e.to_string())?;
     let (items, overrides) = plan::resolve_all(&conn, id, &base)?;
@@ -501,7 +581,7 @@ pub fn service_preflight(id: i64, name: String, step: Option<String>) -> Result<
     Ok(preflight_problems(r, &argv))
 }
 
-fn preflight_problems(r: &Resolved, argv: &[String]) -> Vec<String> {
+pub(crate) fn preflight_problems(r: &Resolved, argv: &[String]) -> Vec<String> {
     let path = crate::execenv::path_for(r.derived.node_pin.as_deref());
     let mut out = Vec::new();
     if let Some(program) = argv.first() {
@@ -533,6 +613,15 @@ pub fn service_start<R: tauri::Runtime>(
     id: i64,
     name: String,
 ) -> Result<ServiceStatus, String> {
+    start_service(&app, id, &name)
+}
+
+/// `service_start` 的实现体：AI 提议的「启动验证」也复用它。
+pub(crate) fn start_service<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    id: i64,
+    name: &str,
+) -> Result<ServiceStatus, String> {
     let (base, items, _) = resolve_all_or_err(id)?;
     let target = items
         .iter()
@@ -543,8 +632,8 @@ pub fn service_start<R: tauri::Runtime>(
     // 依赖先按拓扑顺序启动（已在运行的跳过）。只验 target 闭包：无关服务的
     // 环/错指不影响本次启动（#24，见 plan::dependency_chain）。
     let chain: Vec<Resolved> =
-        plan::dependency_chain(&items, &name)?.into_iter().cloned().collect();
-    let sup = supervisor::state(&app);
+        plan::dependency_chain(&items, name)?.into_iter().cloned().collect();
+    let sup = supervisor::state(app);
     let project_path = base.to_string_lossy().into_owned();
     // #21：收全部活跃 port（与 run_adhoc 一致），不只收同项目。
     let mut taken: HashSet<u16> = sup.statuses().into_iter().filter_map(|s| s.port).collect();
@@ -553,10 +642,10 @@ pub fn service_start<R: tauri::Runtime>(
         if sup.is_active(&dep.key()) {
             continue;
         }
-        start_one(&app, &sup, &project_path, dep, &mut taken, true)?;
+        start_one(app, &sup, &project_path, dep, &mut taken, true)?;
     }
 
-    start_one(&app, &sup, &project_path, &target, &mut taken, false)
+    start_one(app, &sup, &project_path, &target, &mut taken, false)
 }
 
 fn start_one<R: tauri::Runtime>(
@@ -717,8 +806,17 @@ fn start_docker<R: tauri::Runtime>(
 
 #[tauri::command]
 pub fn service_stop<R: tauri::Runtime>(app: tauri::AppHandle<R>, id: i64, name: String) -> Result<(), String> {
-    let key = supervisor::key_of(id, &name);
-    supervisor::state(&app).stop(&key);
+    stop_service(&app, id, &name)
+}
+
+/// `service_stop` 的实现体。
+pub(crate) fn stop_service<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    id: i64,
+    name: &str,
+) -> Result<(), String> {
+    let key = supervisor::key_of(id, name);
+    supervisor::state(app).stop(&key);
     localstate::clear_adopt(&key);
     supervisor::Ctx::<R>::new(app.clone()).emit_state(&key);
     Ok(())
@@ -743,18 +841,28 @@ pub fn service_step<R: tauri::Runtime>(
     name: String,
     step: String,
 ) -> Result<(), String> {
+    run_step(&app, id, &name, &step)
+}
+
+/// `service_step` 的实现体。
+pub(crate) fn run_step<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    id: i64,
+    name: &str,
+    step: &str,
+) -> Result<(), String> {
     let (_, items, _) = resolve_all_or_err(id)?;
     let r = items
         .iter()
         .find(|i| i.spec.name == name)
         .ok_or_else(|| format!("该项目没有名为 {name} 的服务"))?;
-    let spec = r.spec.step(&step).ok_or_else(|| format!("{name} 没有名为 {step} 的步骤"))?;
+    let spec = r.spec.step(step).ok_or_else(|| format!("{name} 没有名为 {step} 的步骤"))?;
     let timeout_s = spec.timeout_s;
     let spawn = plan::build_step_plan(r, spec)?;
     if let Some(first) = preflight_problems(r, &spawn.argv).into_iter().next() {
         return Err(first);
     }
-    let sup = supervisor::state(&app);
+    let sup = supervisor::state(app);
     let key = r.key();
     if sup.is_active(&key) {
         return Err(format!("{name} 已有运行中的进程"));

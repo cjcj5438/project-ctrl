@@ -10,6 +10,10 @@ export interface ProjectInfo {
   auto_tags: string[]
   github_url: string | null
   has_git: boolean
+  /** AI 生成的项目描述；没跑过画像时为 null。 */
+  summary: string | null
+  /** AI 识别的技术栈；没跑过画像时为空数组。 */
+  stack: string[]
 }
 
 export interface ScanCandidate {
@@ -229,6 +233,222 @@ export interface LogSnapshot {
   lines: string[]
 }
 
+/* ------------------------------------------------------------------------- *
+ * AI（与 src-tauri/src/ai_*.rs 的 serde 形状逐字对齐）
+ * ------------------------------------------------------------------------- */
+
+/** 模型引用：provider 与 id 一起才唯一。 */
+export interface ModelRef {
+  provider: string
+  id: string
+}
+
+/** `~/.project-ctrl/ai/settings.json` 的整份内容。 */
+export interface AiSettings {
+  pi_path: string | null
+  main_model: ModelRef | null
+  main_thinking: string
+  light_model: ModelRef | null
+  light_thinking: string
+}
+
+/** `ai_models` 的一项。 */
+export interface AiModel {
+  provider: string
+  id: string
+  name: string
+  reasoning: boolean
+  context_window: number
+}
+
+/** `ai_status`：pi 没装/版本过低都走 `problem`，命令本身永不报错。 */
+export interface AiEnv {
+  pi_path: string | null
+  pi_version: string | null
+  /** `resolve_pi` 的原始错误文本（直接展示）。 */
+  problem: string | null
+  settings: AiSettings
+  live_processes: number
+}
+
+/** 会话视图（`state ∈ idle|starting|busy|recovering|sleeping|failed`）。 */
+export interface AiSessionView {
+  session_id: string
+  project_id: number
+  project_name: string
+  state: string
+  task: string | null
+  /** 展示用 `provider/id`。 */
+  model: string | null
+  awaiting_user: boolean
+  last_active: number
+}
+
+/** 条目正文：`type` 是 serde 的 tag。 */
+export type AiItemBody =
+  | { type: 'user'; text: string; task: string | null }
+  | { type: 'assistant'; text: string; thinking: string; streaming: boolean }
+  /** `status ∈ running|ok|error|blocked`。 */
+  | { type: 'tool'; name: string; summary: string; status: string; detail: string }
+  | { type: 'card'; card: AiCard }
+  /** `level ∈ info|warn|error`。 */
+  | { type: 'notice'; level: string; text: string; retry: boolean }
+
+/** 一条对话条目；`rev` 单调递增，前端按它去重/补缝。 */
+export interface AiItem {
+  id: string
+  rev: number
+  body: AiItemBody
+}
+
+/** `ai:items` 事件载荷。 */
+export interface ItemsPayload {
+  session_id: string
+  project_id: number
+  from_rev: number
+  to_rev: number
+  items: AiItem[]
+}
+
+/** `ai_open` / `ai_snapshot`：视图 + 当前最大 rev + 全量条目。 */
+export interface AiSnapshot {
+  session: AiSessionView
+  rev: number
+  items: AiItem[]
+}
+
+/** 完整任务：`kind` 是 serde 的 tag。 */
+export type AiTask =
+  | { kind: 'configure' }
+  | { kind: 'diagnose'; service: string }
+  | { kind: 'health' }
+  | { kind: 'profile' }
+  | { kind: 'readme' }
+
+/** 卡片动作：`action` 是 serde 的 tag。 */
+export type AiCardAction =
+  | { action: 'approve'; run_steps: boolean }
+  | { action: 'reject'; feedback: string | null }
+  | { action: 'undo' }
+  | { action: 'stop_services' }
+  | { action: 'adopt_last' }
+  | { action: 'apply_fix'; run_steps: boolean }
+  | { action: 'reverify' }
+  | { action: 'continue_diagnose' }
+  | { action: 'adopt_profile'; summary: boolean; stack: boolean; tags: string[] }
+  | { action: 'dismiss' }
+  | { action: 'allow' }
+  | { action: 'deny' }
+
+/** 校验循环里单个服务的检查结果。 */
+export interface AiServiceCheck {
+  name: string
+  ok: boolean
+  phase: string
+  port: number | null
+  message: string
+}
+
+/** 诊断证据。 */
+export interface AiEvidence {
+  file: string | null
+  line: number | null
+  excerpt: string
+}
+
+/** 体检条目（`severity ∈ error|warn|info`）。 */
+export interface AiHealthItem {
+  severity: string
+  title: string
+  detail: string
+  command: string | null
+}
+
+/**
+ * 七种卡片：`kind` 是 serde 的 tag。
+ *
+ * 状态取值各自独立：proposal 的 `state` 是 `pending|auto|approved|rejected|expired`，
+ * verify 的是 `running|passed|failed|rolled_back|undone|aborted`，
+ * diagnosis 的是 `open|passed|failed`，profile/readme/service_control 的见后端。
+ */
+export type AiCard =
+  | {
+      kind: 'proposal'
+      id: string
+      attempt: number
+      /** `db` | `descriptor`。 */
+      layer: string
+      before: string
+      after: string
+      env_keys: string[]
+      run_steps_default: boolean
+      notes: string
+      state: string
+    }
+  | {
+      kind: 'verify'
+      id: string
+      attempt: number
+      state: string
+      services: AiServiceCheck[]
+      can_undo: boolean
+      can_adopt_last: boolean
+    }
+  | {
+      kind: 'diagnosis'
+      id: string
+      service: string
+      summary: string
+      cause: string
+      /** `config|code|env|external|unknown`。 */
+      category: string
+      evidence: AiEvidence[]
+      suggestion: string
+      /** 有修复方案时后端会给完整集合（前端只判断存在性）。 */
+      config_fix: ServiceSpec[] | null
+      rounds: number
+      state: string
+    }
+  | { kind: 'health'; id: string; summary: string; items: AiHealthItem[] }
+  | {
+      kind: 'profile'
+      id: string
+      summary: string
+      stack: string[]
+      tags: string[]
+      state: string
+    }
+  | { kind: 'readme'; id: string; content: string; state: string }
+  | {
+      kind: 'service_control'
+      id: string
+      service: string
+      /** `start|stop|restart`。 */
+      action: string
+      reason: string
+      state: string
+      result: string | null
+    }
+  /** 会话侧补的 onboarding 卡（不是 `Card` 枚举成员，形状见 ai_session.rs）。 */
+  | { kind: 'onboarding'; id: string; problem: string }
+
+/** `ai:batch` 载荷的一项（`ai:batch` 是**完整**数组）。 */
+export interface BatchItem {
+  project_id: number
+  name: string
+  /** `queued|running|done|failed|adopted|dismissed`。 */
+  state: string
+  profile: AiBatchProfile | null
+  error: string | null
+}
+
+/** 批量画像结果：后端归一后严格是这三个字段。 */
+export interface AiBatchProfile {
+  summary: string
+  stack: string[]
+  tags: string[]
+}
+
 export function errorText(e: unknown): string {
   if (typeof e === 'string') return e
   if (typeof e === 'object' && e !== null && 'message' in e) return String(e.message)
@@ -243,6 +463,10 @@ export const api = {
   scanDirectory: (root: string) => invoke<ScanCandidate[]>('scan_directory', { root }),
   addProjects: (paths: string[], tags: string[]) => invoke<number[]>('add_projects', { paths, tags }),
   setProjectTags: (id: number, tags: string[]) => invoke<void>('set_project_tags', { id, tags }),
+  setProjectProfile: (id: number, summary: string | null, stack: string[]) =>
+    invoke<void>('set_project_profile', { id, summary, stack }),
+  openInVscodeAt: (id: number, relPath: string, line: number | null) =>
+    invoke<void>('open_in_vscode_at', { id, relPath, line }),
   renameTag: (oldName: string, newName: string) => invoke<void>('rename_tag', { oldName, newName }),
   deleteTag: (name: string) => invoke<void>('delete_tag', { name }),
   relinkProject: (id: number, newPath: string) => invoke<void>('relink_project', { id, newPath }),
@@ -300,4 +524,27 @@ export const api = {
   sourcePull: (id: number) => invoke<GitResult>('source_pull', { id }),
   cloneRepo: (url: string, parentDir: string) => invoke<number>('clone_repo', { url, parentDir }),
   importPm2: () => invoke<ImportReport>('import_pm2'),
+
+  // AI：设置 / 模型 / 会话 / 任务 / 批量画像
+  aiStatus: () => invoke<AiEnv>('ai_status'),
+  aiModels: (refresh: boolean) => invoke<AiModel[]>('ai_models', { refresh }),
+  aiSaveSettings: (settings: AiSettings) => invoke<void>('ai_save_settings', { settings }),
+  aiOpen: (id: number) => invoke<AiSnapshot>('ai_open', { id }),
+  aiSnapshot: (sessionId: string) => invoke<AiSnapshot>('ai_snapshot', { sessionId }),
+  aiSessions: () => invoke<AiSessionView[]>('ai_sessions'),
+  aiSend: (sessionId: string, text: string) => invoke<void>('ai_send', { sessionId, text }),
+  aiRetry: (sessionId: string) => invoke<void>('ai_retry', { sessionId }),
+  aiAbort: (sessionId: string) => invoke<void>('ai_abort', { sessionId }),
+  aiClose: (sessionId: string) => invoke<void>('ai_close', { sessionId }),
+  aiSetModel: (sessionId: string, model: ModelRef | null, thinking: string | null) =>
+    invoke<void>('ai_set_model', { sessionId, model, thinking }),
+  aiRunTask: (sessionId: string, task: AiTask) => invoke<void>('ai_run_task', { sessionId, task }),
+  aiCardAction: (sessionId: string, cardId: string, action: AiCardAction) =>
+    invoke<void>('ai_card_action', { sessionId, cardId, action }),
+  aiBatchProfile: (ids: number[]) => invoke<void>('ai_batch_profile', { ids }),
+  aiBatchStatus: () => invoke<BatchItem[]>('ai_batch_status'),
+  aiBatchAdopt: (projectId: number, summary: boolean, stack: boolean, tags: string[]) =>
+    invoke<void>('ai_batch_adopt', { projectId, summary, stack, tags }),
+  aiBatchDismiss: (projectId: number) => invoke<void>('ai_batch_dismiss', { projectId }),
+  aiBatchCancel: () => invoke<void>('ai_batch_cancel'),
 }

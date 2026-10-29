@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, errorText, type GitResult, type ProjectInfo, type SourceInfo } from './api'
 
-/** 源码更新面板：分支 / 落后 / 改动 + fetch / pull。折叠时只显示一行摘要。 */
+/** 源码页签：分支 / 落后 / 改动 + fetch / pull。 */
 export default function SourceSection({ project }: { project: ProjectInfo }) {
-  const [opened, setOpened] = useState(false)
   const [info, setInfo] = useState<SourceInfo | null>(null)
   const [out, setOut] = useState<{ title: string; result: GitResult } | null>(null)
   const [busy, setBusy] = useState(false)
@@ -29,9 +28,8 @@ export default function SourceSection({ project }: { project: ProjectInfo }) {
   }, [project.id])
 
   useEffect(() => {
-    if (!opened) return
     void reload()
-  }, [opened, reload])
+  }, [reload])
 
   const act = async (kind: 'fetch' | 'pull') => {
     setBusy(true)
@@ -49,7 +47,7 @@ export default function SourceSection({ project }: { project: ProjectInfo }) {
 
   const summary = !info
     ? project.has_git
-      ? '展开查看'
+      ? '读取中…'
       : '不是 git 仓库'
     : !info.is_repo
       ? '不是 git 仓库'
@@ -58,16 +56,12 @@ export default function SourceSection({ project }: { project: ProjectInfo }) {
           .join(' · ')
 
   return (
-    <details
-      className="mt-4 rounded-lg border border-border "
-      onToggle={(e) => {
-        if (e.currentTarget.open) setOpened(true)
-      }}
-    >
-      <summary className="cursor-pointer px-3 py-2 text-sm font-semibold">
-        源码 <span className="ml-1 font-normal text-muted">{summary}</span>
-      </summary>
-      <div className="border-t border-border p-3 ">
+    <section aria-label="源码">
+      <div className="flex items-center gap-2 pb-2">
+        <h2 className="text-[13px] font-semibold">源码</h2>
+        <span className="text-[12px] text-muted">{summary}</span>
+      </div>
+      <div>
         {error && <div className="mb-2 text-xs text-error ">{error}</div>}
         {!project.has_git ? (
           <div className="text-sm text-muted">不是 git 仓库。</div>
@@ -118,7 +112,7 @@ export default function SourceSection({ project }: { project: ProjectInfo }) {
                     关闭
                   </button>
                 </div>
-                <pre className="max-h-[30vh] select-text overflow-auto whitespace-pre p-2 font-mono text-[11px] leading-relaxed">
+                <pre className="max-h-[30vh] select-text overflow-auto whitespace-pre bg-surface-sunken p-2 font-mono text-[11px] leading-relaxed">
                   {out.result.text}
                 </pre>
               </div>
@@ -126,6 +120,6 @@ export default function SourceSection({ project }: { project: ProjectInfo }) {
           </>
         )}
       </div>
-    </details>
+    </section>
   )
 }

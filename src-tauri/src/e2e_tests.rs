@@ -744,3 +744,805 @@ fn real_compose_logs_stream_into_shared_sink() {
         .output();
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/* ========================================================================= *
+ * AI 服务配置校验循环：真 node 服务 / 真端口 / 真宿主分发入口
+ *
+ * 全部用例都从 `ai_tasks::dispatch` 进来——那是 pi 的 `pc-host` 通道打到的那同一个
+ * 入口，所以「先停旧 → 写层 → 跑步骤 → 启动 → 等就绪 → 失败回灌 → 自动应用下一轮
+ * → 次数用尽回滚 → 采纳/撤销」这条主路径的排序与加锁被真实覆盖。
+ * ========================================================================= */
+mod verify_loop_e2e {
+    use super::{http_get, scratch, wait_until};
+    use crate::ai_session::{AiManager, AiSnapshot, ItemBody, SessionHandle};
+    use crate::ai_tasks::CardAction;
+    use crate::services::{Derived, Descriptor, ServiceSpec};
+    use crate::supervisor::{key_of, Phase};
+    use serde_json::{json, Value};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::MutexGuard;
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+    use tauri::Manager;
+
+    type MockApp = tauri::App<tauri::test::MockRuntime>;
+    type MockHandle = tauri::AppHandle<tauri::test::MockRuntime>;
+
+    /// 每个用例都会写的真服务：`/ok` 200，其余 404。端口由 plan 注入的 `PORT` 决定。
+    const SERVER_MJS: &str = r#"// 最小 HTTP 服务：/ok 返回 200，其余 404。端口由 plan 注入的 PORT 或 --port 决定。
+import { createServer } from 'node:http';
+const i = process.argv.indexOf('--port');
+const port = Number(i > 0 ? process.argv[i + 1] : process.env.PORT ?? 0);
+createServer((req, res) => {
+  if (req.url === '/ok') { res.writeHead(200); res.end('ok'); }
+  else { res.writeHead(404); res.end('nope'); }
+}).listen(port, '127.0.0.1');
+"#;
+
+    /// 每个用例：独占端口锁 + 独立数据目录 + 临时项目目录 + mock app。
+    ///
+    /// 字段声明顺序即 drop 顺序，所以 `_ports` 放最后：它要等 app/进程/数据目录都收完
+    /// 才让出端口锁，否则下一个用例会在旧进程还没死透时抢到端口。
+    struct LoopEnv {
+        app: MockApp,
+        mgr: AiManager,
+        pid: i64,
+        dir: PathBuf,
+        /// 本环境独占的 scratch 根（`home`/`data`/`proj`/`fakepi` 都在它下面）。
+        /// Drop 时整棵删掉，避免 `$TMPDIR` 里越积越多。
+        root: PathBuf,
+        sid: String,
+        _data: crate::test_support::ScopedDataDir,
+        _home: Option<crate::test_support::ScopedHome>,
+        _ports: MutexGuard<'static, ()>,
+    }
+
+    impl LoopEnv {
+        fn new(tag: &str) -> Self {
+            Self::build(tag, false)
+        }
+
+        /// 需要 `ScopedHome` 的用例（会走到 `spawn_inner` → `install_assets`）用这个：
+        /// 资源与 `~/.project-ctrl` 必须落在临时 HOME 里，绝不碰真机。
+        fn new_with_home(tag: &str) -> Self {
+            Self::build(tag, true)
+        }
+
+        fn build(tag: &str, with_home: bool) -> Self {
+            // 锁顺序跟 ipc Harness 一致：HOME → 端口 → 数据目录。
+            // 反过来说，先拿端口锁再等 HOME 锁会和 `ipc_external_scan_*`
+            // （先 ScopedHome 再 Harness 里的端口锁）构成 ABBA 死锁。
+            let root = scratch(tag);
+            let home_guard = if with_home {
+                let h = root.join("home");
+                std::fs::create_dir_all(&h).expect("建临时 HOME");
+                // HOME 是进程级环境变量：换掉它会让同时跑的 docker 用例找不到
+                // Docker Desktop 的 compose 插件（在 `~/.docker/cli-plugins` 下），
+                // `docker compose` 直接变成「unknown command」。把真 HOME 里只读的
+                // 相关路径链进来，隔离 pi 资源的同时不误伤并发用例。
+                if let Some(real) = std::env::var_os("HOME").map(PathBuf::from) {
+                    for dot in [".docker", ".gitconfig"] {
+                        let src = real.join(dot);
+                        let dst = h.join(dot);
+                        if src.exists() && !dst.exists() {
+                            let _ = std::os::unix::fs::symlink(&src, &dst);
+                        }
+                    }
+                }
+                Some(crate::test_support::ScopedHome::new(&h))
+            } else {
+                None
+            };
+            let ports = crate::test_support::exclusive_ports();
+            let data = root.join("data");
+            std::fs::create_dir_all(&data).expect("建临时数据目录");
+            let data_guard = crate::test_support::ScopedDataDir::new(&data);
+
+            let dir = root.join("proj");
+            std::fs::create_dir_all(&dir).expect("建项目目录");
+            std::fs::write(dir.join("package.json"), "{\"name\":\"x\"}\n").expect("写 package.json");
+            std::fs::write(dir.join("server.mjs"), SERVER_MJS).expect("写 server.mjs");
+
+            let app = crate::test_app();
+            let mgr = app
+                .try_state::<AiManager>()
+                .expect("AiManager 应已装配")
+                .inner()
+                .clone();
+            let path = dir.to_string_lossy().into_owned();
+            let conn = crate::db::open_db().expect("库应能打开");
+            let pid = crate::db::add_project(&conn, &path).expect("项目应能入库");
+            drop(conn);
+            let snap = mgr.open(pid, &path, "e2e").expect("会话应能打开");
+            let sid = snap.session.session_id.clone();
+            Self {
+                app,
+                mgr,
+                pid,
+                dir,
+                root,
+                sid,
+                _data: data_guard,
+                _home: home_guard,
+                _ports: ports,
+            }
+        }
+
+        fn app_handle(&self) -> MockHandle {
+            self.app.handle().clone()
+        }
+
+        fn sup(&self) -> tauri::State<'_, crate::supervisor::Supervisor> {
+            crate::supervisor::state(self.app.handle())
+        }
+
+        /// 往 DB 层种一条旧配方（用例的「第一个提案之前的真相」）。
+        fn seed(&self, spec: &ServiceSpec) {
+            let conn = crate::db::open_db().expect("库应能打开");
+            crate::db::insert_service(&conn, self.pid, spec, &Derived::manual())
+                .expect("种子服务应能入库");
+        }
+
+        fn store_specs(&self) -> Vec<ServiceSpec> {
+            let conn = crate::db::open_db().expect("库应能打开");
+            crate::db::services_of(&conn, self.pid)
+                .expect("读服务表")
+                .iter()
+                .map(|r| ServiceSpec::from_json(&r.config).expect("库里配方应可解析"))
+                .collect()
+        }
+
+        fn db_names(&self) -> Vec<String> {
+            self.store_specs().iter().map(|s| s.name.clone()).collect()
+        }
+
+        /// 在独立线程里走宿主分发入口（`pc-host` 调的就是它），不阻塞驱动线程。
+        fn call(&self, method: &'static str, params: Value) -> JoinHandle<Result<Value, String>> {
+            let handle = self.mgr.handle(&self.sid).expect("会话句柄");
+            host_call(self.app_handle(), handle, method, params)
+        }
+
+        fn approve(&self, run_steps: bool) -> JoinHandle<Result<String, String>> {
+            approve_when_ready(self.app_handle(), self.sid.clone(), run_steps)
+        }
+
+        fn reject(&self, kind: &'static str) -> JoinHandle<Result<String, String>> {
+            reject_when_ready(self.app_handle(), self.sid.clone(), kind)
+        }
+
+        fn cards(&self, kind: &str) -> Vec<Value> {
+            let snap = self.mgr.snapshot(&self.sid).expect("会话快照");
+            cards_of(&snap, kind)
+        }
+
+        fn last_card(&self, kind: &str) -> Option<Value> {
+            self.cards(kind).pop()
+        }
+
+        /// 按 `attempt` 找提案/验证卡（这两类卡才有该字段）。
+        fn card(&self, kind: &str, attempt: u32) -> Option<Value> {
+            self.cards(kind)
+                .into_iter()
+                .find(|c| c["attempt"].as_u64() == Some(u64::from(attempt)))
+        }
+
+        /// 把 pi 指到一个必然失败的桩：`apply_fix` 成功后会 `send_prompt`，那里会
+        /// `install_assets()` + `resolve_pi()`；不指桩就会起真 pi 进程（真机装了 pi）。
+        fn install_pi_stub(&self) {
+            let stub = self.dir.parent().expect("项目目录应有父目录").join("fakepi");
+            std::fs::write(&stub, "#!/bin/sh\nexit 1\n").expect("写桩");
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod 桩");
+            let settings = crate::ai_settings::settings_path();
+            std::fs::create_dir_all(settings.parent().expect("设置目录")).expect("建设置目录");
+            std::fs::write(&settings, format!("{{\"pi_path\":\"{}\"}}\n", stub.display()))
+                .expect("写 AI 设置");
+            crate::ai_settings::clear_cache();
+        }
+    }
+
+    impl Drop for LoopEnv {
+        fn drop(&mut self) {
+            // 先收真进程，再让宿主钩子回滚在飞的循环，最后清进程级全局登记。
+            crate::supervisor::state(self.app.handle()).shutdown_all(&HashSet::new());
+            self.mgr.shutdown_all();
+            crate::ai_tasks::forget_loop_for_test(&self.sid);
+            crate::ai_settings::clear_cache();
+
+            // 最后删 scratch 根目录。
+            // Drop 体在执行时所有字段都还活着（真正析构在体结束之后），所以体内删目录
+            // 是安全的；`_ports` 最后声明 → 最后释放，端口锁会在删目录之后才让出，
+            // 下一个用例不会在旧目录还没删干净时就抢到端口。
+            // 失败时保留现场，方便排查。
+            if std::thread::panicking() {
+                // 保留现场，方便排查
+            } else {
+                // 只删本 harness 自己建的目录，别误伤别处。
+                let ours = self
+                    .root
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.starts_with("pc-e2e-"));
+                if ours {
+                    let _ = std::fs::remove_dir_all(&self.root);
+                }
+            }
+        }
+    }
+
+    fn cards_of(snap: &AiSnapshot, kind: &str) -> Vec<Value> {
+        snap.items
+            .iter()
+            .filter_map(|it| match &it.body {
+                ItemBody::Card { card } => Some(card.clone()),
+                _ => None,
+            })
+            .filter(|c| c["kind"] == kind)
+            .collect()
+    }
+
+    fn host_call(
+        app: MockHandle,
+        handle: SessionHandle,
+        method: &'static str,
+        params: Value,
+    ) -> JoinHandle<Result<Value, String>> {
+        std::thread::spawn(move || crate::ai_tasks::dispatch(&app, &handle, method, &params))
+    }
+
+    /// 等线程收工（超时即失败），再取它的返回值；线程 panic 原样上抛。
+    fn join_within<T>(h: JoinHandle<Result<T, String>>, secs: u64, what: &str) -> Result<T, String> {
+        assert!(
+            wait_until(Duration::from_secs(secs), || h.is_finished()),
+            "{what} 未在 {secs}s 内结束（校验循环可能卡住）"
+        );
+        h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))
+    }
+
+    /// 轮询快照，找到 `kind` 的 pending 卡片就投递决定；返回卡片 id。
+    fn decide_when_pending(
+        app: MockHandle,
+        sid: String,
+        kind: &'static str,
+        decision: Value,
+    ) -> JoinHandle<Result<String, String>> {
+        std::thread::spawn(move || {
+            let mgr = app
+                .try_state::<AiManager>()
+                .ok_or_else(|| "AiManager 未装配".to_string())?
+                .inner()
+                .clone();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let snap = mgr.snapshot(&sid)?;
+                if let Some(card) = cards_of(&snap, kind)
+                    .into_iter()
+                    .find(|c| c["state"] == "pending")
+                {
+                    let id = card["id"]
+                        .as_str()
+                        .ok_or_else(|| format!("{kind} 卡片缺 id：{card}"))?
+                        .to_string();
+                    if kind == "proposal" {
+                        // 前端直接渲染 before/after 的 JSON 文本：必须是非空且可解析的 JSON。
+                        for key in ["before", "after"] {
+                            let text = card[key]
+                                .as_str()
+                                .ok_or_else(|| format!("提案卡缺 {key}：{card}"))?;
+                            assert!(!text.trim().is_empty(), "提案卡 {key} 不能为空");
+                            serde_json::from_str::<Value>(text)
+                                .map_err(|e| format!("提案卡 {key} 不是合法 JSON：{e}"))?;
+                        }
+                    }
+                    match mgr.decide(&sid, &id, decision.clone()) {
+                        Ok(()) => return Ok(id),
+                        // 卡片已推送、`await_decision` 还没登记等待者：同一张卡重试即可。
+                        Err(e) if e.contains("已失效") && Instant::now() < deadline => {}
+                        Err(e) => return Err(format!("投递决定失败：{e}")),
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!("20s 内没有出现待确认的 {kind} 卡片"));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+    }
+
+    fn approve_when_ready(
+        app: MockHandle,
+        sid: String,
+        run_steps: bool,
+    ) -> JoinHandle<Result<String, String>> {
+        decide_when_pending(
+            app,
+            sid,
+            "proposal",
+            json!({"action": "allow", "run_steps": run_steps}),
+        )
+    }
+
+    fn reject_when_ready(
+        app: MockHandle,
+        sid: String,
+        kind: &'static str,
+    ) -> JoinHandle<Result<String, String>> {
+        decide_when_pending(
+            app,
+            sid,
+            kind,
+            json!({"action": "deny", "feedback": "换一个"}),
+        )
+    }
+
+    /// 独占端口锁下挑一个真正空闲的固定端口。
+    fn free_port() -> u16 {
+        (41_000..42_000)
+            .find(|p| crate::ports::is_free(*p))
+            .expect("41000–42000 内应能找到空闲端口")
+    }
+
+    /// 带路径的 GET（`http_get` 固定打 `/`，要从 `/ok` 取真实响应体）。
+    fn http_get_path(port: u16, path: &str) -> Option<String> {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        write!(s, "GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n").ok()?;
+        let mut buf = String::new();
+        s.read_to_string(&mut buf).ok()?;
+        if buf.is_empty() {
+            None
+        } else {
+            Some(buf)
+        }
+    }
+
+    /// 校验循环用的服务规格：真 node 服务 + 固定端口 + 指定健康检查路径。
+    fn svc(name: &str, listen: u16, health_path: &str, timeout_ms: u64) -> ServiceSpec {
+        ServiceSpec::from_json(&format!(
+            r#"{{"name":"{name}","run":["node","server.mjs"],"ports":{{"listen":{listen}}},"health":{{"type":"http","path":"{health_path}","timeout_ms":{timeout_ms}}},"restart":"never"}}"#
+        ))
+        .unwrap_or_else(|e| panic!("规格应合法：{e}"))
+    }
+
+    fn spec_json(spec: &ServiceSpec) -> Value {
+        serde_json::to_value(spec).expect("规格应可序列化")
+    }
+
+    fn ok_body(port: u16) -> bool {
+        http_get_path(port, "/ok").is_some_and(|b| b.contains("ok"))
+    }
+
+    /* --------------------------- T1：三次失败 → 回滚 → 采纳 --------------------------- */
+
+    #[test]
+    fn verify_loop_fails_three_times_then_rolls_back_to_old_recipe() {
+        let env = LoopEnv::new("vloop-rollback");
+        env.seed(&svc("legacy", free_port(), "/ok", 1500));
+        let api_port = free_port();
+        let params = json!({
+            "services": [spec_json(&svc("api", api_port, "/nope", 1500))],
+            "notes": "先试 api",
+        });
+
+        // ① 第 1 次：人工批准。
+        let t1 = Instant::now();
+        let call = env.call("propose_services", params.clone());
+        let approver = env.approve(false);
+        let card_id = join_within(approver, 20, "第 1 次批准").expect("应能找到并批准提案卡");
+        assert!(card_id.starts_with("prop-"), "提案卡 id 应带 prop- 前缀：{card_id}");
+        let first = join_within(call, 30, "第 1 次校验").expect("第 1 次提交应返回 Ok（失败不是错误）");
+        let d1 = t1.elapsed();
+        assert!(d1 < Duration::from_secs(30), "单次尝试必须 < 30s，实际 {d1:?}");
+
+        assert_eq!(first["verified"], json!(false), "健康检查写 /nope 必须判失败：{first}");
+        assert_eq!(first["attempt"], json!(1), "第 1 次应是 attempt=1：{first}");
+        assert_eq!(first["remaining"], json!(2), "第 1 次后应剩 2 次：{first}");
+        let fails = first["failures"].as_array().expect("failures 必须是数组");
+        assert!(!fails.is_empty(), "失败必须带至少一条 failures：{first}");
+        assert_eq!(fails[0]["name"], json!("api"), "失败项应是 api：{}", fails[0]);
+        for key in ["phase", "note", "preflight", "exit_code"] {
+            assert!(fails[0].get(key).is_some(), "失败项必须带 {key}：{}", fails[0]);
+        }
+        assert!(fails[0]["logs"].is_array(), "失败项 logs 必须是数组：{}", fails[0]);
+        assert_eq!(
+            env.card("verify", 1).expect("第 1 次应有验证卡")["state"],
+            json!("failed"),
+            "第 1 次失败后验证卡必须是 failed"
+        );
+
+        // ② 第 2 次：失败后自动应用——没有批准线程，也必须在 30s 内自己返回。
+        let t2 = Instant::now();
+        let second = join_within(env.call("propose_services", params.clone()), 30, "第 2 次校验")
+            .expect("第 2 次应自动应用并返回");
+        let d2 = t2.elapsed();
+        assert!(d2 < Duration::from_secs(30), "第 2 次必须 < 30s（不该等用户确认），实际 {d2:?}");
+        assert_eq!(second["verified"], json!(false), "第 2 次仍应失败：{second}");
+        assert_eq!(second["attempt"], json!(2));
+        assert_eq!(second["remaining"], json!(1));
+        assert_eq!(
+            env.card("proposal", 2).expect("第 2 次应有提案卡")["state"],
+            json!("auto"),
+            "第 2 次的提案卡必须是 auto（无需用户确认）"
+        );
+
+        // ③ 第 3 次：次数用尽 → 回滚。
+        let t3 = Instant::now();
+        let third = join_within(env.call("propose_services", params.clone()), 30, "第 3 次校验")
+            .expect("第 3 次应自动应用并返回");
+        let d3 = t3.elapsed();
+        assert!(d3 < Duration::from_secs(30), "第 3 次必须 < 30s，实际 {d3:?}");
+        assert_eq!(third["verified"], json!(false));
+        assert_eq!(third["exhausted"], json!(true), "第 3 次必须报次数用尽：{third}");
+        assert_eq!(
+            env.card("proposal", 3).expect("第 3 次应有提案卡")["state"],
+            json!("auto")
+        );
+
+        assert_eq!(env.db_names(), vec!["legacy".to_string()], "次数用尽必须把旧配方整体还原");
+        let key = key_of(env.pid, "api");
+        for st in env.sup().statuses() {
+            assert!(
+                !(st.key == key && matches!(st.phase, Phase::Running | Phase::Crashed)),
+                "回滚后 api 不能还在运行/崩溃态：{:?}",
+                st.phase
+            );
+        }
+        let rolled = env.card("verify", 3).expect("第 3 次应有验证卡");
+        assert_eq!(rolled["state"], json!("rolled_back"), "次数用尽后验证卡必须是 rolled_back");
+        assert_eq!(rolled["can_adopt_last"], json!(true), "回滚后必须允许采纳最后一次配方");
+        let vid = rolled["id"].as_str().expect("验证卡应有 id").to_string();
+
+        // ④ 采纳最后一次：把失败配方写回生效层（不再启动）。
+        crate::ai_tasks::ai_card_action(env.app_handle(), env.sid.clone(), vid, CardAction::AdoptLast)
+            .expect("采纳最后一次应成功");
+        assert_eq!(env.db_names(), vec!["api".to_string()], "采纳后库里应只剩 api");
+        assert_eq!(
+            env.card("verify", 3).expect("第 3 次应有验证卡")["state"],
+            json!("passed"),
+            "采纳后验证卡应转 passed"
+        );
+        eprintln!("[T1] 三次尝试耗时：{d1:?} / {d2:?} / {d3:?}");
+    }
+
+    /* --------------------------- T2：通过 → 撤销 --------------------------- */
+
+    #[test]
+    fn verify_loop_pass_writes_db_then_undo_restores() {
+        let env = LoopEnv::new("vloop-pass");
+        env.seed(&svc("legacy", free_port(), "/ok", 1500));
+        let api_port = free_port();
+        let call = env.call(
+            "propose_services",
+            json!({"services": [spec_json(&svc("api", api_port, "/ok", 2000))]}),
+        );
+        let approver = env.approve(false);
+        let prop_id = join_within(approver, 20, "批准").expect("应能批准提案卡");
+        assert!(prop_id.starts_with("prop-"));
+        let ok = join_within(call, 40, "通过校验").expect("提交应成功");
+
+        assert_eq!(ok["verified"], json!(true), "健康检查 /ok 应通过：{ok}");
+        assert_eq!(ok["services"][0]["ok"], json!(true), "services[0] 必须 ok：{ok}");
+        let port = ok["services"][0]["port"]
+            .as_u64()
+            .expect("就绪服务必须带端口") as u16;
+        // 真进程真端口：这是「REAL server 真的起来了」的证据。
+        assert!(
+            wait_until(Duration::from_secs(5), || ok_body(port)),
+            "真实服务应在 {port} 上接受连接并回 ok"
+        );
+
+        assert_eq!(env.db_names(), vec!["api".to_string()], "通过后库里只剩 api（整组覆盖语义）");
+        let v = env.card("verify", 1).expect("应有验证卡");
+        assert_eq!(v["state"], json!("passed"));
+        assert_eq!(v["can_undo"], json!(true), "通过后必须允许撤销");
+        let vid = v["id"].as_str().expect("验证卡 id").to_string();
+
+        crate::ai_tasks::ai_card_action(env.app_handle(), env.sid.clone(), vid, CardAction::Undo)
+            .expect("撤销应成功");
+        assert_eq!(env.db_names(), vec!["legacy".to_string()], "撤销必须还原旧配方");
+        assert!(
+            wait_until(Duration::from_secs(5), || http_get(port).is_none()),
+            "撤销后 {port} 不应再接受连接"
+        );
+        assert_eq!(
+            env.card("verify", 1).expect("应有验证卡")["state"],
+            json!("undone"),
+            "撤销后验证卡应是 undone"
+        );
+    }
+
+    /* --------------------------- T3：描述文件层 --------------------------- */
+
+    #[test]
+    fn verify_loop_descriptor_layer_writes_file_not_db() {
+        let env = LoopEnv::new("vloop-descriptor");
+        let old = svc("oldfile", free_port(), "/ok", 1500);
+        crate::descriptor::write(&env.dir, &Descriptor::new(vec![old]), false)
+            .expect("应能写描述文件");
+        let file = crate::descriptor::path_of(&env.dir);
+        let original = std::fs::read(&file).expect("读原始描述文件");
+        // 库里放一条完全不同的种子：用来证明描述文件层绝不写库。
+        env.seed(&svc("dbseed", free_port(), "/ok", 1500));
+
+        let api_port = free_port();
+        let call = env.call(
+            "propose_services",
+            json!({"services": [spec_json(&svc("api", api_port, "/ok", 2000))]}),
+        );
+        let approver = env.approve(false);
+        join_within(approver, 20, "批准").expect("应能批准提案卡");
+        let ok = join_within(call, 40, "通过校验").expect("提交应成功");
+        assert_eq!(ok["verified"], json!(true), "描述文件层也应真起服务并通过：{ok}");
+
+        let d = crate::descriptor::read(&env.dir)
+            .expect("读描述文件")
+            .expect("描述文件应存在");
+        assert_eq!(
+            d.services.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+            vec!["api".to_string()],
+            "描述文件必须被整份覆盖成 api"
+        );
+        assert_eq!(env.db_names(), vec!["dbseed".to_string()], "描述文件层绝不能写数据库");
+        assert_eq!(
+            env.card("proposal", 1).expect("应有提案卡")["layer"],
+            json!("descriptor"),
+            "提案卡必须标出 descriptor 层"
+        );
+
+        let vid = env.card("verify", 1).expect("应有验证卡")["id"]
+            .as_str()
+            .expect("验证卡 id")
+            .to_string();
+        crate::ai_tasks::ai_card_action(env.app_handle(), env.sid.clone(), vid, CardAction::Undo)
+            .expect("撤销应成功");
+        assert_eq!(
+            std::fs::read(&file).expect("读回描述文件"),
+            original,
+            "撤销必须逐字节还原描述文件"
+        );
+    }
+
+    /* --------------------------- T4：中止 --------------------------- */
+
+    #[test]
+    fn verify_loop_abort_rolls_back_and_stops() {
+        let env = LoopEnv::new("vloop-abort");
+        env.seed(&svc("legacy", free_port(), "/ok", 1500));
+        let api_port = free_port();
+        let call = env.call(
+            "propose_services",
+            json!({"services": [spec_json(&svc("api", api_port, "/nope", 2000))]}),
+        );
+        let approver = env.approve(false);
+        join_within(approver, 20, "批准").expect("应能批准提案卡");
+
+        // 等 api 真的起来（此刻 proposer 正在 wait_ready 里转），再走 shutdown——
+        // `AiManager::shutdown_all` 就是用这个方法给在飞的循环封顶的。
+        let key = key_of(env.pid, "api");
+        assert!(
+            wait_until(Duration::from_secs(20), || env
+                .sup()
+                .status_of(&key)
+                .is_some_and(|s| s.phase == Phase::Running)),
+            "api 应已启动（说明 proposer 已进入健康检查阶段）"
+        );
+        let handle = env.mgr.handle(&env.sid).expect("会话句柄");
+        crate::ai_tasks::dispatch(env.app.handle(), &handle, "shutdown", &Value::Null)
+            .expect("shutdown 应返回 ok");
+
+        let err = join_within(call, 30, "中止后的提交").expect_err("中止必须让提案返回错误");
+        // ai_tasks.rs:59 `const ABORTED: &str = "用户已停止"`，abort_loop 原样返回它。
+        assert!(err.contains("用户已停止"), "中止的错误必须是 ABORTED：{err}");
+        assert_eq!(env.db_names(), vec!["legacy".to_string()], "中止必须按快照回滚到旧配方");
+        for st in env.sup().statuses() {
+            assert!(
+                !(st.key == key && matches!(st.phase, Phase::Running | Phase::Crashed)),
+                "中止后 api 不应还在运行/崩溃态：{:?}",
+                st.phase
+            );
+        }
+        // abort_loop 把 verify 卡打成 aborted（proposal 卡停在 approved）。
+        assert_eq!(
+            env.card("verify", 1).expect("应有验证卡")["state"],
+            json!("aborted"),
+            "中止后验证卡必须是 aborted"
+        );
+    }
+
+    /* ------------------- T5：诊断 → 应用修复 → 重新验证 ------------------- */
+
+    #[test]
+    fn diagnosis_apply_fix_runs_verify_loop_and_reverify_restarts() {
+        let env = LoopEnv::new_with_home("vloop-diagnosis");
+        env.install_pi_stub();
+        let legacy_port = free_port();
+        let api_port = free_port();
+        env.seed(&svc("legacy", legacy_port, "/ok", 1500));
+        env.seed(&svc("api", api_port, "/nope", 1500));
+        // 现场：api 真起着但健康检查一直不就绪（进程在跑、就绪超时）。
+        crate::commands::start_service(env.app.handle(), env.pid, "api")
+            .expect("api 应能启动（health 稍后失败）");
+        let key = key_of(env.pid, "api");
+        assert!(
+            wait_until(Duration::from_secs(10), || env.sup().status_of(&key).is_some()),
+            "api 应出现在运行表里"
+        );
+
+        let diag = env.call(
+            "diagnosis",
+            json!({
+                "service": "api",
+                "summary": "健康检查路径写错",
+                "cause": "server.mjs 只对 /ok 回 200，配方里写的是 /nope",
+                "category": "config",
+                "evidence": [{"file": "server.mjs", "line": 1, "excerpt": "if (req.url === '/ok')"}],
+                "suggestion": "把 health.path 改成 /ok",
+                "config_fix": [spec_json(&svc("api", api_port, "/ok", 2000))],
+            }),
+        );
+        join_within(diag, 20, "诊断上报").expect("诊断应成功");
+        let card = env.last_card("diagnosis").expect("应有诊断卡");
+        assert_eq!(card["state"], json!("open"), "新诊断卡必须是 open：{card}");
+        assert!(card["config_fix"].is_array(), "config_fix 必须带上：{card}");
+        let cid = card["id"].as_str().expect("诊断卡 id").to_string();
+
+        // ApplyFix 在 worker 线程（`ai-apply-{sid}`）里跑完整校验循环。
+        crate::ai_tasks::ai_card_action(
+            env.app_handle(),
+            env.sid.clone(),
+            cid.clone(),
+            CardAction::ApplyFix { run_steps: false },
+        )
+        .expect("ApplyFix 应受理");
+        assert!(
+            wait_until(Duration::from_secs(40), || env
+                .last_card("verify")
+                .is_some_and(|c| c["state"] == json!("passed"))),
+            "ApplyFix 应在 40s 内把 verify 卡推到 passed"
+        );
+        let specs = env.store_specs();
+        let api = specs.iter().find(|s| s.name == "api").expect("库里应有 api");
+        assert_eq!(
+            api.health.as_ref().and_then(|h| h.path.clone()).as_deref(),
+            Some("/ok"),
+            "ApplyFix 必须把 /ok 写进库：{specs:?}"
+        );
+        let port = env.last_card("verify").expect("验证卡")["services"][0]["port"]
+            .as_u64()
+            .expect("通过的服务应带端口") as u16;
+        assert!(wait_until(Duration::from_secs(5), || ok_body(port)), "修复后真实服务应在 {port} 回 ok");
+        assert_eq!(
+            env.last_card("diagnosis").expect("诊断卡")["state"],
+            json!("passed"),
+            "成功的修复要把诊断卡标 passed"
+        );
+
+        // `apply_fix` 成功时把该诊断记录从 DIAGNOSES 里删掉（ai_tasks.rs:1706），
+        // 所以同一张卡再点「重新验证」必然失效——先把真实行为钉住。
+        let stale = crate::ai_tasks::ai_card_action(
+            env.app_handle(),
+            env.sid.clone(),
+            cid,
+            CardAction::Reverify,
+        );
+        assert_eq!(
+            stale.err().as_deref(),
+            Some("这条诊断已失效"),
+            "apply_fix 已消费掉这条诊断记录"
+        );
+
+        // 让它再次不就绪，并重新诊断（Reverify 需要一条仍然存活的诊断记录）。
+        env.seed(&svc("api", api_port, "/nope", 1500));
+        crate::commands::stop_service(env.app.handle(), env.pid, "api").expect("停 api");
+        let again = env.call(
+            "diagnosis",
+            json!({
+                "service": "api",
+                "summary": "仍未就绪",
+                "cause": "路径又被改回 /nope",
+                "category": "config",
+                "evidence": [],
+                "suggestion": "改回 /ok",
+            }),
+        );
+        join_within(again, 20, "第二次诊断").expect("第二次诊断应成功");
+        let cid2 = env.last_card("diagnosis").expect("第二张诊断卡")["id"]
+            .as_str()
+            .expect("诊断卡 id")
+            .to_string();
+
+        crate::ai_tasks::ai_card_action(
+            env.app_handle(),
+            env.sid.clone(),
+            cid2.clone(),
+            CardAction::Reverify,
+        )
+        .expect("Reverify 应受理");
+        assert!(
+            wait_until(Duration::from_secs(30), || env
+                .last_card("diagnosis")
+                .is_some_and(|c| c["state"] == json!("failed"))),
+            "重新验证失败后诊断卡必须转 failed"
+        );
+        // 卡片上的 `rounds` 恒为 0：`reverify` 只把内部 `DiagnosisRec.rounds` 加一
+        // （ai_tasks.rs:1822 `rec.rounds += 1`），从不 patch 卡片字段。所以「rounds==1」
+        // 在卡片上不可观察，这里断言真实值，并用公共入口证明计数确实涨了。
+        assert_eq!(
+            env.last_card("diagnosis").expect("诊断卡")["rounds"],
+            json!(0),
+            "卡片 rounds 不会随 reverify 变化（计数只存在 DiagnosisRec 里）"
+        );
+        for _ in 0..2 {
+            crate::ai_tasks::ai_card_action(
+                env.app_handle(),
+                env.sid.clone(),
+                cid2.clone(),
+                CardAction::Reverify,
+            )
+            .expect("Reverify 应受理");
+            assert_eq!(
+                env.last_card("diagnosis").expect("诊断卡")["state"],
+                json!("failed")
+            );
+        }
+        let err = crate::ai_tasks::ai_card_action(
+            env.app_handle(),
+            env.sid.clone(),
+            cid2,
+            CardAction::ContinueDiagnose,
+        )
+        .expect_err("轮次用尽后必须拒绝继续诊断");
+        // ai_tasks.rs:1839 `if rounds >= 3 { return Err("诊断轮次已用尽") }`
+        assert!(err.contains("诊断轮次已用尽"), "三轮失败后 rounds 必须是 3：{err}");
+    }
+
+    /* ------------------- T6：服务控制卡片必须经用户批准 ------------------- */
+
+    #[test]
+    fn service_control_card_requires_approval() {
+        let env = LoopEnv::new("vloop-control");
+        env.seed(&svc("api", free_port(), "/ok", 2000));
+        let key = key_of(env.pid, "api");
+
+        // ① 拒绝：卡片 rejected，服务绝不能被拉起。
+        let call = env.call(
+            "service_control",
+            json!({"service": "api", "action": "restart", "reason": "e2e"}),
+        );
+        let deny = env.reject("service_control");
+        join_within(deny, 20, "拒绝服务控制卡").expect("应能找到并拒绝卡片");
+        let out = join_within(call, 20, "拒绝后的 service_control").expect("拒绝应返回 Ok");
+        assert_eq!(out["approved"], json!(false), "拒绝必须回 approved=false：{out}");
+        assert_eq!(
+            env.last_card("service_control").expect("应有控制卡")["state"],
+            json!("rejected"),
+            "拒绝后控制卡必须是 rejected"
+        );
+        assert!(
+            env.sup().status_of(&key).is_none(),
+            "被拒绝时绝不能启动/重启服务（{key}）"
+        );
+
+        // ② 允许：卡片 done，服务真的起来了。
+        let call = env.call(
+            "service_control",
+            json!({"service": "api", "action": "restart", "reason": "e2e"}),
+        );
+        let allow = decide_when_pending(
+            env.app_handle(),
+            env.sid.clone(),
+            "service_control",
+            json!({"action": "allow"}),
+        );
+        join_within(allow, 20, "允许服务控制卡").expect("应能找到并允许卡片");
+        let out = join_within(call, 40, "允许后的 service_control").expect("允许应返回 Ok");
+        assert_eq!(out["approved"], json!(true), "允许必须回 approved=true：{out}");
+        assert!(out["status"].is_object(), "允许后必须带 supervisor 状态：{out}");
+        assert!(
+            env.sup().status_of(&key).is_some_and(|s| s.phase == Phase::Running),
+            "允许后 api 应真的在跑"
+        );
+    }
+}

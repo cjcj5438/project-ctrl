@@ -5,6 +5,7 @@ import { EditorView, basicSetup } from 'codemirror'
 import { EditorState } from '@codemirror/state'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { api, errorText, isConflict, type ReadmeInfo } from './api'
+import { DiffView } from './DiffView'
 
 const EXTERNAL_LINK = /^(https?:|mailto:)/i
 
@@ -106,10 +107,16 @@ export default function ReadmeSection({
   projectId,
   onDirtyChange,
   onError,
+  aiDraft,
+  onAiDraftApplied,
 }: {
   projectId: number
   onDirtyChange: (dirty: boolean) => void
   onError: (msg: string | null) => void
+  /** AI 生成的草稿：nonce 变化即灌进编辑器（有未保存修改时先走确认流程）。 */
+  aiDraft?: { content: string; nonce: number }
+  /** 草稿已灌入：父组件据此清掉它，切页签再回来不会把用户后续编辑顶掉。 */
+  onAiDraftApplied: () => void
 }) {
   const [info, setInfo] = useState<ReadmeInfo | null>(null)
   const [loading, setLoading] = useState(true)
@@ -119,6 +126,11 @@ export default function ReadmeSection({
   const [mtime, setMtime] = useState<string | null>(null)
   const [conflict, setConflict] = useState(false)
   const [confirmDiscard, setConfirmDiscard] = useState<null | (() => void)>(null)
+  const [aiBanner, setAiBanner] = useState(false)
+  const [showAiDiff, setShowAiDiff] = useState(false)
+  const appliedNonce = useRef<number | null>(null)
+  /** 已挂到确认框上、但用户还没决定的 AI 草稿（取消后可重来）。 */
+  const armedNonce = useRef<number | null>(null)
 
   const editorRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
@@ -204,6 +216,30 @@ export default function ReadmeSection({
     return () => window.removeEventListener('keydown', onKey)
   }, [editing])
 
+  // AI 草稿：只在 nonce 变化时应用一次；脏编辑器先确认（同一套 confirmDiscard）
+  useEffect(() => {
+    if (!aiDraft) return
+    if (appliedNonce.current === aiDraft.nonce || armedNonce.current === aiDraft.nonce) return
+    const content = aiDraft.content
+    const applyDraft = () => {
+      appliedNonce.current = aiDraft.nonce
+      armedNonce.current = null
+      setDraft(content)
+      setEditing(true)
+      setAiBanner(true)
+      setShowAiDiff(false)
+      onError(null)
+      onAiDraftApplied()
+    }
+    if (editing && draft !== savedContent) {
+      // 脏编辑器：先问一句。用户取消时回到原状，什么都不丢
+      armedNonce.current = aiDraft.nonce
+      setConfirmDiscard(() => applyDraft)
+    } else {
+      applyDraft()
+    }
+  }, [aiDraft, editing, draft, savedContent, onError, onAiDraftApplied])
+
   const save = async (force = false) => {
     try {
       const newMtime = await api.saveReadme(projectId, draft, mtime, force)
@@ -211,6 +247,9 @@ export default function ReadmeSection({
       setSavedContent(draft)
       setInfo((i) => (i ? { ...i, content: draft, mtime: newMtime } : i))
       setConflict(false)
+      // 存盘后草稿就是正文了：AI 提示与改动对照都该收起
+      setAiBanner(false)
+      setShowAiDiff(false)
       onError(null)
     } catch (e) {
       if (isConflict(e)) {
@@ -260,9 +299,10 @@ export default function ReadmeSection({
   if (loading) return <div className="text-sm text-muted">README 载入中…</div>
 
   return (
-    <div className="mt-6">
-      <div className="flex items-center gap-3">
-        <h3 className="text-sm font-semibold text-muted">README</h3>
+    <section aria-label="README">
+      <div className="flex items-center gap-3 pb-2">
+        <h2 className="text-[13px] font-semibold">README</h2>
+        {info?.filename && <span className="font-mono text-[11px] text-muted">{info.filename}</span>}
         {editing && (
           <>
             {dirty && <span className="text-xs text-warning">●未保存</span>}
@@ -295,8 +335,49 @@ export default function ReadmeSection({
         )}
       </div>
 
-      {!info?.exists ? (
-        <div className="mt-3 rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted ">
+      {aiBanner && editing && (
+        <div className="mb-2 flex items-center gap-2 rounded-[var(--radius-card)] border border-ai/40 bg-ai/10 px-3 py-1.5 text-[12px]">
+          <span className="text-ai">AI 草稿（未保存）</span>
+          <button
+            type="button"
+            onClick={() => setShowAiDiff((v) => !v)}
+            aria-expanded={showAiDiff}
+            className="rounded text-[11px] text-muted underline hover:text-fg"
+          >
+            {showAiDiff ? '收起改动' : '查看改动'}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setAiBanner(false)
+              setShowAiDiff(false)
+            }}
+            className="ml-auto rounded text-[11px] text-muted underline hover:text-fg"
+            aria-label="收起 AI 草稿提示"
+          >
+            关闭
+          </button>
+        </div>
+      )}
+
+      {aiBanner && showAiDiff && (
+        <div className="mb-2">
+          <DiffView before={savedContent} after={draft} />
+        </div>
+      )}
+
+      {editing ? (
+        <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+          <div
+            ref={editorRef}
+            className="min-h-[320px] overflow-auto rounded-[var(--radius-card)] border border-border bg-surface-sunken"
+          />
+          <div className="max-h-[70vh] overflow-auto rounded-[var(--radius-card)] border border-border bg-surface p-4 ">
+            <MarkdownView id={projectId} markdown={draft} />
+          </div>
+        </div>
+      ) : !info?.exists ? (
+        <div className="rounded-[var(--radius-card)] border border-dashed border-border p-6 text-center text-sm text-muted ">
           <p>暂无 README</p>
           <button
             type="button"
@@ -306,15 +387,8 @@ export default function ReadmeSection({
             生成
           </button>
         </div>
-      ) : editing ? (
-        <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
-          <div ref={editorRef} className="min-h-[320px] overflow-auto rounded-lg border border-border " />
-          <div className="max-h-[70vh] overflow-auto rounded-lg border border-border bg-surface p-4 ">
-            <MarkdownView id={projectId} markdown={draft} />
-          </div>
-        </div>
       ) : (
-        <div className="mt-3 rounded-lg border border-border bg-surface p-4 ">
+        <div className="rounded-[var(--radius-card)] border border-border bg-surface p-4 ">
           <MarkdownView id={projectId} markdown={savedContent} />
         </div>
       )}
@@ -349,11 +423,16 @@ export default function ReadmeSection({
             confirmDiscard()
             setConfirmDiscard(null)
           }}
-          onCancel={() => setConfirmDiscard(null)}
+          onCancel={() => {
+            // 用户选择保留现有修改：AI 草稿就此作废（不再重复弹窗）
+            appliedNonce.current = armedNonce.current
+            armedNonce.current = null
+            setConfirmDiscard(null)
+          }}
         >
           <p>README 有未保存的修改，放弃后将丢失。</p>
         </Confirm>
       )}
-    </div>
+    </section>
   )
 }
